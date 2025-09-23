@@ -1,0 +1,229 @@
+"""NLA SFT Dataset with activation vector support."""
+
+import torch
+import pandas as pd
+from typing import Dict, Optional, Any, List, Union
+from omegaconf import DictConfig
+from omegaconf.listconfig import ListConfig
+from transformers import PreTrainedTokenizer
+
+from verl.utils.dataset.sft_dataset import SFTDataset
+from verl.utils.model import compute_position_id_with_mask
+
+
+class NLASFTDataset(SFTDataset):
+    """
+    SFT Dataset for NLA that supports activation vectors.
+
+    This dataset can be used for both:
+    1. Actor training: Provides prompts + activation vectors for injection
+    2. Critic training: Provides responses + target activation vectors for reconstruction
+
+    Expected parquet columns:
+    - prompt: The input prompt text
+    - response: The response text
+    - activation_vector: The activation vector (list or numpy array)
+    - Additional columns as needed by base SFTDataset
+    """
+
+    def __init__(
+        self,
+        parquet_files: Union[str, ListConfig],
+        tokenizer: Union[str, PreTrainedTokenizer],
+        config: DictConfig,
+        mode: str = "actor",  # "actor", "critic", or "both"
+    ):
+        """
+        Initialize NLA SFT dataset.
+
+        Args:
+            parquet_files: Path(s) to parquet files
+            tokenizer: Tokenizer instance or path
+            config: Configuration dict with dataset parameters
+            mode: Training mode - "actor", "critic", or "both"
+        """
+        self.mode = mode
+        self.activation_dim = config.get("activation_dim", 768)
+        self.injection_token = config.get("injection_token", "<INJECT>")
+        self.injection_token_id = config.get("injection_token_id", None)
+
+        # Initialize base dataset
+        super().__init__(parquet_files, tokenizer, config)
+
+        # Add injection token to tokenizer if needed
+        if self.injection_token_id is None and self.injection_token:
+            # Add special token if not already present
+            if self.injection_token not in self.tokenizer.get_vocab():
+                self.tokenizer.add_special_tokens({"additional_special_tokens": [self.injection_token]})
+            self.injection_token_id = self.tokenizer.convert_tokens_to_ids(self.injection_token)
+
+        # Load activation vectors
+        self._load_activation_vectors()
+
+    def _load_activation_vectors(self):
+        """Load activation vectors from the dataframe."""
+        # Activation vectors should be in the dataframe
+        if "activation_vector" not in self.dataframe.columns:
+            raise ValueError("Dataset must contain 'activation_vector' column")
+
+        # Convert activation vectors to tensors
+        self.activation_vectors = []
+        for idx in range(len(self.dataframe)):
+            vec = self.dataframe.iloc[idx]["activation_vector"]
+
+            # Handle different formats (list, numpy array, etc.)
+            if isinstance(vec, (list, tuple)):
+                vec = torch.tensor(vec, dtype=torch.float32)
+            elif hasattr(vec, "numpy"):  # pandas/numpy array
+                vec = torch.tensor(vec.numpy(), dtype=torch.float32)
+            elif isinstance(vec, torch.Tensor):
+                vec = vec.float()
+            else:
+                vec = torch.tensor(vec, dtype=torch.float32)
+
+            # Ensure correct dimension
+            if vec.shape[-1] != self.activation_dim:
+                raise ValueError(f"Activation vector dimension mismatch: expected {self.activation_dim}, got {vec.shape[-1]}")
+
+            self.activation_vectors.append(vec)
+
+    def _prepare_actor_sample(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Prepare sample for actor training with activation injection.
+
+        The prompt should contain the injection token where the activation
+        vector should be injected.
+        """
+        # Get base sample from parent class
+        sample = super().__getitem__(idx)
+
+        # Add activation vector
+        sample["activation_vectors"] = self.activation_vectors[idx]
+
+        # Ensure input_ids contain the injection token
+        if self.injection_token_id is not None:
+            # Check if injection token is present
+            if self.injection_token_id not in sample["input_ids"]:
+                # Insert injection token at the end of the prompt
+                # This is a simplified approach - you may want more sophisticated placement
+                prompt_end_idx = (sample["loss_mask"] == 0).sum().item()
+
+                # Insert token
+                input_ids = sample["input_ids"]
+                new_input_ids = torch.cat([
+                    input_ids[:prompt_end_idx],
+                    torch.tensor([self.injection_token_id]),
+                    input_ids[prompt_end_idx:]
+                ])[:self.max_length]
+
+                # Update masks accordingly
+                sample["input_ids"] = new_input_ids
+                # Adjust attention mask and loss mask if needed
+                if new_input_ids.shape[0] != sample["attention_mask"].shape[0]:
+                    # Truncate or pad masks
+                    sample["attention_mask"] = sample["attention_mask"][:new_input_ids.shape[0]]
+                    sample["loss_mask"] = sample["loss_mask"][:new_input_ids.shape[0]]
+
+        return sample
+
+    def _prepare_critic_sample(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Prepare sample for critic training.
+
+        The critic needs:
+        - response_ids: The generated response tokens
+        - response_attention_mask: Attention mask for the response
+        - target_activations: The target activation vector to predict
+        """
+        # Get the raw prompt and response
+        prompt = self.prompts[idx]
+        response = self.responses[idx]
+
+        # Tokenize response only
+        response_with_eos = response + self.tokenizer.eos_token
+        response_output = self.tokenizer(
+            response_with_eos,
+            return_tensors="pt",
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            add_special_tokens=False
+        )
+
+        sample = {
+            "response_ids": response_output["input_ids"][0],
+            "response_attention_mask": response_output["attention_mask"][0],
+            "activation_vectors": self.activation_vectors[idx],  # Target for critic
+        }
+
+        # Also include full sequence for potential joint training
+        full_sample = super().__getitem__(idx)
+        sample.update({
+            "input_ids": full_sample["input_ids"],
+            "attention_mask": full_sample["attention_mask"],
+            "loss_mask": full_sample["loss_mask"],
+        })
+
+        return sample
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a training sample.
+
+        Returns different formats based on training mode:
+        - actor: Sample with injection token and activation vector
+        - critic: Sample with response and target activation
+        - both: Combined sample with all fields
+        """
+        if self.mode == "actor":
+            return self._prepare_actor_sample(idx)
+        elif self.mode == "critic":
+            return self._prepare_critic_sample(idx)
+        elif self.mode == "both":
+            # Combine both actor and critic samples
+            actor_sample = self._prepare_actor_sample(idx)
+            critic_sample = self._prepare_critic_sample(idx)
+
+            # Merge samples, with critic fields prefixed
+            combined_sample = actor_sample.copy()
+            combined_sample.update({
+                "response_ids": critic_sample["response_ids"],
+                "response_attention_mask": critic_sample["response_attention_mask"],
+            })
+            return combined_sample
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+
+class NLASFTCollator:
+    """
+    Data collator for NLA SFT that properly handles activation vectors.
+    """
+
+    def __init__(self, pad_token_id: int = 0):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate batch of samples, handling activation vectors properly.
+        """
+        batch = {}
+
+        # Stack standard tensor fields
+        tensor_keys = ["input_ids", "attention_mask", "loss_mask", "position_ids"]
+        for key in tensor_keys:
+            if key in features[0]:
+                batch[key] = torch.stack([f[key] for f in features])
+
+        # Stack response fields if present
+        response_keys = ["response_ids", "response_attention_mask"]
+        for key in response_keys:
+            if key in features[0]:
+                batch[key] = torch.stack([f[key] for f in features])
+
+        # Stack activation vectors
+        if "activation_vectors" in features[0]:
+            # Ensure all activation vectors have the same shape
+            batch["activation_vectors"] = torch.stack([f["activation_vectors"] for f in features])
+
+        return batch

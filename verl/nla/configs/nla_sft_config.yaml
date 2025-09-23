@@ -1,0 +1,118 @@
+# NLA SFT Training Configuration
+
+model:
+  model_name: "meta-llama/Llama-2-7b-hf"  # Base model for actor
+  activation_dim: 768  # Dimension of activation vectors
+  enable_flashattn: true  # Use flash attention if available
+
+  # Injection configuration for actor
+  injection:
+    mode: "replace"  # "replace", "add", or "project"
+    layer_indices: [0]  # Which layers to inject at (0 = embedding)
+    projection_dim: null  # Optional projection dimension
+    injection_token: "<INJECT>"  # Special token marking injection point
+    injection_token_id: null  # Will be auto-assigned
+
+  # Critic model configuration
+  critic:
+    model_name: "meta-llama/Llama-2-7b-hf"  # Can use smaller model
+    pooling: "last"  # Pooling method: "last", "mean", "max", "cls", "weighted"
+    dropout: 0.1
+    projection_layers: 2  # Number of layers in projection head
+
+data:
+  # Dataset configuration
+  train_dataset:
+    parquet_files: ["data/nla_sft_train.parquet"]
+    prompt_key: "prompt"
+    response_key: "response"
+    max_length: 2048
+    truncation: "right"
+    use_shm: false
+    mode: "both"  # "actor", "critic", or "both"
+    activation_dim: 768
+    injection_token: "<INJECT>"
+
+  val_dataset:
+    parquet_files: ["data/nla_sft_val.parquet"]
+    prompt_key: "prompt"
+    response_key: "response"
+    max_length: 2048
+    truncation: "right"
+    use_shm: false
+    mode: "both"
+    activation_dim: 768
+    injection_token: "<INJECT>"
+
+  # Batch sizes
+  train_batch_size: 32
+  val_batch_size: 32
+  micro_batch_size_per_gpu: 4  # For gradient accumulation
+
+optim:
+  # Actor optimizer settings
+  lr: 1e-5
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  max_norm: 1.0  # Gradient clipping
+
+  # Critic optimizer settings
+  critic_lr: 5e-5
+
+  # Learning rate schedule
+  warmup_steps: 100
+  lr_scheduler_type: "cosine"
+
+trainer:
+  # Training settings
+  total_training_steps: 10000
+  val_steps: 500  # Validate every N steps
+  save_steps: 1000  # Save checkpoint every N steps
+  logging_steps: 10
+
+  # Mode settings
+  train_mode: "both"  # "actor", "critic", or "both"
+  critic_epochs: 1  # Epochs per critic training step
+
+  # Checkpoint settings
+  save_dir: "checkpoints/nla_sft"
+  save_total_limit: 5
+  load_checkpoint: null  # Path to checkpoint to resume from
+
+  # Hardware settings
+  device: "cuda"
+  mixed_precision: "bf16"
+  gradient_checkpointing: false
+
+  # Distributed training
+  world_size: 1
+  local_rank: 0
+  backend: "nccl"
+
+  # FSDP settings
+  fsdp:
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: false
+    mixed_precision: "bf16"
+    backward_prefetch: "BACKWARD_PRE"
+
+  # Logging
+  use_tensorboard: true
+  tensorboard_dir: "logs/nla_sft"
+  use_wandb: false
+  wandb_project: "nla_sft"
+  wandb_entity: null
+  wandb_name: null
+
+# Evaluation settings
+eval:
+  # Generation settings for evaluation
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+  # Metrics
+  compute_perplexity: true
+  compute_critic_mse: true
