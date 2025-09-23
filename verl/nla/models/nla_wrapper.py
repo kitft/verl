@@ -52,8 +52,8 @@ class NLAModelWrapper(BaseWrapper):
         activation_dim: int = None,
     ):
         super().__init__()
-        # Use object.__setattr__ to avoid __getattr__ during initialization
-        object.__setattr__(self, "base_model", base_model)
+        # Register base_model as a proper submodule so its parameters are accessible
+        self.base_model = base_model
         object.__setattr__(self, "injection_config", injection_config or InjectionConfig())
         object.__setattr__(self, "hidden_dim", hidden_dim or self._infer_hidden_dim())
         object.__setattr__(self, "activation_dim", activation_dim or self.hidden_dim)

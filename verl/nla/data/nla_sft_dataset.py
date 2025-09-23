@@ -44,7 +44,10 @@ class NLASFTDataset(SFTDataset):
             mode: Training mode - "actor", "critic", or "both"
         """
         self.mode = mode
-        self.activation_dim = config.get("activation_dim", 768)
+        # Get activation_dim from config - will be determined dynamically from model config
+        self.activation_dim = config.get("activation_dim")
+        if self.activation_dim is None:
+            raise ValueError("activation_dim must be provided in config or determined from model config")
 
         # Initialize base dataset first to get tokenizer
         super().__init__(parquet_files, tokenizer, config)

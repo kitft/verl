@@ -1,6 +1,6 @@
-# Neural Latent Activation (NLA) with GRPO Training
+# Natural Language Autoencoder (NLA) with GRPO Training
 
-This module implements Neural Latent Activation (NLA) training using Group Relative Policy Optimization (GRPO) within the verl framework.
+This module implements Natural Language Autoencoder (NLA) training using Group Relative Policy Optimization (GRPO) within the verl framework.
 
 ## Overview
 
@@ -326,7 +326,7 @@ If you use this implementation, please cite:
 
 ```bibtex
 @software{nla_grpo_2024,
-  title={Neural Latent Activation with GRPO},
+  title={Natural Language Autoencoder with GRPO},
   author={Your Team},
   year={2024},
   url={https://github.com/your-org/verl-nla}

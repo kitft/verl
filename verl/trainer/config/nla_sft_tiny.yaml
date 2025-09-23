@@ -21,6 +21,8 @@ data:
     path: verl.nla.data.nla_sft_dataset
     name: NLASFTDataset
 
+  # activation_dim now determined dynamically from model config
+
   max_length: 512
   truncation: error
   use_shm: false
@@ -75,7 +77,7 @@ engine:
 
 # NLA-specific configuration
 nla:
-  activation_dim: 3072  # Gemma-2-tiny hidden size
+  # activation_dim now determined dynamically from model's hidden_size
   train_mode: both  # "actor", "critic", or "both"
 
   # Injection configuration for actor
@@ -83,7 +85,7 @@ nla:
     mode: replace
     layer_indices: [0]
     projection_dim: null
-    injection_token: "<INJECT>"
+    injection_token: null  # Let system auto-select
 
   # Critic model configuration
   critic:

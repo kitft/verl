@@ -61,8 +61,8 @@ nla:
   # Enable NLA datasets
   use_nla_datasets: true
 
-  # Gemma-2-tiny has hidden_size=3072
-  activation_dim: 3072
+  # activation_dim will be auto-determined from model's hidden_size
+  # No need to specify it explicitly
 
   # Reduce GRPO settings for testing
   grpo:
@@ -79,8 +79,8 @@ data:
     - data/testing/test_nla_dataset.parquet
 
   # Very small batches for testing
-  batch_size: 2
-  eval_batch_size: 2
+  train_batch_size: 2
+  val_batch_size: 2
 
   # No parallel workers for testing
   num_workers: 0
@@ -91,7 +91,7 @@ data:
 ray_kwargs:
   ray_init:
     num_cpus: 4
-    num_gpus: 0  # CPU testing
+    num_gpus: 1  # GPU testing
 
     runtime_env:
       env_vars:

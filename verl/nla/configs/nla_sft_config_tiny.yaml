@@ -2,7 +2,7 @@
 
 model:
   model_name: "yujiepan/gemma-2-tiny-random"  # Using tiny model for testing
-  activation_dim: 3072  # Gemma-2-tiny has hidden_size=3072
+  # activation_dim determined dynamically from model's hidden_size
   enable_flashattn: false  # Disabled for testing
 
   # Injection configuration for actor
@@ -30,7 +30,7 @@ data:
     truncation: "right"
     use_shm: false
     mode: "both"  # "actor", "critic", or "both"
-    activation_dim: 3072
+    # activation_dim determined dynamically from model's hidden_size
     injection_token: "<INJECT>"
 
   val_dataset:
@@ -41,7 +41,7 @@ data:
     truncation: "right"
     use_shm: false
     mode: "both"
-    activation_dim: 3072
+    # activation_dim determined dynamically from model's hidden_size
     injection_token: "<INJECT>"
 
   # Batch sizes - smaller for testing

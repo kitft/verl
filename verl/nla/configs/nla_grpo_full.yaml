@@ -132,7 +132,7 @@ grpo:
 
 # NLA specific settings
 nla:
-  activation_dim: 3072  # Gemma-2-tiny hidden size
+  # activation_dim determined dynamically from model's hidden_size
   injection_position: "manual"
   injection_mode: "replace"
   injection_layer_indices: [0]

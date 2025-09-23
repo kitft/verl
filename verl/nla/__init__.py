@@ -1,4 +1,4 @@
-"""Neural Latent Activation (NLA) injection for verl."""
+"""Natural Language Autoencoder (NLA) injection for verl."""
 
 from .models import NLAModelWrapper
 from .data import NLADataset, NLABatch

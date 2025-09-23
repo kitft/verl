@@ -63,12 +63,14 @@ class NLATaskRunner:
 
         # Check if we should use NLA workers
         if config.get("nla", {}).get("use_nla_datasets", False):
-            # Use NLA actor worker for activation injection
-            from verl.nla.workers.nla_actor_worker import create_nla_actor_worker
+            # NLA only supports FSDP strategy currently
+            strategy = config.actor_rollout_ref.actor.strategy
+            if strategy not in {"fsdp", "fsdp2"}:
+                raise NotImplementedError(f"NLA only supports FSDP strategy, got '{strategy}'")
 
-            # Create NLA worker class based on strategy
-            base_strategy = config.actor_rollout_ref.actor.strategy
-            actor_rollout_cls = create_nla_actor_worker(config)
+            # Use NLA actor worker for activation injection
+            from verl.nla.workers.nla_actor_worker import NLAActorRolloutRefWorker
+            actor_rollout_cls = NLAActorRolloutRefWorker
         else:
             # Use standard workers based on strategy
             if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
@@ -87,17 +89,27 @@ class NLATaskRunner:
 
     def add_critic_worker(self, config):
         """Add critic worker."""
-        # Use standard critic workers - NLA logic is handled in the trainer
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import CriticWorker
-
-            critic_cls = CriticWorker
-        elif config.critic.strategy == "megatron":
-            from verl.workers.megatron_workers import CriticWorker
-
-            critic_cls = CriticWorker
+        # For NLA GRPO, we use a custom critic worker with vector value head
+        if config.get("nla", {}).get("use_nla_datasets", False):
+            # NLA GRPO uses our custom critic worker with vector value head
+            if config.critic.strategy in {"fsdp", "fsdp2"}:
+                from verl.nla.workers.nla_critic_worker import NLACriticWorker
+                critic_cls = NLACriticWorker
+            elif config.critic.strategy == "megatron":
+                from verl.nla.workers.nla_critic_worker import NLACriticWorker
+                critic_cls = NLACriticWorker
+            else:
+                raise NotImplementedError(f"Strategy {config.critic.strategy} not supported")
         else:
-            raise NotImplementedError(f"Strategy {config.critic.strategy} not supported")
+            # Use standard critic workers for non-NLA training
+            if config.critic.strategy in {"fsdp", "fsdp2"}:
+                from verl.workers.fsdp_workers import CriticWorker
+                critic_cls = CriticWorker
+            elif config.critic.strategy == "megatron":
+                from verl.workers.megatron_workers import CriticWorker
+                critic_cls = CriticWorker
+            else:
+                raise NotImplementedError(f"Strategy {config.critic.strategy} not supported")
 
         self.role_worker_mapping[Role.Critic] = ray.remote(critic_cls)
 
@@ -142,11 +154,17 @@ class NLATaskRunner:
         else:
             # Create NLA datasets
             nla_config = config.get("nla", {})
+
+            # Get model config to determine activation_dim
+            from transformers import AutoConfig
+            model_path = config.actor_rollout_ref.model.path
+            model_config = AutoConfig.from_pretrained(model_path)
+
             dataset_config = {
                 "prompt_key": config.data.prompt_key,
                 "activation_vector_key": nla_config.get("activation_vector_key", "activation_vector"),
                 "max_prompt_length": config.data.max_prompt_length,
-                "activation_dim": nla_config.get("activation_dim", 768),
+                "activation_dim": model_config.hidden_size,  # Use model's hidden_size
                 "injection_position": nla_config.get("injection", {}).get("position", "manual"),
             }
 
@@ -262,7 +280,7 @@ class NLATaskRunner:
                 reward_normalize=grpo_settings.get("reward_normalize", False),
                 reward_transform=grpo_settings.get("reward_transform", "negative"),
                 reward_scale=grpo_settings.get("reward_scale", 1.0),
-                actor_learning_rate=config.actor_rollout_ref.actor.lr,
+                actor_learning_rate=config.actor_rollout_ref.actor.optim.lr,
                 ppo_epochs=config.trainer.get("ppo_epochs", 1),
                 ppo_clip_ratio=config.trainer.get("clip_ratio", 0.2),
             )

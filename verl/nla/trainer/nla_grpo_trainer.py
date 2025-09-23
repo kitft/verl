@@ -107,62 +107,6 @@ class NLAGRPOTrainer(RayPPOTrainer):
             "group_advantage_std": [],
         }
 
-    def _create_critic_worker(self, worker_group: RayWorkerGroup) -> Any:
-        """Create custom critic worker with vector value head."""
-
-        from ..models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
-
-        class GRPOCriticWorker(worker_group.worker_cls):
-            """Custom critic worker with vector output for GRPO."""
-
-            def init_model(self):
-                # Initialize the critic as a copy of the base model with vector value head
-                self.critic = AutoModelForCausalLMWithVectorValueHead.from_pretrained(
-                    self.model_name_or_path,
-                    dropout=0.1,
-                    **self.model_kwargs
-                )
-
-                # Move to device
-                self.critic = self.critic.to(self.device)
-
-                # Update optimizer for new parameters
-                self.critic_optimizer = torch.optim.Adam(
-                    self.critic.parameters(),
-                    lr=self.grpo_config.critic_learning_rate,
-                )
-
-            def compute_activation_predictions(
-                self,
-                response_ids: torch.Tensor,
-                attention_mask: torch.Tensor,
-            ) -> torch.Tensor:
-                """
-                Compute predicted activation vectors for responses.
-
-                The critic outputs a vector at the last token position.
-                Returns: (batch_size, hidden_size)
-                """
-                output = self.critic(
-                    input_ids=response_ids,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                )
-                # Extract the last token's value (which is the activation vector)
-                # The model already handles extracting the last valid token
-                values = output.value  # (batch, seq_len, hidden_size)
-
-                # Get the last valid position for each sequence
-                if attention_mask is not None:
-                    seq_lengths = attention_mask.sum(dim=1) - 1
-                    batch_size = values.shape[0]
-                    activation_vectors = values[torch.arange(batch_size), seq_lengths]
-                else:
-                    activation_vectors = values[:, -1]
-
-                return activation_vectors  # (batch, hidden_size)
-
-        return GRPOCriticWorker
 
     def _generate_multiple_trajectories(
         self,

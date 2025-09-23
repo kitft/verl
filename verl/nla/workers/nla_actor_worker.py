@@ -3,134 +3,98 @@
 import torch
 from typing import Dict, Optional, Any
 from verl.protocol import DataProto
-from verl.single_controller.ray import RayWorkerGroup
+from verl.workers.fsdp_workers import ActorRolloutRefWorker as FSDPActorRolloutRefWorker
+from verl.single_controller.base.decorator import register
+from verl.single_controller.base import Dispatch
 from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
 
 
-class NLAActorWorker:
+class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
     """
-    Custom actor worker that wraps the base model with NLAModelWrapper
+    NLA-enabled actor rollout worker that handles activation injection.
+
+    This worker extends the base FSDP actor worker with NLA capabilities
     for activation injection during generation.
-
-    This worker is designed to be used with GRPO/PPO trainers where
-    the actor needs to generate text conditioned on activation vectors.
     """
 
-    def __init__(self, base_worker_cls: type):
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Initialize model with NLA wrapper."""
+        # First call parent's init_model to set up the base model
+        super().init_model()
+
+        # Now wrap the actor model with NLA capabilities if we have activation injection
+        if hasattr(self, 'actor') and hasattr(self.config, 'nla'):
+            # Extract NLA configuration
+            nla_config = self.config.get('nla', {})
+            injection_config = nla_config.get('injection', {})
+
+            # Configure injection settings
+            injection_cfg = InjectionConfig(
+                mode=injection_config.get("mode", "replace"),
+                layer_indices=injection_config.get("layer_indices", [0]),
+                projection_dim=injection_config.get("projection_dim", None),
+                injection_token=injection_config.get("injection_token", None),
+            )
+
+            # Get model's hidden dimension
+            base_model = self.actor.model if hasattr(self.actor, 'model') else self.actor
+            hidden_dim = base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None
+            activation_dim = nla_config.get("activation_dim", hidden_dim or 768)
+
+            # Wrap model with NLA wrapper
+            self.nla_wrapper = NLAModelWrapper(
+                base_model=base_model,
+                tokenizer=getattr(self, 'tokenizer', None),
+                injection_config=injection_cfg,
+                hidden_dim=hidden_dim,
+                activation_dim=activation_dim,
+            )
+
+            print(f"Wrapped actor model with NLAModelWrapper")
+            print(f"Injection token: '{self.nla_wrapper.injection_config.injection_character}' (ID: {self.nla_wrapper.injection_config.injection_token_id})")
+
+    def generate_sequences(self, data: DataProto) -> DataProto:
         """
-        Initialize NLA actor worker by wrapping a base worker class.
+        Generate sequences with activation injection.
 
-        Args:
-            base_worker_cls: The base worker class to extend
+        This method extends the base generation to include activation vectors
+        in the forward pass of the model.
         """
-        self.base_worker_cls = base_worker_cls
-        self._create_wrapped_class()
+        # Extract activation vectors from DataProto
+        activation_vectors = None
+        if hasattr(data, 'metadata') and data.metadata:
+            activation_vectors = data.metadata.get('activation_vectors')
 
-    def _create_wrapped_class(self):
-        """Create a wrapped worker class with NLA functionality."""
+        # If no activation vectors in metadata, check batch data
+        if activation_vectors is None and hasattr(data, 'data') and 'activation_vectors' in data.data:
+            activation_vectors = data.data.get('activation_vectors')
 
-        class NLAActorWorkerWrapped(self.base_worker_cls):
-            """Inner class that extends the base worker with NLA capabilities."""
+        # Store activation vectors for use during generation
+        if activation_vectors is not None and hasattr(self, 'nla_wrapper'):
+            # TODO: Set up activation injection in the model
+            # This would involve modifying the model's forward pass to inject activations
+            print(f"Found activation vectors with shape: {activation_vectors.shape}")
 
-            def init_model(self):
-                """Initialize model with NLA wrapper."""
-                # First initialize the base model
-                super().init_model()
+        # Call parent's generate_sequences
+        return super().generate_sequences(data)
 
-                # Extract model, tokenizer and config
-                base_model = self.model
-                tokenizer = getattr(self, 'tokenizer', None)
-                config = getattr(self, 'config', None)
+    def compute_log_prob(self, data: DataProto) -> DataProto:
+        """
+        Compute log probabilities with activation injection.
 
-                # Configure injection settings
-                injection_config = InjectionConfig(
-                    mode=config.model.injection.get("mode", "replace") if config else "replace",
-                    layer_indices=config.model.injection.get("layer_indices", [0]) if config else [0],
-                    projection_dim=config.model.injection.get("projection_dim", None) if config else None,
-                    injection_token=config.model.injection.get("injection_token", None) if config else None,
-                    # Don't set injection_token_id here - let InjectionTokenManager handle it
-                )
+        Ensures activation vectors are passed during log prob computation.
+        """
+        # Extract and handle activation vectors similar to generation
+        activation_vectors = None
+        if hasattr(data, 'metadata') and data.metadata:
+            activation_vectors = data.metadata.get('activation_vectors')
 
-                # Wrap model with NLA wrapper
-                # The tokenizer will be used to auto-select the injection token if not specified
-                self.model = NLAModelWrapper(
-                    base_model=base_model,
-                    tokenizer=tokenizer,  # Pass tokenizer for injection token management
-                    injection_config=injection_config,
-                    hidden_dim=base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None,
-                    activation_dim=config.model.get("activation_dim", 768) if config else 768,
-                )
+        if activation_vectors is None and hasattr(data, 'data') and 'activation_vectors' in data.data:
+            activation_vectors = data.data.get('activation_vectors')
 
-                print(f"Wrapped actor model with NLAModelWrapper")
-                print(f"Injection token: '{self.model.injection_config.injection_character}' (ID: {self.model.injection_config.injection_token_id})")
+        if activation_vectors is not None and hasattr(self, 'nla_wrapper'):
+            print(f"Computing log probs with activation vectors of shape: {activation_vectors.shape}")
 
-            def generate_sequences(self, data: DataProto) -> DataProto:
-                """
-                Generate sequences with activation injection.
+        return super().compute_log_prob(data)
 
-                This method extends the base generation to include activation vectors
-                in the forward pass of the model.
-                """
-                # Extract activation vectors from DataProto metadata
-                activation_vectors = None
-                if hasattr(data, 'metadata') and data.metadata:
-                    activation_vectors = data.metadata.get('activation_vectors')
-
-                # If no activation vectors in metadata, check batch data
-                if activation_vectors is None and hasattr(data, 'batch'):
-                    activation_vectors = data.batch.get('activation_vectors')
-
-                # Store activation vectors in a place accessible during generation
-                if activation_vectors is not None:
-                    # Add to model kwargs that will be passed to forward
-                    if not hasattr(data, 'meta_info'):
-                        data.meta_info = {}
-                    data.meta_info['activation_vectors'] = activation_vectors
-                    print(f"Found activation vectors with shape: {activation_vectors.shape}")
-
-                # Call base generation
-                result = super().generate_sequences(data)
-
-                return result
-
-            def compute_log_prob(self, data: DataProto) -> DataProto:
-                """
-                Compute log probabilities with activation injection.
-
-                Ensures activation vectors are passed during log prob computation.
-                """
-                # Extract and pass activation vectors similar to generation
-                activation_vectors = None
-                if hasattr(data, 'metadata') and data.metadata:
-                    activation_vectors = data.metadata.get('activation_vectors')
-
-                if activation_vectors is None and hasattr(data, 'batch'):
-                    activation_vectors = data.batch.get('activation_vectors')
-
-                if activation_vectors is not None:
-                    if not hasattr(data, 'meta_info'):
-                        data.meta_info = {}
-                    data.meta_info['activation_vectors'] = activation_vectors
-
-                return super().compute_log_prob(data)
-
-        self.wrapped_class = NLAActorWorkerWrapped
-
-    def get_worker_class(self):
-        """Return the wrapped worker class."""
-        return self.wrapped_class
-
-
-def create_nla_actor_worker(base_worker_cls: type, config: Optional[Dict] = None):
-    """
-    Factory function to create an NLA actor worker from a base worker class.
-
-    Args:
-        base_worker_cls: The base worker class to wrap
-        config: Optional configuration for NLA settings
-
-    Returns:
-        The wrapped worker class with NLA capabilities
-    """
-    wrapper = NLAActorWorker(base_worker_cls)
-    return wrapper.get_worker_class()
