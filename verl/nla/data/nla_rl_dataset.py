@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from typing import Dict, Optional, Any, Union, List
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.nla.utils.injection_manager import InjectionTokenManager
 
 
 class NLARLDataset(RLHFDataset):
@@ -23,7 +24,7 @@ class NLARLDataset(RLHFDataset):
         prompt_key: str = "prompt",
         activation_vector_key: str = "activation_vector",
         max_prompt_length: int = 512,
-        injection_token: str = "<INJECT>",
+        injection_token: str = None,  # Will be auto-determined from tokenizer
         injection_position: str = "end",  # "start", "end", or "manual"
         activation_dim: int = 768,
         **kwargs
@@ -44,12 +45,13 @@ class NLARLDataset(RLHFDataset):
         """
         # Store NLA-specific parameters
         self.activation_vector_key = activation_vector_key
-        self.injection_token = injection_token
         self.injection_position = injection_position
         self.activation_dim = activation_dim
 
-        # Ensure injection token is in tokenizer
-        self.injection_token_id = self._ensure_injection_token(tokenizer)
+        # Set up injection token management
+        self.injection_manager = InjectionTokenManager(tokenizer, injection_token)
+        self.injection_token = self.injection_manager.character
+        self.injection_token_id = self.injection_manager.token_id
 
         # Initialize base dataset
         super().__init__(
@@ -60,16 +62,6 @@ class NLARLDataset(RLHFDataset):
             **kwargs
         )
 
-    def _ensure_injection_token(self, tokenizer) -> int:
-        """Ensure the injection token exists in the tokenizer."""
-        if self.injection_token not in tokenizer.get_vocab():
-            # Add special token to tokenizer
-            special_tokens = {"additional_special_tokens": [self.injection_token]}
-            tokenizer.add_special_tokens(special_tokens)
-            print(f"Added injection token '{self.injection_token}' to tokenizer")
-
-        injection_token_id = tokenizer.convert_tokens_to_ids(self.injection_token)
-        return injection_token_id
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """

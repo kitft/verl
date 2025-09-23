@@ -24,7 +24,8 @@ class InjectionConfig:
     mode: str = "replace"  # "replace", "add", or "project"
     layer_indices: List[int] = None  # Which layers to inject at
     projection_dim: Optional[int] = None  # For learnable projection
-    injection_token_id: int = -1  # Special token ID marking injection point
+    injection_token_id: int = -1  # Token ID marking injection point (uses existing vocab)
+    injection_character: str = None  # The actual character used for injection
 
     def __post_init__(self):
         if self.layer_indices is None:

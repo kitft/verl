@@ -8,6 +8,7 @@ from omegaconf.listconfig import ListConfig
 from transformers import PreTrainedTokenizer
 
 from verl.utils.dataset.sft_dataset import SFTDataset
+from verl.nla.utils.injection_manager import InjectionTokenManager
 from verl.utils.model import compute_position_id_with_mask
 
 
@@ -44,18 +45,15 @@ class NLASFTDataset(SFTDataset):
         """
         self.mode = mode
         self.activation_dim = config.get("activation_dim", 768)
-        self.injection_token = config.get("injection_token", "<INJECT>")
-        self.injection_token_id = config.get("injection_token_id", None)
 
-        # Initialize base dataset
+        # Initialize base dataset first to get tokenizer
         super().__init__(parquet_files, tokenizer, config)
 
-        # Add injection token to tokenizer if needed
-        if self.injection_token_id is None and self.injection_token:
-            # Add special token if not already present
-            if self.injection_token not in self.tokenizer.get_vocab():
-                self.tokenizer.add_special_tokens({"additional_special_tokens": [self.injection_token]})
-            self.injection_token_id = self.tokenizer.convert_tokens_to_ids(self.injection_token)
+        # Set up injection token management
+        injection_token = config.get("injection_token", None)
+        self.injection_manager = InjectionTokenManager(self.tokenizer, injection_token)
+        self.injection_token = self.injection_manager.character
+        self.injection_token_id = self.injection_manager.token_id
 
         # Load activation vectors
         self._load_activation_vectors()
