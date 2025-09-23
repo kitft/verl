@@ -170,6 +170,10 @@ class NLAModelWrapper(BaseWrapper):
         if "base_model" not in self.__dict__:
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
+        # Check if it's in our modules first (for dynamically added modules)
+        if "_modules" in self.__dict__ and name in self._modules:
+            return self._modules[name]
+
         # Delegate to base model
         return getattr(self.base_model, name)
 

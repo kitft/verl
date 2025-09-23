@@ -80,10 +80,31 @@ def mock_config():
     config.model.model_name = "gpt2"
     config.model.activation_dim = 768
     config.model.enable_flashattn = False
-    config.model.injection.mode = "replace"
-    config.model.injection.layer_indices = [0]
-    config.model.injection.projection_dim = None
-    config.model.injection.injection_token_id = 50000
+
+    # Setup model.get() to return activation_dim and critic config
+    model_config_dict = {
+        "activation_dim": 768,
+        "critic": {
+            "model_name": "gpt2",
+            "pooling": "last",
+            "dropout": 0.1,
+            "projection_layers": 2,
+        }
+    }
+    config.model.get.side_effect = lambda k, d=None: model_config_dict.get(k, d)
+
+    # Injection config
+    injection_config_dict = {
+        "mode": "replace",
+        "layer_indices": [0],
+        "projection_dim": None,
+        "injection_token_id": 50000,
+    }
+    config.model.injection.mode = injection_config_dict["mode"]
+    config.model.injection.layer_indices = injection_config_dict["layer_indices"]
+    config.model.injection.projection_dim = injection_config_dict["projection_dim"]
+    config.model.injection.injection_token_id = injection_config_dict["injection_token_id"]
+    config.model.injection.get.side_effect = lambda k, d=None: injection_config_dict.get(k, d)
 
     # Critic config
     config.model.critic.model_name = "gpt2"
@@ -106,17 +127,32 @@ def mock_config():
     }.get(k, default)
 
     # Optimizer config
-    config.optim.lr = 1e-5
-    config.optim.critic_lr = 5e-5
-    config.optim.weight_decay = 0.01
-    config.optim.beta1 = 0.9
-    config.optim.beta2 = 0.999
-    config.optim.max_norm = 1.0
-    config.optim.warmup_steps = 0
+    optim_config_dict = {
+        "lr": 1e-5,
+        "critic_lr": 5e-5,
+        "weight_decay": 0.01,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "max_norm": 1.0,
+        "warmup_steps": 0,
+    }
+    config.optim.lr = optim_config_dict["lr"]
+    config.optim.critic_lr = optim_config_dict["critic_lr"]
+    config.optim.weight_decay = optim_config_dict["weight_decay"]
+    config.optim.beta1 = optim_config_dict["beta1"]
+    config.optim.beta2 = optim_config_dict["beta2"]
+    config.optim.max_norm = optim_config_dict["max_norm"]
+    config.optim.warmup_steps = optim_config_dict["warmup_steps"]
+    config.optim.get.side_effect = lambda k, d=None: optim_config_dict.get(k, d)
 
     # Trainer config
-    config.trainer.critic_epochs = 1
-    config.trainer.total_training_steps = 1000
+    trainer_config_dict = {
+        "critic_epochs": 1,
+        "total_training_steps": 1000,
+    }
+    config.trainer.critic_epochs = trainer_config_dict["critic_epochs"]
+    config.trainer.total_training_steps = trainer_config_dict["total_training_steps"]
+    config.trainer.get.side_effect = lambda k, d=None: trainer_config_dict.get(k, d)
 
     return config
 
@@ -538,7 +574,7 @@ class TestNLASFTTrainer:
 
         # Mock critic output
         mock_output = MagicMock()
-        mock_output.predicted_activation = torch.randn(2, 768)
+        mock_output.predicted_activation = torch.randn(2, 768, requires_grad=True)
         trainer.fsdp_critic.return_value = mock_output
 
         # Create batch
