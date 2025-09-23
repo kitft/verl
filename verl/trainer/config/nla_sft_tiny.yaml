@@ -31,6 +31,9 @@ data:
 model:
   partial_pretrain: yujiepan/gemma-2-tiny-random
   trust_remote_code: true
+
+tokenizer:
+  path: models/gemma-with-chat  # Use tokenizer with chat template
   enable_gradient_checkpointing: false
   use_liger: false
   strategy: fsdp2

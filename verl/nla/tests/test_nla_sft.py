@@ -1,18 +1,19 @@
 """Comprehensive tests for NLA SFT components."""
 
-import torch
-import pytest
 import tempfile
-import pandas as pd
-import numpy as np
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+from transformers import AutoTokenizer
 
 # Import NLA components
-from verl.nla.data.nla_sft_dataset import NLASFTDataset, NLASFTCollator
-from verl.nla.models.nla_wrapper import NLAModelWrapper, InjectionConfig
+from verl.nla.data.nla_sft_dataset import NLASFTCollator, NLASFTDataset
 from verl.nla.models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
+from verl.nla.models.nla_wrapper import InjectionConfig, NLAModelWrapper
 from verl.nla.trainer.nla_sft_trainer import NLASFTTrainer
 
 
@@ -30,21 +31,16 @@ def mock_tokenizer():
 
     # Mock tokenizer call
     def tokenizer_call(text, **kwargs):
-        mock_output = {
-            "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
-            "attention_mask": torch.tensor([[1, 1, 1, 1, 1]])
-        }
+        mock_output = {"input_ids": torch.tensor([[1, 2, 3, 4, 5]]), "attention_mask": torch.tensor([[1, 1, 1, 1, 1]])}
         if kwargs.get("padding") == "max_length":
             max_len = kwargs.get("max_length", 10)
             pad_len = max_len - 5
-            mock_output["input_ids"] = torch.cat([
-                mock_output["input_ids"][0],
-                torch.zeros(pad_len, dtype=torch.long)
-            ]).unsqueeze(0)
-            mock_output["attention_mask"] = torch.cat([
-                mock_output["attention_mask"][0],
-                torch.zeros(pad_len, dtype=torch.long)
-            ]).unsqueeze(0)
+            mock_output["input_ids"] = torch.cat(
+                [mock_output["input_ids"][0], torch.zeros(pad_len, dtype=torch.long)]
+            ).unsqueeze(0)
+            mock_output["attention_mask"] = torch.cat(
+                [mock_output["attention_mask"][0], torch.zeros(pad_len, dtype=torch.long)]
+            ).unsqueeze(0)
         return mock_output
 
     tokenizer.side_effect = tokenizer_call
@@ -57,14 +53,13 @@ def sample_data_file():
     """Create a temporary parquet file with sample data."""
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
         # Create sample data
-        data = pd.DataFrame({
-            "prompt": ["What is AI?", "Explain machine learning"],
-            "response": ["AI is artificial intelligence", "ML is a subset of AI"],
-            "activation_vector": [
-                np.random.randn(768).tolist(),
-                np.random.randn(768).tolist()
-            ]
-        })
+        data = pd.DataFrame(
+            {
+                "prompt": ["What is AI?", "Explain machine learning"],
+                "response": ["AI is artificial intelligence", "ML is a subset of AI"],
+                "activation_vector": [np.random.randn(768).tolist(), np.random.randn(768).tolist()],
+            }
+        )
         data.to_parquet(f.name)
         yield f.name
         # Cleanup
@@ -89,7 +84,7 @@ def mock_config():
             "pooling": "last",
             "dropout": 0.1,
             "projection_layers": 2,
-        }
+        },
     }
     config.model.get.side_effect = lambda k, d=None: model_config_dict.get(k, d)
 
@@ -123,7 +118,7 @@ def mock_config():
         "use_shm": False,
         "prompt_key": "prompt",
         "response_key": "response",
-        "apply_chat_template_kwargs": {}
+        "apply_chat_template_kwargs": {},
     }.get(k, default)
 
     # Optimizer config
@@ -172,15 +167,10 @@ class TestNLASFTDataset:
             "use_shm": False,
             "prompt_key": "prompt",
             "response_key": "response",
-            "apply_chat_template_kwargs": {}
+            "apply_chat_template_kwargs": {},
         }.get(k, default)
 
-        dataset = NLASFTDataset(
-            parquet_files=sample_data_file,
-            tokenizer=mock_tokenizer,
-            config=config,
-            mode="actor"
-        )
+        dataset = NLASFTDataset(parquet_files=sample_data_file, tokenizer=mock_tokenizer, config=config, mode="actor")
 
         assert len(dataset) == 2
         assert len(dataset.activation_vectors) == 2
@@ -198,15 +188,10 @@ class TestNLASFTDataset:
             "use_shm": False,
             "prompt_key": "prompt",
             "response_key": "response",
-            "apply_chat_template_kwargs": {}
+            "apply_chat_template_kwargs": {},
         }.get(k, default)
 
-        dataset = NLASFTDataset(
-            parquet_files=sample_data_file,
-            tokenizer=mock_tokenizer,
-            config=config,
-            mode="actor"
-        )
+        dataset = NLASFTDataset(parquet_files=sample_data_file, tokenizer=mock_tokenizer, config=config, mode="actor")
 
         sample = dataset[0]
         assert "activation_vectors" in sample
@@ -227,15 +212,10 @@ class TestNLASFTDataset:
             "use_shm": False,
             "prompt_key": "prompt",
             "response_key": "response",
-            "apply_chat_template_kwargs": {}
+            "apply_chat_template_kwargs": {},
         }.get(k, default)
 
-        dataset = NLASFTDataset(
-            parquet_files=sample_data_file,
-            tokenizer=mock_tokenizer,
-            config=config,
-            mode="critic"
-        )
+        dataset = NLASFTDataset(parquet_files=sample_data_file, tokenizer=mock_tokenizer, config=config, mode="critic")
 
         sample = dataset[0]
         assert "response_ids" in sample
@@ -255,15 +235,10 @@ class TestNLASFTDataset:
             "use_shm": False,
             "prompt_key": "prompt",
             "response_key": "response",
-            "apply_chat_template_kwargs": {}
+            "apply_chat_template_kwargs": {},
         }.get(k, default)
 
-        dataset = NLASFTDataset(
-            parquet_files=sample_data_file,
-            tokenizer=mock_tokenizer,
-            config=config,
-            mode="both"
-        )
+        dataset = NLASFTDataset(parquet_files=sample_data_file, tokenizer=mock_tokenizer, config=config, mode="both")
 
         sample = dataset[0]
         # Should have both actor and critic fields
@@ -287,13 +262,13 @@ class TestNLASFTCollator:
             {
                 "input_ids": torch.tensor([1, 2, 3, 4, 5]),
                 "attention_mask": torch.tensor([1, 1, 1, 1, 1]),
-                "activation_vectors": torch.randn(768)
+                "activation_vectors": torch.randn(768),
             },
             {
                 "input_ids": torch.tensor([6, 7, 8, 9, 10]),
                 "attention_mask": torch.tensor([1, 1, 1, 1, 1]),
-                "activation_vectors": torch.randn(768)
-            }
+                "activation_vectors": torch.randn(768),
+            },
         ]
 
         batch = collator(samples)
@@ -311,15 +286,15 @@ class TestNLASFTCollator:
                 "attention_mask": torch.tensor([1, 1, 1, 1, 1]),
                 "response_ids": torch.tensor([11, 12, 13, 14, 15]),
                 "response_attention_mask": torch.tensor([1, 1, 1, 1, 1]),
-                "activation_vectors": torch.randn(768)
+                "activation_vectors": torch.randn(768),
             },
             {
                 "input_ids": torch.tensor([6, 7, 8, 9, 10]),
                 "attention_mask": torch.tensor([1, 1, 1, 1, 1]),
                 "response_ids": torch.tensor([16, 17, 18, 19, 20]),
                 "response_attention_mask": torch.tensor([1, 1, 1, 1, 1]),
-                "activation_vectors": torch.randn(768)
-            }
+                "activation_vectors": torch.randn(768),
+            },
         ]
 
         batch = collator(samples)
@@ -337,18 +312,10 @@ class TestNLAModelWrapper:
         base_model.config.hidden_size = 768
 
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        config = InjectionConfig(
-            mode="replace",
-            layer_indices=[0],
-            injection_token="|"
-        )
+        config = InjectionConfig(mode="replace", layer_indices=[0], injection_token="|")
 
         wrapper = NLAModelWrapper(
-            base_model=base_model,
-            injection_config=config,
-            hidden_dim=768,
-            activation_dim=768,
-            tokenizer=tokenizer
+            base_model=base_model, injection_config=config, hidden_dim=768, activation_dim=768, tokenizer=tokenizer
         )
 
         assert wrapper.hidden_dim == 768
@@ -361,26 +328,20 @@ class TestNLAModelWrapper:
         base_model.config.hidden_size = 768
 
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        config = InjectionConfig(
-            mode="replace",
-            layer_indices=[0],
-            injection_token="|"
-        )
+        config = InjectionConfig(mode="replace", layer_indices=[0], injection_token="|")
 
         wrapper = NLAModelWrapper(
-            base_model=base_model,
-            injection_config=config,
-            hidden_dim=768,
-            activation_dim=768,
-            tokenizer=tokenizer
+            base_model=base_model, injection_config=config, hidden_dim=768, activation_dim=768, tokenizer=tokenizer
         )
 
         # Create input with injection tokens
         injection_token_id = tokenizer.convert_tokens_to_ids("|")
-        input_ids = torch.tensor([
-            [1, 2, injection_token_id, 4, 5],  # Injection at position 2
-            [6, 7, 8, injection_token_id, 10],  # Injection at position 3
-        ])
+        input_ids = torch.tensor(
+            [
+                [1, 2, injection_token_id, 4, 5],  # Injection at position 2
+                [6, 7, 8, injection_token_id, 10],  # Injection at position 3
+            ]
+        )
 
         positions = wrapper._find_injection_positions(input_ids)
         assert len(positions) == 2
@@ -395,18 +356,10 @@ class TestNLAModelWrapper:
         base_model.get_input_embeddings = MagicMock(return_value=MagicMock())
 
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        config = InjectionConfig(
-            mode="replace",
-            layer_indices=[0],
-            injection_token="|"
-        )
+        config = InjectionConfig(mode="replace", layer_indices=[0], injection_token="|")
 
         wrapper = NLAModelWrapper(
-            base_model=base_model,
-            injection_config=config,
-            hidden_dim=768,
-            activation_dim=768,
-            tokenizer=tokenizer
+            base_model=base_model, injection_config=config, hidden_dim=768, activation_dim=768, tokenizer=tokenizer
         )
 
         # Mock the base model forward
@@ -419,16 +372,10 @@ class TestNLAModelWrapper:
         activation_vectors = torch.randn(1, 768)
 
         # Forward pass
-        output = wrapper.forward(
-            input_ids=input_ids,
-            activation_vectors=activation_vectors
-        )
+        output = wrapper.forward(input_ids=input_ids, activation_vectors=activation_vectors)
 
         # Check that injection was attempted
         assert base_model.called or base_model.get_input_embeddings.called
-
-
-
 
 
 class TestAutoModelForCausalLMWithVectorValueHead:
@@ -442,9 +389,10 @@ class TestAutoModelForCausalLMWithVectorValueHead:
 
     def test_forward_pass(self):
         """Test forward pass returns vector values."""
-        # This test would require a real model from HuggingFace  
+        # This test would require a real model from HuggingFace
         # Skipping for now as it needs the tiny model loaded
         pass
+
 
 class TestNLASFTTrainer:
     """Test NLA SFT Trainer."""
@@ -470,7 +418,7 @@ class TestNLASFTTrainer:
             tokenizer=tokenizer,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
-            train_mode="both"
+            train_mode="both",
         )
 
         assert trainer.train_mode == "both"
@@ -488,7 +436,7 @@ class TestNLASFTTrainer:
             ulysses_device_mesh=MagicMock(),
             tokenizer=mock_tokenizer,
             train_dataset=MagicMock(),
-            train_mode="actor"
+            train_mode="actor",
         )
 
         # Mock the FSDP model
@@ -505,7 +453,7 @@ class TestNLASFTTrainer:
             "input_ids": torch.randint(0, 50257, (2, 11)),
             "attention_mask": torch.ones(2, 11),
             "loss_mask": torch.ones(2, 11),
-            "activation_vectors": torch.randn(2, 768)
+            "activation_vectors": torch.randn(2, 768),
         }
 
         # Compute loss
@@ -524,7 +472,7 @@ class TestNLASFTTrainer:
             ulysses_device_mesh=MagicMock(),
             tokenizer=mock_tokenizer,
             train_dataset=MagicMock(),
-            train_mode="critic"
+            train_mode="critic",
         )
         # Set config manually since we mocked __init__
         trainer.config = mock_config
@@ -538,13 +486,13 @@ class TestNLASFTTrainer:
                 super().__init__()
                 self.embed = nn.Embedding(100, 768)
                 self.layer = nn.Linear(768, 768)
-                self.config = type('Config', (), {'hidden_size': 768})()
+                self.config = type("Config", (), {"hidden_size": 768})()
 
             def forward(self, input_ids, attention_mask=None, output_hidden_states=False, **kwargs):
                 x = self.embed(input_ids)
                 x = self.layer(x)
                 # Return output object with proper structure
-                output = type('Output', (), {})()
+                output = type("Output", (), {})()
                 # For transformers compatibility, hidden_states should be a tuple of layer outputs
                 if output_hidden_states:
                     output.hidden_states = (x,)  # Tuple of hidden states from each layer
@@ -553,7 +501,6 @@ class TestNLASFTTrainer:
                 return output
 
         # Create real critic with AutoModelForCausalLMWithVectorValueHead
-        from verl.nla.models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
         real_critic = AutoModelForCausalLMWithVectorValueHead.from_pretrained("yujiepan/gemma-2-tiny-random")
 
         # Add clip_grad_norm_ method to the critic (FSDP models have this)
@@ -571,7 +518,7 @@ class TestNLASFTTrainer:
         batch = {
             "response_ids": torch.randint(0, 100, (2, 10)),
             "response_attention_mask": torch.ones(2, 10),
-            "activation_vectors": torch.randn(2, 768)
+            "activation_vectors": torch.randn(2, 768),
         }
 
         # Train critic - this should now work with real gradients
@@ -608,14 +555,11 @@ def test_end_to_end_training(mock_fsdp, mock_model_load, sample_data_file, mock_
         "use_shm": False,
         "prompt_key": "prompt",
         "response_key": "response",
-        "apply_chat_template_kwargs": {}
+        "apply_chat_template_kwargs": {},
     }.get(k, default)
 
     train_dataset = NLASFTDataset(
-        parquet_files=sample_data_file,
-        tokenizer=tokenizer,
-        config=dataset_config,
-        mode="both"
+        parquet_files=sample_data_file, tokenizer=tokenizer, config=dataset_config, mode="both"
     )
 
     # Would create trainer and run training step

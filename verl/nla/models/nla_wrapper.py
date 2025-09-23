@@ -188,16 +188,17 @@ class NLAModelWrapper(BaseWrapper):
 
     def __getattr__(self, name):
         """Delegate unknown attributes to base model."""
-        # Check if base_model exists in instance dictionary
-        if "base_model" not in self.__dict__:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-
-        # Check if it's in our modules first (for dynamically added modules)
+        # First check if it's in our modules (including base_model)
         if "_modules" in self.__dict__ and name in self._modules:
             return self._modules[name]
 
-        # Delegate to base model
-        return getattr(self.base_model, name)
+        # Check if base_model exists as a module
+        if "_modules" in self.__dict__ and "base_model" in self._modules:
+            # Delegate to base model
+            return getattr(self._modules["base_model"], name)
+
+        # Fallback error
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     def forward(
         self,

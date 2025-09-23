@@ -4,8 +4,7 @@ import torch
 from typing import Dict, Optional, Any
 from verl.protocol import DataProto
 from verl.workers.fsdp_workers import ActorRolloutRefWorker as FSDPActorRolloutRefWorker
-from verl.single_controller.base.decorator import register
-from verl.single_controller.base import Dispatch
+from verl.single_controller.base.decorator import register, Dispatch
 from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
 
 

@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """Test script to verify NLA setup with fake dataset and tiny model."""
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from omegaconf import OmegaConf
-import pandas as pd
 import sys
-import os
+
+import pandas as pd
+import torch
+from omegaconf import OmegaConf
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add verl to path
-sys.path.insert(0, 'verl')
+sys.path.insert(0, "verl")
 
-from verl.verl.nla.data.nla_sft_dataset import NLASFTDataset, NLASFTCollator
+from verl.verl.nla.data.nla_sft_dataset import NLASFTCollator, NLASFTDataset
 
 
 def test_dataset_loading():
@@ -50,7 +50,7 @@ def test_model_loading():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"✓ Tokenizer loaded")
+    print("✓ Tokenizer loaded")
     print(f"  - Vocab size: {tokenizer.vocab_size}")
     print(f"  - EOS token: {tokenizer.eos_token}")
     print(f"  - PAD token: {tokenizer.pad_token}")
@@ -58,13 +58,10 @@ def test_model_loading():
     # Load model
     print(f"\nLoading model from {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-        device_map="cpu"
+        model_name, trust_remote_code=True, torch_dtype=torch.float32, device_map="cpu"
     )
 
-    print(f"✓ Model loaded")
+    print("✓ Model loaded")
     print(f"  - Model type: {model.config.model_type}")
     print(f"  - Hidden size: {model.config.hidden_size}")
     print(f"  - Num layers: {model.config.num_hidden_layers}")
@@ -80,29 +77,25 @@ def test_nla_dataset_class():
     print("=" * 50)
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        "yujiepan/gemma-2-tiny-random",
-        trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained("yujiepan/gemma-2-tiny-random", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Create config
-    config = OmegaConf.create({
-        "activation_dim": 128,
-        "injection_token": "<INJECT>",
-        "max_length": 512,
-        "truncation": "right",
-        "padding": "right",
-    })
+    config = OmegaConf.create(
+        {
+            "activation_dim": 128,
+            "injection_token": "<INJECT>",
+            "max_length": 512,
+            "truncation": "right",
+            "padding": "right",
+        }
+    )
 
     # Test actor mode
     print("\nTesting Actor mode...")
     actor_dataset = NLASFTDataset(
-        parquet_files="test_nla_dataset.parquet",
-        tokenizer=tokenizer,
-        config=config,
-        mode="actor"
+        parquet_files="test_nla_dataset.parquet", tokenizer=tokenizer, config=config, mode="actor"
     )
 
     sample = actor_dataset[0]
@@ -113,10 +106,7 @@ def test_nla_dataset_class():
     # Test critic mode
     print("\nTesting Critic mode...")
     critic_dataset = NLASFTDataset(
-        parquet_files="test_nla_dataset.parquet",
-        tokenizer=tokenizer,
-        config=config,
-        mode="critic"
+        parquet_files="test_nla_dataset.parquet", tokenizer=tokenizer, config=config, mode="critic"
     )
 
     sample = critic_dataset[0]
@@ -151,11 +141,7 @@ def test_generation():
 
     with torch.no_grad():
         outputs = model.generate(
-            **inputs,
-            max_new_tokens=50,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id
+            **inputs, max_new_tokens=50, temperature=0.7, do_sample=True, pad_token_id=tokenizer.pad_token_id
         )
 
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -189,6 +175,7 @@ def main():
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

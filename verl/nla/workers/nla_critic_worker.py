@@ -4,8 +4,7 @@ import torch
 from typing import Dict, Optional, Any
 from verl.workers.fsdp_workers import CriticWorker
 from verl.nla.models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
-from verl import register
-from verl.single_controller.base import Dispatch
+from verl.single_controller.base.decorator import register, Dispatch
 from verl.single_controller.ray.base import RayResourcePool, RayClassWithInitArgs
 
 
