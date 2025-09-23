@@ -24,7 +24,7 @@ The NLA framework implements a novel training paradigm where:
    │  └─ Activation vectors repeated for each trajectory
    ├─ Actor Generation
    │  ├─ NLAActorWorker extracts vectors from DataProto
-   │  ├─ NLAModelWrapper injects at <INJECT> positions
+   │  ├─ NLAModelWrapper injects at injection token positions
    │  └─ Generates N diverse responses per prompt
    ├─ Critic Evaluation
    │  ├─ NLAAutoencoderCritic predicts activation vectors
@@ -60,7 +60,7 @@ NLAActorWorker.generate_sequences(data_proto)
 
 # 4. Model injects at token positions
 NLAModelWrapper.forward()
-→ Finds <INJECT> token positions
+→ Finds injection token positions (auto-selected rare character)
 → Replaces embeddings with activation vectors
 → Generates conditioned text
 
@@ -83,7 +83,7 @@ MSE(predicted_activation, original_activation)
 
 1. **NLAModelWrapper** (`models/nla_wrapper.py`)
    - Wraps any transformer model to support activation injection
-   - Injects activation vectors at specified token positions marked with `<INJECT>`
+   - Injects activation vectors at specified token positions
    - Supports multiple injection modes: replace, add, or project
    - Seamlessly integrates with HuggingFace generation
 
@@ -96,6 +96,41 @@ MSE(predicted_activation, original_activation)
    - **SFT Phase**: Supervised pre-training for both actor and critic
    - **GRPO Training**: Group Relative Policy Optimization with multiple trajectories
    - **PPO Training**: Standard PPO with activation-based rewards
+
+### Injection Token System
+
+The NLA framework uses a sophisticated injection token system that **does not modify the tokenizer vocabulary**:
+
+1. **Automatic Token Selection** (`utils/injection_manager.py`)
+   - Automatically finds a suitable existing rare token from the vocabulary
+   - Prefers rarely-used Chinese characters (e.g., "㊗", "㊙", "㊚") that tokenize to single tokens
+   - No tokenizer resizing or embedding matrix modifications needed
+   - Compatible with all tokenizer backends including Rust implementations
+
+2. **Token Requirements**
+   - Must already exist in the tokenizer vocabulary
+   - Must tokenize to exactly one token ID
+   - Must preserve structure when wrapped in `<concept>` tags
+   - The injection character appears only within `<concept>CharacterHere</concept>` tags
+
+3. **Usage Example**
+   ```python
+   from verl.nla.utils.injection_manager import InjectionTokenManager
+
+   # Auto-select a suitable token
+   manager = InjectionTokenManager(tokenizer)
+   print(f"Using '{manager.character}' (ID: {manager.token_id}) for injection")
+
+   # Text with injection marker
+   text = f"Explain <concept>{manager.character}</concept> in detail"
+   ```
+
+4. **Benefits**
+   - No model architecture changes required
+   - Maintains exact compatibility with pretrained models
+   - Works with any tokenizer that has Unicode support
+   - Fail-fast behavior if no suitable token found
+   - Clean separation between concept markers and actual text
 
 ## Supervised Fine-Tuning (SFT) Phase
 
@@ -138,7 +173,7 @@ model:
   injection:
     mode: "replace"  # or "add", "project"
     layer_indices: [0]  # embedding layer
-    injection_token: "<INJECT>"
+    injection_token: null  # Auto-selects suitable rare token from vocab
 
 trainer:
   train_mode: "both"  # or "actor", "critic"
@@ -213,7 +248,7 @@ See `trainer/nla_ppo_trainer.py` for implementation.
 
 **NLARLDataset** - RL training dataset
 - Loads prompts and activation vectors from parquet
-- Automatically inserts `<INJECT>` tokens
+- Automatically inserts injection tokens (auto-selected rare characters)
 - Handles various activation formats (lists, numpy, tensors)
 - Validates activation dimensions
 
@@ -234,7 +269,7 @@ See `trainer/nla_ppo_trainer.py` for implementation.
 
 **NLAModelWrapper** - Activation injection
 - Wraps any transformer model
-- Finds `<INJECT>` token positions
+- Finds injection token positions (wrapped in `<concept>` tags)
 - Replaces/adds/projects activation vectors at embeddings
 - Maintains compatibility with HuggingFace generation
 
@@ -327,7 +362,7 @@ from verl.nla.workers import create_nla_actor_worker
 dataset = create_nla_rl_dataset(
     data_files=["nla_train.parquet"],
     tokenizer=tokenizer,
-    config={"activation_dim": 768, "injection_token": "<INJECT>"}
+    config={"activation_dim": 768, "injection_token": None}  # Auto-selects
 )
 
 # 2. Wrap actor worker for injection
@@ -353,18 +388,23 @@ trainer.fit()
 
 ```python
 from verl.nla.models import NLAModelWrapper, InjectionConfig
+from verl.nla.utils.injection_manager import InjectionTokenManager
+
+# Set up injection token
+injection_mgr = InjectionTokenManager(tokenizer)
 
 # Wrap model for injection
 wrapped_model = NLAModelWrapper(
     base_model=your_model,
     injection_config=InjectionConfig(
         mode="replace",
-        injection_token_id=tokenizer.convert_tokens_to_ids("<INJECT>")
+        injection_token_id=injection_mgr.token_id,
+        injection_character=injection_mgr.character
     )
 )
 
 # Generate with activation
-prompt = "Explain <INJECT> in detail"
+prompt = f"Explain <concept>{injection_mgr.character}</concept> in detail"
 inputs = tokenizer(prompt, return_tensors="pt")
 activation_vector = torch.randn(1, 768)  # Your activation
 
