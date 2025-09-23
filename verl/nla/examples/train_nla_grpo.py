@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Example script for training NLA with GRPO.
+Example script for training NLA with GRPO using Hydra configuration.
 
 This script demonstrates how to:
 1. Set up NLA datasets with activation vectors
@@ -9,9 +9,12 @@ This script demonstrates how to:
 4. Train both actor and critic with the GRPO objective
 """
 
+import os
 import torch
+import hydra
 from omegaconf import OmegaConf, DictConfig
 from transformers import AutoTokenizer
+from pathlib import Path
 
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
@@ -24,110 +27,7 @@ from verl.nla.workers.nla_actor_worker import create_nla_actor_worker
 from verl.nla.integration.dataproto_adapter import NLADataProtoAdapter
 
 
-def create_config() -> DictConfig:
-    """Create configuration for NLA GRPO training."""
-    config = OmegaConf.create({
-        # Model configuration
-        "model": {
-            "model_name": "meta-llama/Llama-2-7b-hf",
-            "activation_dim": 768,
-            "injection": {
-                "mode": "replace",
-                "layer_indices": [0],
-                "injection_token": "<INJECT>",
-                "injection_token_id": None,  # Will be auto-assigned
-                "projection_dim": None,
-            }
-        },
-
-        # GRPO configuration
-        "grpo": {
-            "num_trajectories_per_prompt": 4,
-            "group_normalize_advantages": True,
-            "critic_supervised_weight": 1.0,
-            "critic_learning_rate": 5e-5,
-            "critic_train_epochs": 1,
-            "reward_normalize": False,
-            "reward_transform": "negative",
-            "reward_scale": 1.0,
-            "activation_dim": 768,
-            "use_pooling": "last",
-        },
-
-        # Data configuration
-        "data": {
-            "train_files": ["data/nla_train.parquet"],
-            "val_files": ["data/nla_val.parquet"],
-            "train_batch_size": 32,
-            "val_batch_size": 32,
-            "prompt_key": "prompt",
-            "activation_vector_key": "activation_vector",
-            "max_prompt_length": 512,
-            "injection_token": "<INJECT>",
-            "injection_position": "end",
-            "activation_dim": 768,
-        },
-
-        # Training configuration
-        "trainer": {
-            "total_epochs": 3,
-            "total_training_steps": None,
-            "save_freq": 100,
-            "val_freq": 50,
-            "project_name": "nla_grpo",
-            "experiment_name": "autoencoder_training",
-            "device": "cuda",
-        },
-
-        # Algorithm configuration
-        "algorithm": {
-            "adv_estimator": "grpo",
-            "gamma": 1.0,
-            "lam": 1.0,
-            "use_kl_in_reward": False,
-        },
-
-        # Actor/Rollout configuration
-        "actor_rollout_ref": {
-            "model": {
-                "model_name": "meta-llama/Llama-2-7b-hf",
-                "lora_rank": 0,  # Can use LoRA if needed
-            },
-            "rollout": {
-                "n": 1,  # This is overridden by GRPO's num_trajectories_per_prompt
-                "temperature": 1.0,
-                "top_k": 50,
-                "top_p": 0.9,
-                "do_sample": True,
-                "max_new_tokens": 128,
-            },
-            "actor": {
-                "optim": {
-                    "lr": 1e-5,
-                    "weight_decay": 0.01,
-                },
-            },
-        },
-
-        # Critic configuration
-        "critic": {
-            "model_name": "meta-llama/Llama-2-7b-hf",
-            "pooling": "last",
-            "dropout": 0.1,
-            "projection_layers": 2,
-        },
-
-        # Resource configuration
-        "resource_pool": {
-            "actor_rollout": [4],  # 4 GPUs for actor
-            "critic": [2],  # 2 GPUs for critic
-        },
-    })
-
-    return config
-
-
-def setup_tokenizer(model_name: str, injection_token: str):
+def setup_tokenizer(model_name: str, injection_token: str = None):
     """Set up tokenizer with injection token."""
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -135,139 +35,199 @@ def setup_tokenizer(model_name: str, injection_token: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Add injection token
-    if injection_token not in tokenizer.get_vocab():
+    # Add injection token if specified (otherwise InjectionManager will auto-select)
+    if injection_token and injection_token not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({"additional_special_tokens": [injection_token]})
         print(f"Added injection token '{injection_token}' to tokenizer")
 
     return tokenizer
 
 
-def create_datasets(config: DictConfig, tokenizer):
+def create_datasets(cfg: DictConfig, tokenizer):
     """Create NLA datasets with activation vectors."""
+
+    # Convert OmegaConf lists to regular Python lists
+    train_files = list(cfg.data.train_dataset.parquet_files)
+    val_files = list(cfg.data.val_dataset.parquet_files) if cfg.data.val_dataset.parquet_files else None
+
     train_dataset = create_nla_rl_dataset(
-        data_files=config.data.train_files,
+        data_files=train_files,
         tokenizer=tokenizer,
-        config=OmegaConf.to_container(config.data),
+        config={
+            "prompt_key": cfg.data.train_dataset.prompt_key,
+            "activation_vector_key": cfg.data.train_dataset.activation_vector_key,
+            "max_prompt_length": cfg.data.train_dataset.max_prompt_length,
+            "injection_token": cfg.data.train_dataset.injection_token,
+            "injection_position": cfg.data.train_dataset.injection_position,
+            "activation_dim": cfg.data.train_dataset.activation_dim,
+        }
     )
 
-    val_dataset = create_nla_rl_dataset(
-        data_files=config.data.val_files,
-        tokenizer=tokenizer,
-        config=OmegaConf.to_container(config.data),
-    )
+    val_dataset = None
+    if val_files:
+        val_dataset = create_nla_rl_dataset(
+            data_files=val_files,
+            tokenizer=tokenizer,
+            config={
+                "prompt_key": cfg.data.val_dataset.prompt_key,
+                "activation_vector_key": cfg.data.val_dataset.activation_vector_key,
+                "max_prompt_length": cfg.data.val_dataset.max_prompt_length,
+                "injection_token": cfg.data.val_dataset.injection_token,
+                "injection_position": cfg.data.val_dataset.injection_position,
+                "activation_dim": cfg.data.val_dataset.activation_dim,
+            }
+        )
 
     return train_dataset, val_dataset
 
 
-def create_worker_mapping(config: DictConfig):
-    """
-    Create role-to-worker mapping with NLA customization.
+def setup_resource_pool(cfg: DictConfig):
+    """Set up Ray resource pool for distributed training."""
+    # Get GPU settings from config
+    actor_gpus = cfg.get('distributed', {}).get('actor_gpus', 1)
+    critic_gpus = cfg.get('distributed', {}).get('critic_gpus', 1)
 
-    This is where we inject our custom NLA actor worker.
-    """
-    from verl.workers.fsdp_workers import ActorRolloutRefWorker
-    from verl.workers.fsdp_workers import CriticWorker
-
-    # Create NLA-wrapped actor worker
-    nla_actor_worker = create_nla_actor_worker(
-        base_worker_cls=ActorRolloutRefWorker,
-        config=OmegaConf.to_container(config),
+    # Create resource pool
+    ray_resource_pool = RayResourcePool(
+        actor_rollout=[actor_gpus],
+        critic=[critic_gpus],
     )
 
-    role_worker_mapping = {
-        Role.ActorRollout: nla_actor_worker,
-        Role.Critic: CriticWorker,  # Standard critic worker (GRPO will customize it)
-    }
+    # Set up worker groups
+    manager = ResourcePoolManager(ray_resource_pool)
 
-    return role_worker_mapping
+    # Create actor worker with NLA support
+    actor_worker_cls = create_nla_actor_worker(cfg.model)
 
-
-def create_resource_pool_manager(config: DictConfig) -> ResourcePoolManager:
-    """Create resource pool manager for distributed training."""
-    resource_pool_spec = {
-        "actor_rollout": config.resource_pool.actor_rollout,
-        "critic": config.resource_pool.critic,
-    }
-
-    mapping = {
-        Role.ActorRollout: "actor_rollout",
-        Role.Critic: "critic",
-    }
-
-    return ResourcePoolManager(
-        resource_pool_spec=resource_pool_spec,
-        mapping=mapping,
+    # Create worker group
+    worker_group = RayWorkerGroup(
+        resource_pool=ray_resource_pool,
+        ray_actor_cls=actor_worker_cls,
+        ray_init_config={"num_gpus": actor_gpus},
     )
 
+    return manager, worker_group
 
-def main():
+
+def create_trainer(cfg: DictConfig, train_dataset, val_dataset, tokenizer):
+    """Create NLA GRPO trainer."""
+
+    # Convert config to format expected by trainer
+    trainer_config = GRPOTrainerConfig(
+        # Model settings
+        model_name=cfg.model.model_name,
+        critic_model_name=cfg.model.critic.model_name,
+        activation_dim=cfg.model.actor.get('activation_dim', cfg.data.train_dataset.activation_dim),
+
+        # Training settings
+        num_epochs=cfg.training.num_epochs,
+        max_steps=cfg.training.max_steps,
+        batch_size=cfg.data.batch_size,
+        eval_batch_size=cfg.data.eval_batch_size,
+        learning_rate=cfg.training.learning_rate,
+
+        # GRPO specific
+        num_responses_per_prompt=cfg.grpo.num_responses_per_prompt,
+        temperature=cfg.grpo.temperature,
+        max_new_tokens=cfg.grpo.max_new_tokens,
+        use_nla_reward=cfg.grpo.use_nla_reward,
+        reconstruction_weight=cfg.grpo.reconstruction_weight,
+
+        # PPO settings
+        ppo_epochs=cfg.grpo.ppo_epochs,
+        eps_clip=cfg.grpo.eps_clip,
+        value_loss_coef=cfg.grpo.value_loss_coef,
+        entropy_coef=cfg.grpo.entropy_coef,
+
+        # Output settings
+        output_dir=cfg.training.output_dir,
+        logging_steps=cfg.training.logging_steps,
+        eval_steps=cfg.training.eval_steps,
+        save_steps=cfg.training.save_steps,
+
+        # Debug
+        debug=cfg.debug.enabled,
+    )
+
+    # Create trainer
+    trainer = NLAGRPOTrainer(
+        config=trainer_config,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
+        nla_config=cfg.model.injection,
+    )
+
+    return trainer
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="test_tiny_grpo_config")
+def main(cfg: DictConfig):
     """Main training function."""
-    print("Starting NLA GRPO Training")
+    print("="*60)
+    print("Starting NLA GRPO Training with Hydra Configuration")
+    print("="*60)
 
-    # Create configuration
-    config = create_config()
+    # Print config
+    print("\nConfiguration:")
+    print(OmegaConf.to_yaml(cfg))
+
+    # Set device
+    device = cfg.get('device', 'cuda:0')
+    if cfg.get('use_cpu', False):
+        device = 'cpu'
+    torch.cuda.set_device(device) if 'cuda' in device else None
 
     # Set up tokenizer
+    print(f"\n1. Setting up tokenizer for {cfg.model.model_name}")
     tokenizer = setup_tokenizer(
-        model_name=config.model.model_name,
-        injection_token=config.model.injection.injection_token,
+        model_name=cfg.model.model_name,
+        injection_token=cfg.model.injection.injection_token,
     )
 
     # Update config with injection token ID
-    injection_token_id = tokenizer.convert_tokens_to_ids(config.model.injection.injection_token)
-    config.model.injection.injection_token_id = injection_token_id
+    if cfg.model.injection.injection_token:
+        injection_token_id = tokenizer.convert_tokens_to_ids(cfg.model.injection.injection_token)
+        cfg.model.injection.injection_token_id = injection_token_id
+        print(f"   Injection token ID: {injection_token_id}")
 
     # Create datasets
-    train_dataset, val_dataset = create_datasets(config, tokenizer)
-    print(f"Train dataset size: {len(train_dataset)}, Val dataset size: {len(val_dataset)}")
+    print("\n2. Loading datasets")
+    train_dataset, val_dataset = create_datasets(cfg, tokenizer)
+    print(f"   Train dataset size: {len(train_dataset)}")
+    if val_dataset:
+        print(f"   Val dataset size: {len(val_dataset)}")
 
-    # Create worker mapping
-    role_worker_mapping = create_worker_mapping(config)
+    # Set up Ray if using distributed training
+    if cfg.distributed.world_size > 1:
+        print("\n3. Setting up Ray for distributed training")
+        import ray
+        if not ray.is_initialized():
+            ray.init()
+        manager, worker_group = setup_resource_pool(cfg)
+    else:
+        print("\n3. Using single-device training")
+        manager, worker_group = None, None
 
-    # Create resource pool manager
-    resource_pool_manager = create_resource_pool_manager(config)
-
-    # Create GRPO configuration
-    grpo_config = GRPOTrainerConfig(
-        num_trajectories_per_prompt=config.grpo.num_trajectories_per_prompt,
-        group_normalize_advantages=config.grpo.group_normalize_advantages,
-        critic_supervised_weight=config.grpo.critic_supervised_weight,
-        critic_learning_rate=config.grpo.critic_learning_rate,
-        critic_train_epochs=config.grpo.critic_train_epochs,
-        reward_normalize=config.grpo.reward_normalize,
-        reward_transform=config.grpo.reward_transform,
-        reward_scale=config.grpo.reward_scale,
-        activation_dim=config.grpo.activation_dim,
-        use_pooling=config.grpo.use_pooling,
-    )
-
-    # Create NLA GRPO trainer
-    trainer = NLAGRPOTrainer(
-        config=config,
-        tokenizer=tokenizer,
-        role_worker_mapping=role_worker_mapping,
-        resource_pool_manager=resource_pool_manager,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        grpo_config=grpo_config,
-    )
-
-    # Initialize workers
-    print("Initializing distributed workers...")
-    trainer.init_workers()
+    # Create trainer
+    print("\n4. Creating NLA GRPO trainer")
+    trainer = create_trainer(cfg, train_dataset, val_dataset, tokenizer)
 
     # Start training
-    print("Starting GRPO training loop...")
-    trainer.fit()
+    print("\n5. Starting training")
+    print("="*60)
 
-    print("Training completed!")
+    try:
+        trainer.train()
+        print("\n✅ Training completed successfully!")
+    except Exception as e:
+        print(f"\n❌ Training failed with error: {e}")
+        raise
+    finally:
+        # Cleanup
+        if cfg.distributed.world_size > 1 and ray.is_initialized():
+            ray.shutdown()
 
 
 if __name__ == "__main__":
-    # Initialize Ray if needed
-    import ray
-    if not ray.is_initialized():
-        ray.init()
-
     main()

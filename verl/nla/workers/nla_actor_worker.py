@@ -37,8 +37,9 @@ class NLAActorWorker:
                 # First initialize the base model
                 super().init_model()
 
-                # Extract model and config
+                # Extract model, tokenizer and config
                 base_model = self.model
+                tokenizer = getattr(self, 'tokenizer', None)
                 config = getattr(self, 'config', None)
 
                 # Configure injection settings
@@ -46,19 +47,22 @@ class NLAActorWorker:
                     mode=config.model.injection.get("mode", "replace") if config else "replace",
                     layer_indices=config.model.injection.get("layer_indices", [0]) if config else [0],
                     projection_dim=config.model.injection.get("projection_dim", None) if config else None,
-                    injection_token_id=config.model.injection.get("injection_token_id", -1) if config else -1,
+                    injection_token=config.model.injection.get("injection_token", None) if config else None,
+                    # Don't set injection_token_id here - let InjectionTokenManager handle it
                 )
 
                 # Wrap model with NLA wrapper
+                # The tokenizer will be used to auto-select the injection token if not specified
                 self.model = NLAModelWrapper(
                     base_model=base_model,
+                    tokenizer=tokenizer,  # Pass tokenizer for injection token management
                     injection_config=injection_config,
                     hidden_dim=base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None,
                     activation_dim=config.model.get("activation_dim", 768) if config else 768,
                 )
 
                 print(f"Wrapped actor model with NLAModelWrapper")
-                print(f"Injection config: {injection_config}")
+                print(f"Injection token: '{self.model.injection_config.injection_character}' (ID: {self.model.injection_config.injection_token_id})")
 
             def generate_sequences(self, data: DataProto) -> DataProto:
                 """

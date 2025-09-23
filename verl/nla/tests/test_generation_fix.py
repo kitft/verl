@@ -171,7 +171,7 @@ def test_generation_without_injection(mock_fsdp, mock_deepspeed, mock_dist):
     # Create wrapper
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(),
+        injection_config=InjectionConfig(injection_token_id=999),
         hidden_dim=768
     )
 

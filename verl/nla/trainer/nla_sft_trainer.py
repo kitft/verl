@@ -93,8 +93,10 @@ class NLASFTTrainer(FSDPSFTTrainer):
             base_model = self.model  # This is the unwrapped model before FSDP
 
             # Wrap with NLA wrapper
+            # Pass tokenizer to ensure consistent injection token selection
             wrapped_model = NLAModelWrapper(
                 base_model=base_model,
+                tokenizer=self.tokenizer,  # Use the same tokenizer as dataset
                 injection_config=self.injection_config,
                 hidden_dim=base_model.config.hidden_size,
                 activation_dim=self.activation_dim,

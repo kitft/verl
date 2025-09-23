@@ -22,23 +22,23 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         config,
         critic_module: nn.Module,
         critic_optimizer: optim.Optimizer,
-        activation_dim: int = 8,
     ):
         super().__init__(config, critic_module, critic_optimizer)
-        self.activation_dim = activation_dim
+        # Get hidden size from the critic model
+        self.hidden_size = critic_module.config.hidden_size if hasattr(critic_module, 'config') else None
 
     def compute_values(self, data: DataProto) -> torch.Tensor:
         """
         Compute activation vector predictions.
 
         Returns:
-            torch.Tensor: Predicted activation vectors (batch_size, seq_len, activation_dim)
+            torch.Tensor: Predicted activation vectors (batch_size, seq_len, hidden_size)
         """
         # Call parent's compute_values which handles micro-batching and model forward
         # The parent expects scalar values, but our model outputs vectors
         values = super().compute_values(data)
 
-        # Values should be (batch_size, response_len, activation_dim)
+        # Values should be (batch_size, response_len, hidden_size)
         # The parent class already handles extracting just the response portion
         return values
 
@@ -53,8 +53,8 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         Compute MSE loss between predicted and target activations.
 
         Args:
-            predicted_activations: (batch, seq_len, activation_dim)
-            target_activations: (batch, activation_dim)
+            predicted_activations: (batch, seq_len, hidden_size)
+            target_activations: (batch, hidden_size)
             response_mask: Optional mask for valid tokens
             pooling: How to pool sequence predictions ("last", "mean", "max")
 
@@ -122,10 +122,10 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         if "target_activations" not in data.batch:
             raise ValueError("target_activations must be provided in data.batch for NLA critic training")
 
-        target_activations = data.batch["target_activations"]  # (batch, activation_dim)
+        target_activations = data.batch["target_activations"]  # (batch, hidden_size)
 
         # Compute predictions using parent's forward logic
-        predicted_activations = self.compute_values(data)  # (batch, seq_len, activation_dim)
+        predicted_activations = self.compute_values(data)  # (batch, seq_len, hidden_size)
 
         # Get response mask if available
         response_mask = data.batch.get("response_mask", None)
@@ -148,7 +148,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Log metrics
         metrics["critic_loss"] = loss.item()
         metrics["grad_norm"] = grad_norm.item() if torch.isfinite(grad_norm) else float('inf')
-        metrics["activation_dim"] = self.activation_dim
+        metrics["hidden_size"] = self.hidden_size if self.hidden_size else predicted_activations.shape[-1]
 
         # Log some statistics about predictions
         with torch.no_grad():

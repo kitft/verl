@@ -19,8 +19,9 @@ class NLARLDataset(RLHFDataset):
 
     def __init__(
         self,
-        parquet_files: Union[str, List[str]],
+        data_files: Union[str, List[str]],  # Changed from parquet_files to match parent
         tokenizer: Any,
+        config: Optional[Dict] = None,  # Config dict for parent class
         prompt_key: str = "prompt",
         activation_vector_key: str = "activation_vector",
         max_prompt_length: int = 512,
@@ -33,8 +34,9 @@ class NLARLDataset(RLHFDataset):
         Initialize NLA RL dataset.
 
         Args:
-            parquet_files: Path(s) to parquet files containing prompts and activation vectors
+            data_files: Path(s) to parquet files containing prompts and activation vectors
             tokenizer: Tokenizer instance
+            config: Configuration dict for base RLHFDataset
             prompt_key: Column name for prompts in the parquet file
             activation_vector_key: Column name for activation vectors
             max_prompt_length: Maximum length for prompts
@@ -48,17 +50,27 @@ class NLARLDataset(RLHFDataset):
         self.injection_position = injection_position
         self.activation_dim = activation_dim
 
+        # Create config if not provided
+        if config is None:
+            config = {
+                "prompt_key": prompt_key,
+                "max_prompt_length": max_prompt_length,
+            }
+        else:
+            # Update config with our parameters
+            config["prompt_key"] = prompt_key
+            config["max_prompt_length"] = max_prompt_length
+
         # Set up injection token management
         self.injection_manager = InjectionTokenManager(tokenizer, injection_token)
         self.injection_token = self.injection_manager.character
         self.injection_token_id = self.injection_manager.token_id
 
-        # Initialize base dataset
+        # Initialize base dataset with correct parameters
         super().__init__(
-            parquet_files=parquet_files,
+            data_files=data_files,
             tokenizer=tokenizer,
-            prompt_key=prompt_key,
-            max_prompt_length=max_prompt_length,
+            config=config,
             **kwargs
         )
 
@@ -187,13 +199,20 @@ def create_nla_rl_dataset(
     """
     config = config or {}
 
+    # Create base config for RLHFDataset
+    base_config = {
+        "prompt_key": config.get("prompt_key", "prompt"),
+        "max_prompt_length": config.get("max_prompt_length", 512),
+    }
+
     dataset = NLARLDataset(
-        parquet_files=data_files,
+        data_files=data_files,
         tokenizer=tokenizer,
+        config=base_config,
         prompt_key=config.get("prompt_key", "prompt"),
         activation_vector_key=config.get("activation_vector_key", "activation_vector"),
         max_prompt_length=config.get("max_prompt_length", 512),
-        injection_token=config.get("injection_token", "<INJECT>"),
+        injection_token=config.get("injection_token", None),
         injection_position=config.get("injection_position", "end"),
         activation_dim=config.get("activation_dim", 768),
     )

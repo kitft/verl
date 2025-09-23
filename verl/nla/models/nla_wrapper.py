@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any, List, Tuple, Union
 from dataclasses import dataclass
+from verl.nla.utils.injection_manager import InjectionTokenManager
 
 # Try to import GenerationMixin for proper generation support
 try:
@@ -24,8 +25,10 @@ class InjectionConfig:
     mode: str = "replace"  # "replace", "add", or "project"
     layer_indices: List[int] = None  # Which layers to inject at
     projection_dim: Optional[int] = None  # For learnable projection
-    injection_token_id: int = -1  # Token ID marking injection point (uses existing vocab)
-    injection_character: str = None  # The actual character used for injection
+    injection_token: Optional[str] = None  # Optional specific token (auto-selected if None)
+    # These will be set by InjectionTokenManager:
+    injection_token_id: Optional[int] = None
+    injection_character: Optional[str] = None
 
     def __post_init__(self):
         if self.layer_indices is None:
@@ -43,6 +46,7 @@ class NLAModelWrapper(BaseWrapper):
     def __init__(
         self,
         base_model: nn.Module,
+        tokenizer: Any = None,
         injection_config: Optional[InjectionConfig] = None,
         hidden_dim: int = None,
         activation_dim: int = None,
@@ -57,6 +61,23 @@ class NLAModelWrapper(BaseWrapper):
         # Also set the model config for transformers compatibility
         if hasattr(base_model, "config"):
             object.__setattr__(self, "config", base_model.config)
+
+        # Set up injection token management
+        if tokenizer is not None:
+            # Use InjectionTokenManager for consistent token selection
+            injection_manager = InjectionTokenManager(tokenizer, self.injection_config.injection_token)
+            # Update injection config with auto-selected token info
+            self.injection_config.injection_token_id = injection_manager.token_id
+            self.injection_config.injection_character = injection_manager.character
+            object.__setattr__(self, "injection_manager", injection_manager)
+        elif self.injection_config.injection_token_id is not None and self.injection_config.injection_token_id >= 0:
+            # Token ID was manually specified - use it directly
+            object.__setattr__(self, "injection_manager", None)
+        else:
+            raise ValueError(
+                "Either provide a tokenizer for auto-selection or specify injection_token_id in config. "
+                "The tokenizer ensures consistency with the dataset's injection token."
+            )
 
         # Initialize projection layer if needed
         if self.injection_config.mode == "project" and self.injection_config.projection_dim:

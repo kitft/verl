@@ -1,0 +1,150 @@
+# Test configuration for NLA GRPO training with tiny model
+# Uses yujiepan/gemma-2-tiny-random and small fake dataset
+
+model:
+  model_name: "yujiepan/gemma-2-tiny-random"
+
+  # Actor model configuration (with NLA wrapper)
+  actor:
+    enable_nla: true
+
+  # NLA injection configuration
+  injection:
+    mode: "replace"  # How to inject: replace, add, or project
+    layer_indices: [0]  # Which layers to inject at (0 = embedding)
+    projection_dim: null  # Optional projection dimension
+    injection_token: null  # Will be auto-detected from tokenizer
+    injection_token_id: null  # Will be auto-assigned
+
+  # Critic model configuration
+  critic:
+    model_name: "yujiepan/gemma-2-tiny-random"
+    enable_nla: true
+    dropout: 0.1
+
+# Data configuration
+data:
+  train_dataset:
+    parquet_files: ["test_nla_dataset_tiny.parquet"]  # Tiny test dataset
+    prompt_key: "prompt"
+    response_key: "response"
+    activation_vector_key: "activation_vector"
+    max_prompt_length: 128
+    max_response_length: 128
+    mode: "both"  # Train both actor and critic
+    activation_dim: 3072  # Gemma-2-tiny hidden size
+    injection_token: null  # Auto-detect
+    injection_position: "manual"  # Already in prompts
+
+  val_dataset:
+    parquet_files: ["test_nla_dataset.parquet"]  # Small validation set
+    prompt_key: "prompt"
+    response_key: "response"
+    activation_vector_key: "activation_vector"
+    max_prompt_length: 128
+    max_response_length: 128
+    mode: "both"
+    activation_dim: 3072
+    injection_token: null
+    injection_position: "manual"
+
+  # Batch sizes - very small for testing
+  batch_size: 2
+  eval_batch_size: 2
+  num_workers: 0  # No multiprocessing for testing
+
+# Training configuration
+training:
+  # Number of epochs/iterations
+  num_epochs: 2
+  max_steps: 10  # Very few steps for testing
+
+  # Optimizer settings
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  warmup_steps: 2
+
+  # Gradient settings
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false  # Disable for tiny model
+
+  # Mixed precision
+  fp16: false
+  bf16: false
+
+  # Evaluation
+  eval_steps: 5
+  eval_strategy: "steps"
+  save_steps: 10
+  save_strategy: "steps"
+
+  # Logging
+  logging_steps: 1
+  report_to: "none"  # No wandb for testing
+
+  # Output
+  output_dir: "./test_nla_grpo_output"
+  overwrite_output_dir: true
+
+# GRPO specific settings
+grpo:
+  # Response generation
+  num_responses_per_prompt: 2  # Generate 2 responses per prompt
+  max_new_tokens: 50
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+  # Reward computation
+  use_nla_reward: true  # Use reconstruction loss as reward
+  reconstruction_weight: 1.0  # Weight for reconstruction reward
+
+  # PPO settings (simplified for testing)
+  ppo_epochs: 1
+  chunk_size: 2
+
+  # Advantage estimation
+  gamma: 0.99
+  lam: 0.95
+
+  # Clipping
+  eps_clip: 0.2
+  value_clip: 0.2
+
+  # Coefficients
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+
+# Distributed training (single GPU for testing)
+distributed:
+  backend: "nccl"
+  world_size: 1
+  rank: 0
+  local_rank: 0
+
+# Device settings
+device: "cuda:0"  # Change to "cpu" if no GPU
+use_cpu: false  # Set to true for CPU-only testing
+
+# Random seed
+seed: 42
+
+# Checkpoint settings
+checkpoint:
+  save_total_limit: 2
+  load_best_model_at_end: false
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+
+# Early stopping
+early_stopping:
+  enabled: false
+  patience: 3
+  threshold: 0.0001
+
+# Debug settings
+debug:
+  enabled: true
+  print_samples: true
+  check_gradients: true
+  log_activation_stats: true

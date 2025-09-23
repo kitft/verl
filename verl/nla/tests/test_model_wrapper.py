@@ -3,9 +3,10 @@
 import pytest
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from verl.nla.models import NLAModelWrapper, InjectionConfig
+from verl.nla.utils.injection_manager import InjectionTokenManager
 
 
 class DummyModel(nn.Module):
@@ -41,10 +42,13 @@ class TestNLAModelWrapper:
     def test_initialization(self):
         """Test wrapper initialization."""
         model = DummyModel()
+        # Use a real tokenizer - GPT2 is small and fast
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(mode="replace", layer_indices=[0])
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
             hidden_dim=768,
         )
@@ -57,13 +61,15 @@ class TestNLAModelWrapper:
     def test_hidden_dim_inference(self):
         """Test automatic hidden dimension inference."""
         model = DummyModel(hidden_size=1024)
-        wrapper = NLAModelWrapper(base_model=model)
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer)
 
         assert wrapper.hidden_dim == 1024
 
     def test_injection_position_finding(self):
         """Test finding injection positions in input."""
         model = DummyModel()
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             injection_token_id=100,  # Arbitrary token ID
@@ -71,6 +77,7 @@ class TestNLAModelWrapper:
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
         )
 
@@ -90,7 +97,9 @@ class TestNLAModelWrapper:
     def test_forward_without_injection(self):
         """Test forward pass without activation injection."""
         model = DummyModel()
-        wrapper = NLAModelWrapper(base_model=model)
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        # Provide tokenizer to avoid the error
+        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer)
 
         input_ids = torch.randint(0, 100, (2, 10))
 
@@ -103,6 +112,7 @@ class TestNLAModelWrapper:
     def test_forward_with_injection(self):
         """Test forward pass with activation injection."""
         model = DummyModel()
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             injection_token_id=100,
@@ -110,6 +120,7 @@ class TestNLAModelWrapper:
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
             hidden_dim=768,
         )
@@ -128,13 +139,16 @@ class TestNLAModelWrapper:
     def test_projection_layer(self):
         """Test learnable projection layer."""
         model = DummyModel()
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="project",
             projection_dim=512,
+            injection_token_id=999,
         )
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
             hidden_dim=768,
             activation_dim=256,  # Different from hidden dim
@@ -147,6 +161,7 @@ class TestNLAModelWrapper:
     def test_injection_at_layer(self):
         """Test injection at specific layer."""
         model = DummyModel()
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             injection_token_id=100,
@@ -154,6 +169,7 @@ class TestNLAModelWrapper:
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
         )
 
@@ -175,6 +191,7 @@ class TestNLAModelWrapper:
     def test_additive_injection(self):
         """Test additive injection mode."""
         model = DummyModel()
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="add",
             injection_token_id=100,
@@ -182,6 +199,7 @@ class TestNLAModelWrapper:
 
         wrapper = NLAModelWrapper(
             base_model=model,
+            tokenizer=tokenizer,
             injection_config=config,
         )
 

@@ -124,7 +124,7 @@ def test_fail_fast_without_transformers():
 
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(),
+        injection_config=InjectionConfig(injection_token_id=999),
         hidden_dim=768
     )
 

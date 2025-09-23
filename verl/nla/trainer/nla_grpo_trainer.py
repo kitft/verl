@@ -19,7 +19,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.torch_functional import masked_mean
 
-from ..models.autoencoder_critic import NLAAutoencoderCritic
+from ..models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
 from ..rewards.mse_reward import MSERewardComputer, CriticSupervisedLoss
 from ..integration.dataproto_adapter import NLADataProtoAdapter
 
@@ -46,10 +46,6 @@ class GRPOTrainerConfig:
     actor_learning_rate: float = 1e-5
     ppo_epochs: int = 4
     ppo_clip_ratio: float = 0.2
-
-    # Activation settings
-    activation_dim: int = 768
-    use_pooling: str = "last"  # How to pool response hidden states
 
 
 class NLAGRPOTrainer(RayPPOTrainer):
@@ -86,21 +82,23 @@ class NLAGRPOTrainer(RayPPOTrainer):
         }
 
     def _create_critic_worker(self, worker_group: RayWorkerGroup) -> Any:
-        """Create custom critic worker with autoencoder head."""
+        """Create custom critic worker with vector value head."""
+
+        from ..models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
 
         class GRPOCriticWorker(worker_group.worker_cls):
             """Custom critic worker with vector output for GRPO."""
 
             def init_model(self):
-                # Initialize base model
-                super().init_model()
-
-                # Replace value head with autoencoder critic
-                self.critic = NLAAutoencoderCritic(
-                    base_model=self.model,
-                    activation_dim=self.grpo_config.activation_dim,
-                    use_pooling=self.grpo_config.use_pooling,
+                # Initialize the critic as a copy of the base model with vector value head
+                self.critic = AutoModelForCausalLMWithVectorValueHead.from_pretrained(
+                    self.model_name_or_path,
+                    dropout=0.1,
+                    **self.model_kwargs
                 )
+
+                # Move to device
+                self.critic = self.critic.to(self.device)
 
                 # Update optimizer for new parameters
                 self.critic_optimizer = torch.optim.Adam(
@@ -113,12 +111,30 @@ class NLAGRPOTrainer(RayPPOTrainer):
                 response_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
             ) -> torch.Tensor:
-                """Compute predicted activation vectors for responses."""
+                """
+                Compute predicted activation vectors for responses.
+
+                The critic outputs a vector at the last token position.
+                Returns: (batch_size, hidden_size)
+                """
                 output = self.critic(
                     input_ids=response_ids,
                     attention_mask=attention_mask,
+                    return_dict=True,
                 )
-                return output.predicted_activation
+                # Extract the last token's value (which is the activation vector)
+                # The model already handles extracting the last valid token
+                values = output.value  # (batch, seq_len, hidden_size)
+
+                # Get the last valid position for each sequence
+                if attention_mask is not None:
+                    seq_lengths = attention_mask.sum(dim=1) - 1
+                    batch_size = values.shape[0]
+                    activation_vectors = values[torch.arange(batch_size), seq_lengths]
+                else:
+                    activation_vectors = values[:, -1]
+
+                return activation_vectors  # (batch, hidden_size)
 
         return GRPOCriticWorker
 
@@ -294,6 +310,7 @@ class NLAGRPOTrainer(RayPPOTrainer):
                 # Single sample in group - no relative comparison possible
                 group_advantages = torch.zeros_like(group_rewards)
                 group_returns = group_rewards
+                raise ValueError("Single sample in group - no relative comparison possible")
 
             # Store computed values
             advantages[group_mask] = group_advantages
