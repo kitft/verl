@@ -53,6 +53,7 @@ actor_rollout_ref:
 
 # Tiny model critic settings
 critic:
+  enable: true  # Explicitly enable critic for NLA GRPO
   model:
     path: yujiepan/gemma-2-tiny-random
 
