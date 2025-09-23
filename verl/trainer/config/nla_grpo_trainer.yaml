@@ -1,0 +1,96 @@
+# NLA GRPO training configuration
+# Inherits from ppo_trainer.yaml and customizes for NLA
+
+# Inherit defaults from base PPO trainer
+defaults:
+  # Include all base PPO defaults
+  - ppo_trainer
+
+  # Override with NLA-specific settings
+  - _self_
+
+# Override trainer settings for NLA
+trainer:
+  # Project and experiment names
+  project_name: nla_experiments
+  experiment_name: grpo_autoencoder
+
+  # Training settings
+  total_training_steps: 1000
+  save_freq: 100
+  test_freq: 50
+
+  # Use tensorboard for tracking NLA metrics
+  logger: ["console", "tensorboard"]
+
+# Override algorithm for GRPO
+algorithm:
+  # Use GRPO advantage estimator
+  adv_estimator: grpo
+
+  # GRPO typically uses different normalization
+  norm_adv_by_std_in_grpo: true
+
+  # Disable KL penalties for NLA (we use reconstruction loss)
+  use_kl_in_reward: false
+
+# NLA-specific configuration
+nla:
+  # Activation settings
+  activation_dim: 768  # Default for standard models
+
+  # Injection settings
+  injection:
+    mode: replace  # How to inject: replace, add, or project
+    layer_indices: [0]  # Which layers to inject at
+    position: manual  # Injection position already in prompts
+
+  # GRPO settings
+  grpo:
+    num_trajectories_per_prompt: 4  # Generate N responses per prompt
+    group_normalize_advantages: true
+
+    # Critic training
+    critic_supervised_weight: 1.0
+    critic_learning_rate: 5e-5
+    critic_train_epochs: 1
+
+    # Reward computation
+    reward_normalize: false
+    reward_transform: negative  # MSE to reward
+    reward_scale: 1.0
+
+  # Use custom NLA datasets
+  use_nla_datasets: true
+  activation_vector_key: activation_vector
+
+# Override data settings for NLA
+data:
+  # Dataset paths relative to workspace
+  train_files:
+    - data/nla/train.parquet
+
+  val_files:
+    - data/nla/val.parquet
+
+  # NLA dataset settings
+  prompt_key: prompt
+  response_key: response
+  max_prompt_length: 512
+
+  # Batch settings
+  batch_size: 16
+  eval_batch_size: 8
+
+# Custom critic for vector outputs
+critic:
+  # Use NLA critic model with vector value head
+  use_vector_value_head: true
+  vector_output_dim: ${nla.activation_dim}
+
+  # Critic learns to predict activation vectors
+  output_activation_vectors: true
+
+# Disable reward model (using critic-based rewards)
+reward_model:
+  enable: false

@@ -1,0 +1,138 @@
+# Full NLA GRPO training configuration with Ray infrastructure
+
+trainer:
+  n_gpus_per_node: 1
+  nnodes: 1
+  default_hdfs_dir: "./nla_output"
+  project_name: "nla_rl"
+  experiment_name: "grpo_training"
+  worker_module: "verl.nla.workers"
+  use_tensorboard: false
+  default_local_dir: "./local_output"
+  checkpoint:
+    save_freq: 10
+    load_path: null
+  total_training_steps: 10
+  steps_per_update: 1
+  ppo_mini_batch_size: 2
+  ppo_epochs: 1
+  gradient_checkpointing: false
+  clip_ratio: 0.2
+  value_clip: 0.2
+  max_grad_norm: 1.0
+  normalize_reward: false
+  normalize_advantages: true
+  gamma: 0.99
+  lam: 0.95
+
+actor_rollout_ref:
+  model:
+    path: "yujiepan/gemma-2-tiny-random"
+    use_shm: false
+    enable_gradient_checkpointing: false
+  actor:
+    lr: 1e-5
+    weight_decay: 0.01
+    warmup_steps: 2
+    optim: "adam"
+    strategy: "fsdp"
+    fsdp_config:
+      param_offload: false
+      grad_offload: false
+      optimizer_offload: false
+    update_params_per_step: 1
+    use_kl_loss: false
+  rollout:
+    name: "vllm"
+    mode: "sync"
+    micro_batch_size: 2
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    generation_kwargs:
+      max_new_tokens: 50
+      temperature: 0.7
+      top_p: 0.9
+      do_sample: true
+  ref:
+    enable: false
+
+critic:
+  model:
+    path: "yujiepan/gemma-2-tiny-random"
+    enable_gradient_checkpointing: false
+  lr: 5e-5
+  weight_decay: 0.01
+  warmup_steps: 2
+  optim: "adam"
+  strategy: "fsdp"
+  fsdp_config:
+    param_offload: false
+    grad_offload: false
+    optimizer_offload: false
+
+algorithm:
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: "fixed"
+    value: 0.1
+
+data:
+  batch_size: 2
+  max_prompt_length: 128
+  shuffle: true
+  train_files: ["data/testing/test_nla_dataset_tiny.parquet"]
+  val_files: ["data/testing/test_nla_dataset.parquet"]
+  prompt_key: "prompt"
+  num_workers: 0
+  valid_num_workers: 0
+  dataloader_num_workers: 0
+
+reward_model:
+  enable: false
+  enable_resource_pool: false
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 4
+    num_gpus: 0  # CPU testing
+    runtime_env:
+      env_vars:
+        TOKENIZERS_PARALLELISM: "false"
+        NCCL_DEBUG: "WARN"
+      excludes:
+        - "*.whl"
+        - "*.whl.1"
+        - ".git/"
+        - "__pycache__/"
+        - "*.pyc"
+        - ".venv/"
+        - "data/testing/*.parquet"
+        - "*.parquet"
+  resource_pool:
+    actor_rollout:
+      num_gpus: 0
+      num_cpus: 2
+    critic:
+      num_gpus: 0
+      num_cpus: 2
+
+# GRPO specific settings
+grpo:
+  num_trajectories_per_prompt: 2
+  group_normalize_advantages: true
+  critic_supervised_weight: 1.0
+  critic_learning_rate: 5e-5
+  critic_train_epochs: 1
+  reward_normalize: false
+  reward_transform: "negative"
+  reward_scale: 1.0
+  actor_learning_rate: 1e-5
+  ppo_epochs: 1
+  ppo_clip_ratio: 0.2
+
+# NLA specific settings
+nla:
+  activation_dim: 3072  # Gemma-2-tiny hidden size
+  injection_position: "manual"
+  injection_mode: "replace"
+  injection_layer_indices: [0]

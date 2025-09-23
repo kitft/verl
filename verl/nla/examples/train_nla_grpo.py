@@ -39,6 +39,7 @@ def setup_tokenizer(model_name: str, injection_token: str = None):
     if injection_token and injection_token not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({"additional_special_tokens": [injection_token]})
         print(f"Added injection token '{injection_token}' to tokenizer")
+        raise ValueError(f"Injection token '{injection_token}' not found in tokenizer")
 
     return tokenizer
 
@@ -112,50 +113,56 @@ def setup_resource_pool(cfg: DictConfig):
 def create_trainer(cfg: DictConfig, train_dataset, val_dataset, tokenizer):
     """Create NLA GRPO trainer."""
 
-    # Convert config to format expected by trainer
-    trainer_config = GRPOTrainerConfig(
-        # Model settings
-        model_name=cfg.model.model_name,
-        critic_model_name=cfg.model.critic.model_name,
-        activation_dim=cfg.model.actor.get('activation_dim', cfg.data.train_dataset.activation_dim),
-
-        # Training settings
-        num_epochs=cfg.training.num_epochs,
-        max_steps=cfg.training.max_steps,
-        batch_size=cfg.data.batch_size,
-        eval_batch_size=cfg.data.eval_batch_size,
-        learning_rate=cfg.training.learning_rate,
-
+    # Create GRPO config with supported fields
+    grpo_config = GRPOTrainerConfig(
         # GRPO specific
-        num_responses_per_prompt=cfg.grpo.num_responses_per_prompt,
-        temperature=cfg.grpo.temperature,
-        max_new_tokens=cfg.grpo.max_new_tokens,
-        use_nla_reward=cfg.grpo.use_nla_reward,
-        reconstruction_weight=cfg.grpo.reconstruction_weight,
+        num_trajectories_per_prompt=cfg.grpo.get('num_responses_per_prompt', 2),
+        group_normalize_advantages=True,
 
-        # PPO settings
+        # Critic training
+        critic_supervised_weight=cfg.grpo.get('reconstruction_weight', 1.0),
+        critic_learning_rate=cfg.training.learning_rate,
+        critic_train_epochs=1,
+
+        # Reward computation
+        reward_normalize=False,
+        reward_transform="negative",
+        reward_scale=1.0,
+
+        # Actor training
+        actor_learning_rate=cfg.training.learning_rate,
         ppo_epochs=cfg.grpo.ppo_epochs,
-        eps_clip=cfg.grpo.eps_clip,
-        value_loss_coef=cfg.grpo.value_loss_coef,
-        entropy_coef=cfg.grpo.entropy_coef,
-
-        # Output settings
-        output_dir=cfg.training.output_dir,
-        logging_steps=cfg.training.logging_steps,
-        eval_steps=cfg.training.eval_steps,
-        save_steps=cfg.training.save_steps,
-
-        # Debug
-        debug=cfg.debug.enabled,
+        ppo_clip_ratio=cfg.grpo.eps_clip,
     )
 
-    # Create trainer
+    # Create verl config for base trainer
+    verl_config = VerlDictConfig({
+        "trainer": {
+            "device": cfg.device,
+            "max_step": cfg.training.max_steps,
+            "eval_steps": cfg.training.eval_steps,
+            "save_steps": cfg.training.save_steps,
+            "logging_steps": cfg.training.logging_steps,
+            "ppo_epochs": cfg.grpo.ppo_epochs,
+            "clip_ratio": cfg.grpo.eps_clip,
+            "value_clip": cfg.grpo.value_clip,
+            "chunk_size": cfg.grpo.chunk_size,
+            "normalize_advantages": True,
+            "gamma": cfg.grpo.gamma,
+            "lam": cfg.grpo.lam,
+            "model_name": cfg.model.model_name,
+            "critic_model_name": cfg.model.critic.model_name,
+        },
+        "data_loader": {
+            "batch_size": cfg.data.batch_size,
+            "eval_batch_size": cfg.data.eval_batch_size,
+        },
+    })
+
+    # Create trainer with both configs
     trainer = NLAGRPOTrainer(
-        config=trainer_config,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        tokenizer=tokenizer,
-        nla_config=cfg.model.injection,
+        config=verl_config,
+        grpo_config=grpo_config,
     )
 
     return trainer
@@ -184,6 +191,11 @@ def main(cfg: DictConfig):
         model_name=cfg.model.model_name,
         injection_token=cfg.model.injection.injection_token,
     )
+
+    # Set a simple chat template if none exists (for tiny model)
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = "{{ messages[-1]['content'] }}"  # Simple template for testing
+        print("   Set simple chat template for tokenizer")
 
     # Update config with injection token ID
     if cfg.model.injection.injection_token:

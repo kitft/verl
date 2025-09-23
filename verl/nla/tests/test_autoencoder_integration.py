@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from unittest.mock import Mock
+from transformers import AutoTokenizer
 
 from verl.nla.models import AutoModelForCausalLMWithVectorValueHead, NLAModelWrapper
 from verl.nla.models.nla_wrapper import InjectionConfig
@@ -55,11 +56,14 @@ def test_autoencoder_flow():
     # 2. Create NLA wrappers
     print("2. Creating NLA wrappers...")
 
+    # Create tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
     # Actor with injection capability
     injection_config = InjectionConfig(
         mode="replace",
         layer_indices=[0],
-        injection_token_id=999,  # Special token
+        injection_token="|",  # Special token
     )
 
     nla_actor = NLAModelWrapper(
@@ -67,6 +71,7 @@ def test_autoencoder_flow():
         injection_config=injection_config,
         hidden_dim=hidden_dim,
         activation_dim=activation_dim,
+        tokenizer=tokenizer,
     )
 
     # Critic with vector value head
@@ -93,7 +98,8 @@ def test_autoencoder_flow():
 
     # Original prompts with injection marker
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-    input_ids[:, 5] = 999  # Insert injection token at position 5
+    injection_token_id = tokenizer.convert_tokens_to_ids("|")
+    input_ids[:, 5] = injection_token_id  # Insert injection token at position 5
 
     # Original activation vectors
     original_activations = torch.randn(batch_size, activation_dim)

@@ -25,7 +25,7 @@ model:
 # Data configuration
 data:
   train_dataset:
-    parquet_files: ["test_nla_dataset_tiny.parquet"]  # Tiny test dataset
+    parquet_files: ["data/testing/test_nla_dataset_tiny.parquet"]  # Tiny test dataset
     prompt_key: "prompt"
     response_key: "response"
     activation_vector_key: "activation_vector"
@@ -37,7 +37,7 @@ data:
     injection_position: "manual"  # Already in prompts
 
   val_dataset:
-    parquet_files: ["test_nla_dataset.parquet"]  # Small validation set
+    parquet_files: ["data/testing/test_nla_dataset.parquet"]  # Small validation set
     prompt_key: "prompt"
     response_key: "response"
     activation_vector_key: "activation_vector"

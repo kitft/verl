@@ -63,9 +63,35 @@ class NLAGRPOTrainer(RayPPOTrainer):
     def __init__(
         self,
         config: DictConfig,
+        tokenizer,
+        role_worker_mapping,
+        resource_pool_manager,
         grpo_config: Optional[GRPOTrainerConfig] = None,
+        ray_worker_group_cls=None,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset=None,
+        val_dataset=None,
+        collate_fn=None,
+        train_sampler=None,
     ):
-        super().__init__(config)
+        # Initialize parent RayPPOTrainer with all required parameters
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls or RayWorkerGroup,
+            processor=processor,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
+        )
+
         self.grpo_config = grpo_config or GRPOTrainerConfig()
 
         # Initialize NLA components

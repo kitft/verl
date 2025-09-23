@@ -336,45 +336,50 @@ class TestNLAModelWrapper:
         base_model = MagicMock()
         base_model.config.hidden_size = 768
 
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             layer_indices=[0],
-            injection_token_id=50000
+            injection_token="|"
         )
 
         wrapper = NLAModelWrapper(
             base_model=base_model,
             injection_config=config,
             hidden_dim=768,
-            activation_dim=768
+            activation_dim=768,
+            tokenizer=tokenizer
         )
 
         assert wrapper.hidden_dim == 768
         assert wrapper.activation_dim == 768
-        assert wrapper.injection_config.injection_token_id == 50000
+        assert wrapper.injection_config.injection_token == "|"
 
     def test_injection_position_finding(self):
         """Test finding injection token positions."""
         base_model = MagicMock()
         base_model.config.hidden_size = 768
 
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             layer_indices=[0],
-            injection_token_id=50000
+            injection_token="|"
         )
 
         wrapper = NLAModelWrapper(
             base_model=base_model,
             injection_config=config,
             hidden_dim=768,
-            activation_dim=768
+            activation_dim=768,
+            tokenizer=tokenizer
         )
 
         # Create input with injection tokens
+        injection_token_id = tokenizer.convert_tokens_to_ids("|")
         input_ids = torch.tensor([
-            [1, 2, 50000, 4, 5],  # Injection at position 2
-            [6, 7, 8, 50000, 10],  # Injection at position 3
+            [1, 2, injection_token_id, 4, 5],  # Injection at position 2
+            [6, 7, 8, injection_token_id, 10],  # Injection at position 3
         ])
 
         positions = wrapper._find_injection_positions(input_ids)
@@ -389,17 +394,19 @@ class TestNLAModelWrapper:
         base_model.config.hidden_size = 768
         base_model.get_input_embeddings = MagicMock(return_value=MagicMock())
 
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
             layer_indices=[0],
-            injection_token_id=50000
+            injection_token="|"
         )
 
         wrapper = NLAModelWrapper(
             base_model=base_model,
             injection_config=config,
             hidden_dim=768,
-            activation_dim=768
+            activation_dim=768,
+            tokenizer=tokenizer
         )
 
         # Mock the base model forward
@@ -407,7 +414,8 @@ class TestNLAModelWrapper:
         base_model.return_value = mock_output
 
         # Create inputs
-        input_ids = torch.tensor([[1, 2, 50000, 4, 5]])
+        injection_token_id = tokenizer.convert_tokens_to_ids("|")
+        input_ids = torch.tensor([[1, 2, injection_token_id, 4, 5]])
         activation_vectors = torch.randn(1, 768)
 
         # Forward pass

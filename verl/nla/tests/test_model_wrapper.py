@@ -44,7 +44,7 @@ class TestNLAModelWrapper:
         model = DummyModel()
         # Use a real tokenizer - GPT2 is small and fast
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        config = InjectionConfig(mode="replace", layer_indices=[0])
+        config = InjectionConfig(mode="replace", layer_indices=[0], injection_token="|")
 
         wrapper = NLAModelWrapper(
             base_model=model,
@@ -62,7 +62,8 @@ class TestNLAModelWrapper:
         """Test automatic hidden dimension inference."""
         model = DummyModel(hidden_size=1024)
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer)
+        config = InjectionConfig(injection_token="|")
+        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer, injection_config=config)
 
         assert wrapper.hidden_dim == 1024
 
@@ -72,7 +73,7 @@ class TestNLAModelWrapper:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
-            injection_token_id=100,  # Arbitrary token ID
+            injection_token="|",  # Simple character token
         )
 
         wrapper = NLAModelWrapper(
@@ -81,10 +82,12 @@ class TestNLAModelWrapper:
             injection_config=config,
         )
 
-        # Create input with injection tokens
+        # Create input with injection tokens (we'll use the actual token ID from the manager)
+        # For now, use placeholder - the test will get the actual token ID from wrapper
+        injection_token_id = wrapper.injection_config.injection_token_id
         input_ids = torch.tensor([
-            [1, 2, 100, 4, 5],  # Injection at position 2
-            [100, 2, 3, 100, 5],  # Injection at positions 0 and 3
+            [1, 2, injection_token_id, 4, 5],  # Injection at position 2
+            [injection_token_id, 2, 3, injection_token_id, 5],  # Injection at positions 0 and 3
             [1, 2, 3, 4, 5],  # No injection
         ])
 
@@ -98,8 +101,9 @@ class TestNLAModelWrapper:
         """Test forward pass without activation injection."""
         model = DummyModel()
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        # Provide tokenizer to avoid the error
-        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer)
+        # Provide tokenizer and injection config to avoid the error
+        config = InjectionConfig(injection_token="|")
+        wrapper = NLAModelWrapper(base_model=model, tokenizer=tokenizer, injection_config=config)
 
         input_ids = torch.randint(0, 100, (2, 10))
 
@@ -115,7 +119,7 @@ class TestNLAModelWrapper:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
-            injection_token_id=100,
+            injection_token="|",
         )
 
         wrapper = NLAModelWrapper(
@@ -125,8 +129,9 @@ class TestNLAModelWrapper:
             hidden_dim=768,
         )
 
-        # Input with injection token
-        input_ids = torch.tensor([[1, 2, 100, 4, 5]])
+        # Input with injection token (use actual token ID from wrapper)
+        injection_token_id = wrapper.injection_config.injection_token_id
+        input_ids = torch.tensor([[1, 2, injection_token_id, 4, 5]])
         activation_vectors = torch.randn(1, 768)
 
         output = wrapper(
@@ -143,7 +148,7 @@ class TestNLAModelWrapper:
         config = InjectionConfig(
             mode="project",
             projection_dim=512,
-            injection_token_id=999,
+            injection_token="|",
         )
 
         wrapper = NLAModelWrapper(
@@ -164,7 +169,7 @@ class TestNLAModelWrapper:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="replace",
-            injection_token_id=100,
+            injection_token="|",
         )
 
         wrapper = NLAModelWrapper(
@@ -194,7 +199,7 @@ class TestNLAModelWrapper:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         config = InjectionConfig(
             mode="add",
-            injection_token_id=100,
+            injection_token="|",
         )
 
         wrapper = NLAModelWrapper(

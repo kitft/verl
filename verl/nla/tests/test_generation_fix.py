@@ -19,6 +19,7 @@ To properly test these functions, you would need to either:
 import torch
 import torch.nn as nn
 from unittest.mock import Mock, MagicMock, call, patch
+from transformers import AutoTokenizer
 from verl.nla.models.nla_wrapper import NLAModelWrapper, InjectionConfig
 
 
@@ -83,22 +84,25 @@ def test_generation_with_injection(mock_fsdp, mock_deepspeed, mock_dist):
 
     base_model.generate = mock_generate
 
-    # Create wrapper with injection config
+    # Create tokenizer and wrapper with injection config
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     config = InjectionConfig(
         mode="replace",
         layer_indices=[0],
-        injection_token_id=50000  # Special injection token
+        injection_token="|"  # Special injection token
     )
 
     wrapper = NLAModelWrapper(
         base_model=base_model,
         injection_config=config,
         hidden_dim=768,
-        activation_dim=768
+        activation_dim=768,
+        tokenizer=tokenizer
     )
 
     # Create input with injection token
-    input_ids = torch.tensor([[1, 2, 50000, 3, 4]])  # Token at position 2
+    injection_token_id = tokenizer.convert_tokens_to_ids("|")
+    input_ids = torch.tensor([[1, 2, injection_token_id, 3, 4]])  # Token at position 2
     activation_vectors = torch.randn(1, 768)
 
     # Generate with injection
@@ -168,11 +172,13 @@ def test_generation_without_injection(mock_fsdp, mock_deepspeed, mock_dist):
     # Mock generate
     base_model.generate = Mock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
 
-    # Create wrapper
+    # Create tokenizer and wrapper
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(injection_token_id=999),
-        hidden_dim=768
+        injection_config=InjectionConfig(injection_token="|"),
+        hidden_dim=768,
+        tokenizer=tokenizer
     )
 
     # Generate without activation vectors

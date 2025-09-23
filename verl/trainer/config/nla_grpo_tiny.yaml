@@ -1,0 +1,112 @@
+# Tiny NLA GRPO configuration for testing
+# Inherits from nla_grpo_trainer.yaml with tiny model settings
+
+# Inherit from base PPO trainer and customize for NLA tiny testing
+defaults:
+  # Include base PPO defaults (actor, critic, data, etc.)
+  - ppo_trainer
+  # Override with our settings last
+  - _self_
+
+# Override trainer settings for NLA tiny testing
+trainer:
+  # Project and experiment names
+  project_name: nla_experiments
+  experiment_name: grpo_tiny_test
+
+  # Minimal training for quick testing
+  total_training_steps: 10
+  save_freq: 10
+  test_freq: 5
+
+  # Single node/GPU for testing
+  nnodes: 1
+  n_gpus_per_node: 1
+
+  # Use console logging only for testing
+  logger: ["console"]
+
+# Override algorithm for GRPO
+algorithm:
+  # Use GRPO advantage estimator
+  adv_estimator: grpo
+  # GRPO typically uses different normalization
+  norm_adv_by_std_in_grpo: true
+  # Disable KL penalties for NLA (we use reconstruction loss)
+  use_kl_in_reward: false
+
+# Override model paths for tiny model
+actor_rollout_ref:
+  model:
+    path: yujiepan/gemma-2-tiny-random
+
+  # Reduce rollout batch size for testing
+  rollout:
+    micro_batch_size: 2
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.2
+
+    # Smaller generation for testing
+    generation_kwargs:
+      max_new_tokens: 50
+      temperature: 0.7
+
+# Tiny model critic settings
+critic:
+  model:
+    path: yujiepan/gemma-2-tiny-random
+
+# NLA settings for tiny model
+nla:
+  # Enable NLA datasets
+  use_nla_datasets: true
+
+  # Gemma-2-tiny has hidden_size=3072
+  activation_dim: 3072
+
+  # Reduce GRPO settings for testing
+  grpo:
+    num_trajectories_per_prompt: 2  # Only 2 responses per prompt for speed
+    critic_train_epochs: 1
+
+# Test data settings
+data:
+  # Use test datasets
+  train_files:
+    - data/testing/test_nla_dataset_tiny.parquet
+
+  val_files:
+    - data/testing/test_nla_dataset.parquet
+
+  # Very small batches for testing
+  batch_size: 2
+  eval_batch_size: 2
+
+  # No parallel workers for testing
+  num_workers: 0
+  valid_num_workers: 0
+  dataloader_num_workers: 0
+
+# Ray settings for testing
+ray_kwargs:
+  ray_init:
+    num_cpus: 4
+    num_gpus: 0  # CPU testing
+
+    runtime_env:
+      env_vars:
+        TOKENIZERS_PARALLELISM: "false"
+        NCCL_DEBUG: "WARN"
+
+      # Exclude large files from packaging
+      excludes:
+        - "*.whl"
+        - "*.whl.1"
+        - ".git/"
+        - "__pycache__/"
+        - "*.pyc"
+        - ".venv/"
+        - "data/testing/*.parquet"
+        - "*.parquet"
+        - "flashinfer_python*"
+        - "flash_attn*"

@@ -5,6 +5,7 @@ import torch.nn as nn
 from unittest.mock import Mock
 import sys
 sys.path.append('/Users/kit/Documents/Anthropic/NLA')
+from transformers import AutoTokenizer
 
 from verl.nla.models.nla_wrapper import NLAModelWrapper, InjectionConfig
 from verl.nla.models.autoencoder_critic import NLAAutoencoderCritic
@@ -24,15 +25,18 @@ def test_stateless_generation():
     # Mock the base model forward to return proper output
     base_model.forward = Mock(return_value=Mock(logits=torch.randn(1, 5, 50000)))
 
-    # Create wrapper
+    # Create tokenizer and wrapper
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(injection_token_id=50000),
-        hidden_dim=768
+        injection_config=InjectionConfig(injection_token="|"),
+        hidden_dim=768,
+        tokenizer=tokenizer
     )
 
     # Test forward is stateless
-    input_ids = torch.tensor([[1, 2, 50000, 3, 4]])
+    injection_token_id = tokenizer.convert_tokens_to_ids("|")
+    input_ids = torch.tensor([[1, 2, injection_token_id, 3, 4]])
     activation_vectors = torch.randn(1, 768)
 
     # Forward with injection
@@ -54,16 +58,19 @@ def test_vectorized_injection_positions():
     base_model = Mock()
     base_model.config = Mock(hidden_size=768)
 
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(injection_token_id=50000),
-        hidden_dim=768
+        injection_config=InjectionConfig(injection_token="|"),
+        hidden_dim=768,
+        tokenizer=tokenizer
     )
 
     # Test with multiple injection tokens
+    injection_token_id = tokenizer.convert_tokens_to_ids("|")
     input_ids = torch.tensor([
-        [1, 50000, 3, 50000, 5],
-        [50000, 2, 3, 4, 5],
+        [1, injection_token_id, 3, injection_token_id, 5],
+        [injection_token_id, 2, 3, 4, 5],
         [1, 2, 3, 4, 5]  # No injection token
     ])
 
@@ -122,10 +129,12 @@ def test_fail_fast_without_transformers():
     base_model = Mock()
     base_model.config = Mock(hidden_size=768)
 
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     wrapper = NLAModelWrapper(
         base_model=base_model,
-        injection_config=InjectionConfig(injection_token_id=999),
-        hidden_dim=768
+        injection_config=InjectionConfig(injection_token="|"),
+        hidden_dim=768,
+        tokenizer=tokenizer
     )
 
     # Should raise error if transformers not available

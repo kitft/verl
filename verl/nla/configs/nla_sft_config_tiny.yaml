@@ -1,0 +1,119 @@
+# NLA SFT Training Configuration - Tiny version for testing
+
+model:
+  model_name: "yujiepan/gemma-2-tiny-random"  # Using tiny model for testing
+  activation_dim: 3072  # Gemma-2-tiny has hidden_size=3072
+  enable_flashattn: false  # Disabled for testing
+
+  # Injection configuration for actor
+  injection:
+    mode: "replace"  # "replace", "add", or "project"
+    layer_indices: [0]  # Which layers to inject at (0 = embedding)
+    projection_dim: null  # Optional projection dimension
+    injection_token: "<INJECT>"  # Special token marking injection point
+    injection_token_id: null  # Will be auto-assigned
+
+  # Critic model configuration
+  critic:
+    model_name: "yujiepan/gemma-2-tiny-random"  # Same tiny model
+    pooling: "last"  # Pooling method: "last", "mean", "max", "cls", "weighted"
+    dropout: 0.1
+    projection_layers: 2  # Number of layers in projection head
+
+data:
+  # Dataset configuration
+  train_dataset:
+    parquet_files: ["data/testing/test_nla_dataset_tiny.parquet"]
+    prompt_key: "prompt"
+    response_key: "response"
+    max_length: 512  # Reduced for testing
+    truncation: "right"
+    use_shm: false
+    mode: "both"  # "actor", "critic", or "both"
+    activation_dim: 3072
+    injection_token: "<INJECT>"
+
+  val_dataset:
+    parquet_files: ["data/testing/test_nla_dataset.parquet"]
+    prompt_key: "prompt"
+    response_key: "response"
+    max_length: 512  # Reduced for testing
+    truncation: "right"
+    use_shm: false
+    mode: "both"
+    activation_dim: 3072
+    injection_token: "<INJECT>"
+
+  # Batch sizes - smaller for testing
+  train_batch_size: 2
+  val_batch_size: 2
+  micro_batch_size_per_gpu: 1  # For gradient accumulation
+
+optim:
+  # Actor optimizer settings
+  lr: 1e-4  # Slightly higher for faster convergence in testing
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  max_norm: 1.0  # Gradient clipping
+
+  # Critic optimizer settings
+  critic_lr: 5e-4
+
+  # Learning rate schedule
+  warmup_steps: 10  # Reduced for testing
+  lr_scheduler_type: "cosine"
+
+trainer:
+  # Training settings - minimal for testing
+  total_training_steps: 20  # Very short for testing
+  num_epochs: 1  # Single epoch for testing
+  val_steps: 10  # Validate every 10 steps
+  save_steps: 10  # Save checkpoint every 10 steps
+  logging_steps: 1  # Log every step for testing
+
+  # Mode settings
+  train_mode: "both"  # "actor", "critic", or "both"
+  critic_epochs: 1  # Epochs per critic training step
+
+  # Checkpoint settings
+  save_dir: "checkpoints/nla_sft_tiny_test"
+  save_total_limit: 2
+  load_checkpoint: null  # Path to checkpoint to resume from
+
+  # Hardware settings
+  device: "cuda"
+  mixed_precision: "no"  # No mixed precision for testing
+  gradient_checkpointing: false
+
+  # Distributed training - single GPU
+  world_size: 1
+  local_rank: 0
+  backend: "nccl"
+
+  # FSDP settings - minimal for testing
+  fsdp:
+    sharding_strategy: "NO_SHARD"  # No sharding for tiny model
+    cpu_offload: false
+    mixed_precision: "no"
+    backward_prefetch: null
+
+  # Logging
+  use_tensorboard: false  # Disabled for testing
+  tensorboard_dir: "logs/nla_sft_tiny"
+  use_wandb: false
+  wandb_project: "nla_sft"
+  wandb_entity: null
+  wandb_name: null
+
+# Evaluation settings
+eval:
+  # Generation settings for evaluation
+  max_new_tokens: 50  # Reduced for testing
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+  # Metrics
+  compute_perplexity: true
+  compute_critic_mse: true
