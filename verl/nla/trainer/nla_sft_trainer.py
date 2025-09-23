@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
 from verl.utils.torch_functional import masked_mean
 from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
-from ..models.autoencoder_critic import NLAAutoencoderCritic
+from ..models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
 
 
 class NLASFTTrainer(FSDPSFTTrainer):
@@ -130,14 +130,13 @@ class NLASFTTrainer(FSDPSFTTrainer):
             attn_implementation="flash_attention_2" if self.config.model.enable_flashattn else "eager",
         )
 
-        # Create autoencoder critic
-        self.critic = NLAAutoencoderCritic(
-            base_model=critic_base,
+        # Create critic with vector value head
+        self.critic = AutoModelForCausalLMWithVectorValueHead(
+            pretrained_model_name_or_path=self.critic_config.model_path,
             activation_dim=self.activation_dim,
-            hidden_dim=critic_base.config.hidden_size,
-            use_pooling=self.critic_config.get("pooling", "last"),
             dropout=self.critic_config.get("dropout", 0.1),
-            num_projection_layers=self.critic_config.get("projection_layers", 2),
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2" if self.config.model.enable_flashattn else "eager",
         )
 
         # Wrap critic with FSDP

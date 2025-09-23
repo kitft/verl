@@ -1,12 +1,11 @@
 """Model wrappers for NLA injection."""
 
 from .nla_wrapper import NLAModelWrapper, InjectionConfig
-from .autoencoder_critic import NLAAutoencoderCritic, NLAValueHead, AutoencoderCriticOutput
+from .nla_critic_model import AutoModelForCausalLMWithVectorValueHead, NLAVectorValueHead
 
 __all__ = [
     "NLAModelWrapper",
     "InjectionConfig",
-    "NLAAutoencoderCritic",
-    "NLAValueHead",
-    "AutoencoderCriticOutput",
+    "AutoModelForCausalLMWithVectorValueHead",
+    "NLAVectorValueHead",
 ]
