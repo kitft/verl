@@ -127,16 +127,23 @@ class NLAGRPOTrainer(RayPPOTrainer):
         prompts: DataProto,
     ) -> DataProto:
         """
-        Generate N trajectories per prompt for GRPO.
+        Generate N trajectories per prompt for GRPO with activation injection.
 
         Args:
-            prompts: DataProto with original prompts
+            prompts: DataProto with original prompts and activation vectors
 
         Returns:
             DataProto with expanded batch (batch_size * N) and group_ids
         """
         batch_size = prompts.data["input_ids"].shape[0]
         n_trajectories = self.grpo_config.num_trajectories_per_prompt
+
+        # Extract activation vectors before expansion (if present)
+        activation_vectors = None
+        if "activation_vectors" in prompts.data:
+            activation_vectors = prompts.data["activation_vectors"]
+        elif hasattr(prompts, 'metadata') and prompts.metadata and "activation_vectors" in prompts.metadata:
+            activation_vectors = prompts.metadata["activation_vectors"]
 
         # Expand prompts to generate N responses per prompt
         expanded_data = {}
@@ -158,17 +165,40 @@ class NLAGRPOTrainer(RayPPOTrainer):
                 "group_ids": group_ids,
                 "original_batch_size": batch_size,
                 "num_trajectories": n_trajectories,
-                **prompts.metadata,
             }
         )
 
-        # Generate responses with the actor
+        # Add activation vectors to expanded prompts if available
+        if activation_vectors is not None:
+            # Expand activation vectors to match the repeated prompts
+            expanded_activation_vectors = activation_vectors.repeat_interleave(n_trajectories, dim=0)
+
+            # Store in both data and metadata for compatibility
+            expanded_prompts.data["activation_vectors"] = expanded_activation_vectors
+            expanded_prompts.metadata["activation_vectors"] = expanded_activation_vectors
+
+            # Also store original unexpanded vectors for reference
+            expanded_prompts.metadata["original_activation_vectors"] = activation_vectors
+
+        # Preserve any other metadata from original prompts
+        if hasattr(prompts, 'metadata') and prompts.metadata:
+            for key, value in prompts.metadata.items():
+                if key not in expanded_prompts.metadata:
+                    expanded_prompts.metadata[key] = value
+
+        # Generate responses with the actor (with activation injection if vectors present)
         responses = self.actor_rollout_ref_worker.generate_sequences(expanded_prompts)
 
-        # Preserve group information in responses
+        # Preserve group information and activation vectors in responses
         responses.metadata["group_ids"] = group_ids
         responses.metadata["original_batch_size"] = batch_size
         responses.metadata["num_trajectories"] = n_trajectories
+
+        # Preserve activation vectors for critic computation
+        if activation_vectors is not None:
+            responses.metadata["original_activation_vectors"] = activation_vectors
+            if "activation_vectors" not in responses.data:
+                responses.data["activation_vectors"] = expanded_activation_vectors
 
         return responses
 

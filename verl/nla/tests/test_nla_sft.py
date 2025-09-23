@@ -564,30 +564,63 @@ class TestNLASFTTrainer:
             train_dataset=MagicMock(),
             train_mode="critic"
         )
+        # Set config manually since we mocked __init__
+        trainer.config = mock_config
 
-        # Mock the critic and optimizer
-        trainer.fsdp_critic = MagicMock()
-        trainer.critic_optimizer = MagicMock()
+        # Create a real small critic model for proper gradient computation
+        from verl.nla.models import NLAAutoencoderCritic
+        import torch.nn as nn
+
+        # Create a minimal base model
+        class MinimalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(100, 768)
+                self.layer = nn.Linear(768, 768)
+                self.config = type('Config', (), {'hidden_size': 768})()
+
+            def forward(self, input_ids, attention_mask=None, output_hidden_states=False, **kwargs):
+                x = self.embed(input_ids)
+                x = self.layer(x)
+                # Return output object with proper structure
+                output = type('Output', (), {})()
+                # For transformers compatibility, hidden_states should be a tuple of layer outputs
+                if output_hidden_states:
+                    output.hidden_states = (x,)  # Tuple of hidden states from each layer
+                # Last hidden state is the main output
+                output.last_hidden_state = x
+                return output
+
+        # Create real critic with the minimal model
+        real_critic = NLAAutoencoderCritic(
+            base_model=MinimalModel(),
+            activation_dim=768,
+            use_pooling="mean"
+        )
+
+        # Add clip_grad_norm_ method to the critic (FSDP models have this)
+        real_critic.clip_grad_norm_ = lambda max_norm: torch.nn.utils.clip_grad_norm_(
+            real_critic.parameters(), max_norm
+        )
+
+        trainer.fsdp_critic = real_critic
+        trainer.critic_optimizer = torch.optim.Adam(real_critic.parameters(), lr=1e-4)
         trainer.critic_scheduler = None
         trainer.device_name = "cpu"
         trainer.train_critic_epochs = 1
 
-        # Mock critic output
-        mock_output = MagicMock()
-        mock_output.predicted_activation = torch.randn(2, 768, requires_grad=True)
-        trainer.fsdp_critic.return_value = mock_output
-
-        # Create batch
+        # Create batch with small tensors
         batch = {
-            "response_ids": torch.randint(0, 50257, (2, 10)),
+            "response_ids": torch.randint(0, 100, (2, 10)),
             "response_attention_mask": torch.ones(2, 10),
             "activation_vectors": torch.randn(2, 768)
         }
 
-        # Train critic
+        # Train critic - this should now work with real gradients
         metrics = trainer._train_critic_step(batch)
         assert "critic_loss" in metrics
         assert isinstance(metrics["critic_loss"], float)
+        assert metrics["critic_loss"] > 0  # Loss should be positive
 
 
 # Integration test
