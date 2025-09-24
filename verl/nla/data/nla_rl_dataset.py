@@ -168,6 +168,35 @@ class NLARLDataset(RLHFDataset):
         # Store injection token ID for reference
         sample["injection_token_id"] = self.injection_token_id
 
+        response_text = sample.pop("response", None)
+
+        metadata_keys = [
+            "sample_uuid",
+            "source",
+            "formatted_source",
+            "tokenized_source",
+            "forward_pass_text",
+            "prompt_text",
+            "activation_layer",
+            "activation_token",
+            "activation_token_id",
+            "source_message_token_index",
+            "source_sequence_token_index",
+            "prompt_token_index",
+            "source_messages",
+        ]
+
+        extra_info = sample.get("extra_info", {}) or {}
+        for key in metadata_keys:
+            value = sample.pop(key, None)
+            if value is not None:
+                extra_info[key] = value
+
+        if response_text is not None:
+            extra_info["response"] = response_text
+
+        sample["extra_info"] = extra_info
+
         return sample
 
     def _add_injection_token(self, sample: Dict[str, Any]) -> Dict[str, Any]:

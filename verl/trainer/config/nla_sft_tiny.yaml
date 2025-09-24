@@ -13,7 +13,7 @@ data:
   val_files: data/testing/test_nla_dataset.parquet
 
   # Dataset keys
-  prompt_key: prompt
+  prompt_key: prompt_text
   response_key: response
 
   # Custom NLA dataset class

@@ -4,7 +4,7 @@ import torch
 from typing import Dict, Optional, Any
 from verl.protocol import DataProto
 from verl.workers.fsdp_workers import ActorRolloutRefWorker as FSDPActorRolloutRefWorker
-from verl.single_controller.base.decorator import register, Dispatch
+from verl.single_controller.base.decorator import register, Dispatch, make_nd_compute_dataproto_dispatch_fn
 from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
 
 
@@ -150,6 +150,10 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         if self.embed_layer is None:
             raise RuntimeError("Embedding layer not available. Cannot compute input embeddings.")
 
+        target_device = self.embed_layer.weight.device if hasattr(self.embed_layer, "weight") else None
+        if target_device is not None:
+            input_ids = input_ids.to(target_device)
+
         with torch.no_grad():
             input_embeds = self.embed_layer(input_ids)
 
@@ -183,6 +187,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         return input_embeds
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     def generate_sequences(self, data: DataProto) -> DataProto:
         """
         Generate sequences with activation injection.
@@ -237,6 +242,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         data.batch.update({"input_embeds": input_embeds})
         return data
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob(self, data: DataProto) -> DataProto:
         """
         Compute log probabilities with activation injection.

@@ -2,6 +2,7 @@
 
 import torch
 import pandas as pd
+import numpy as np
 from typing import Dict, Optional, Any, List, Union
 from omegaconf import DictConfig
 from omegaconf.listconfig import ListConfig
@@ -98,32 +99,17 @@ class NLASFTDataset(SFTDataset):
         # Get base sample from parent class
         sample = super().__getitem__(idx)
 
-        # Add activation vector
+        # Attach activation vector
         sample["activation_vectors"] = self.activation_vectors[idx]
 
-        # Ensure input_ids contain the injection token
-        if self.injection_token_id is not None:
-            # Check if injection token is present
-            if self.injection_token_id not in sample["input_ids"]:
-                # Insert injection token at the end of the prompt
-                # This is a simplified approach - you may want more sophisticated placement
-                prompt_end_idx = (sample["loss_mask"] == 0).sum().item()
+        if self.injection_token_id not in sample["input_ids"]:
+            raise ValueError(
+                "Prompt does not contain the expected injection token. "
+                "Ensure the dataset prompt_text includes the injection marker."
+            )
 
-                # Insert token
-                input_ids = sample["input_ids"]
-                new_input_ids = torch.cat([
-                    input_ids[:prompt_end_idx],
-                    torch.tensor([self.injection_token_id]),
-                    input_ids[prompt_end_idx:]
-                ])[:self.max_length]
-
-                # Update masks accordingly
-                sample["input_ids"] = new_input_ids
-                # Adjust attention mask and loss mask if needed
-                if new_input_ids.shape[0] != sample["attention_mask"].shape[0]:
-                    # Truncate or pad masks
-                    sample["attention_mask"] = sample["attention_mask"][:new_input_ids.shape[0]]
-                    sample["loss_mask"] = sample["loss_mask"][:new_input_ids.shape[0]]
+        # Skip metadata attachment for now to avoid TensorDict batch issues
+        # sample = self._attach_metadata(idx, sample)
 
         return sample
 
@@ -164,6 +150,40 @@ class NLASFTDataset(SFTDataset):
             "attention_mask": full_sample["attention_mask"],
             "loss_mask": full_sample["loss_mask"],
         })
+
+        # Skip metadata attachment for now to avoid TensorDict batch issues
+        # sample = self._attach_metadata(idx, sample)
+        return sample
+
+    def _attach_metadata(self, idx: int, sample: Dict[str, Any]) -> Dict[str, Any]:
+        row = self.dataframe.iloc[idx]
+
+        metadata_keys = [
+            "sample_uuid",
+            "source",
+            "formatted_source",
+            "tokenized_source",
+            "forward_pass_text",
+            "prompt_text",
+            "activation_layer",
+            "activation_token",
+            "activation_token_id",
+            "source_message_token_index",
+            "source_sequence_token_index",
+            "prompt_token_index",
+            "source_messages",
+        ]
+
+        extra_info = sample.get("extra_info", {}) or {}
+        for key in metadata_keys:
+            if key in row and pd.notna(row[key]):
+                value = row[key]
+                if isinstance(value, np.ndarray):
+                    value = value.tolist()
+                extra_info[key] = value
+
+        extra_info["response"] = self.responses[idx]
+        sample["extra_info"] = extra_info
 
         return sample
 

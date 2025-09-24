@@ -1,6 +1,8 @@
 defaults:
   - _self_
 
+mode: rl  # "rl" or "sft"
+
 dataset:
   name: null
   config_name: null
@@ -11,7 +13,8 @@ dataset:
   text_column: null
   user_role: user
   system_prompt: null
-  add_generation_prompt: false
+  add_generation_prompt: true
+  expect_chat: false
 
 model:
   name: google/gemma-2-2b-it
@@ -27,6 +30,18 @@ sampling:
 output:
   path: data/generated/activation_dataset.parquet
   overwrite: false
+  include_layer_suffix: true
   injection_token: null
+
+prompt:
+  default_role: user
+  add_generation_prompt: true
+  chat_template: null
+  messages:
+    - role: user
+      template: "Explain the following text {injection_token}\n\n{source}"
+
+response:
+  template: "{source}"
 
 seed: 42

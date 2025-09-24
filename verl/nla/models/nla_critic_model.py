@@ -146,6 +146,14 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             attentions=outputs.attentions,
         )
 
+    def can_generate(self) -> bool:
+        """Returns whether this model can generate.
+
+        The critic model is not designed for generation, only for
+        extracting activation vectors.
+        """
+        return False
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
         """
