@@ -187,16 +187,39 @@ class SGLangHttpServer:
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
+        input_embeds: Optional[Any] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(prompt_ids) - 1)
+        prompt_length = len(prompt_ids)
+        prompt_ids_list = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else prompt_ids
+        max_new_tokens = min(self.config.response_length, self.config.max_model_len - prompt_length - 1)
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        prepared_input_embeds = None
+        if input_embeds is not None:
+            if hasattr(input_embeds, "detach") and callable(getattr(input_embeds, "detach")):
+                prepared_input_embeds = input_embeds.detach().cpu().tolist()
+            elif hasattr(input_embeds, "tolist") and callable(getattr(input_embeds, "tolist")):
+                prepared_input_embeds = input_embeds.tolist()
+            else:
+                prepared_input_embeds = input_embeds
+            if prepared_input_embeds is not None:
+                if not isinstance(prepared_input_embeds, list):
+                    prepared_input_embeds = [prepared_input_embeds]
+                elif not prepared_input_embeds:
+                    prepared_input_embeds = [prepared_input_embeds]
+                elif isinstance(prepared_input_embeds[0], list) and (
+                    not prepared_input_embeds[0]
+                    or not isinstance(prepared_input_embeds[0][0], list)
+                ):
+                    prepared_input_embeds = [prepared_input_embeds]
+
         request = GenerateReqInput(
             rid=request_id,
-            input_ids=prompt_ids,
+            input_ids=None if prepared_input_embeds is not None else prompt_ids_list,
+            input_embeds=prepared_input_embeds,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
             image_data=image_data,

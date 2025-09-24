@@ -35,6 +35,16 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        input_embeds = kwargs.get("input_embeds")
+
+        prompt_embeds = None
+        if input_embeds is not None:
+            if hasattr(input_embeds, "detach") and callable(getattr(input_embeds, "detach")):
+                prompt_embeds = input_embeds.detach().cpu().tolist()
+            elif hasattr(input_embeds, "tolist") and callable(getattr(input_embeds, "tolist")):
+                prompt_embeds = input_embeds.tolist()
+            else:
+                prompt_embeds = input_embeds
 
         metrics = {}
         request_id = uuid4().hex
@@ -47,7 +57,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                input_embeds=prompt_embeds,
             )
         response_mask = [1] * len(output.token_ids)
 

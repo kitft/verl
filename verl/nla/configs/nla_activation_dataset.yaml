@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+
+dataset:
+  name: null
+  config_name: null
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: null
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: false
+
+model:
+  name: google/gemma-2-2b-it
+  trust_remote_code: true
+  layer_index: -1
+  use_fp16: false
+
+sampling:
+  total_activations: 256
+  activations_per_sample: 1
+  max_length: 1024
+
+output:
+  path: data/generated/activation_dataset.parquet
+  overwrite: false
+  injection_token: null
+
+seed: 42

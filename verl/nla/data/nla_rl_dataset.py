@@ -75,6 +75,47 @@ class NLARLDataset(RLHFDataset):
         )
 
 
+    def maybe_filter_out_long_prompts(self, dataframe):
+        """
+        Override to handle message format during filtering.
+        """
+        if self.max_prompt_length is None:
+            return dataframe
+
+        print(f"dataset len: {len(dataframe)}")
+
+        def doc2len(doc) -> int:
+            import numpy as np
+            # The prompts should already be in message format from our dataset
+            messages = doc[self.prompt_key]
+            # Convert numpy array to list if needed (parquet storage quirk)
+            if isinstance(messages, np.ndarray):
+                messages = messages.tolist()
+            return len(
+                self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, **self.apply_chat_template_kwargs
+                )
+            )
+
+        dataframe = dataframe.filter(
+            lambda doc: doc2len(doc) <= self.max_prompt_length,
+            num_proc=self.num_workers,
+            desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+        )
+
+        print(f"filter dataset len: {len(dataframe)}")
+        return dataframe
+
+    def _build_messages(self, example: dict):
+        """
+        Override - prompts are already in message format from our dataset.
+        """
+        messages = example.pop(self.prompt_key)
+        # Convert numpy array to list if needed (parquet storage quirk)
+        if isinstance(messages, np.ndarray):
+            messages = messages.tolist()
+        return messages
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         Get a training sample with activation vector.
@@ -89,30 +130,36 @@ class NLARLDataset(RLHFDataset):
         sample = super().__getitem__(idx)
 
         # Load activation vector for this sample
-        if self.activation_vector_key in self.data.columns:
-            activation_vector = self.data.iloc[idx][self.activation_vector_key]
+        activation_vector = sample.pop(self.activation_vector_key, None)
 
-            # Convert to tensor if needed
-            if isinstance(activation_vector, (list, np.ndarray)):
-                activation_vector = torch.tensor(activation_vector, dtype=torch.float32)
-            elif not isinstance(activation_vector, torch.Tensor):
-                activation_vector = torch.tensor(activation_vector, dtype=torch.float32)
+        if activation_vector is None:
+            dataframe = getattr(self, "dataframe", None)
+            column_names = getattr(dataframe, "column_names", []) if dataframe is not None else []
+            if self.activation_vector_key in column_names:
+                activation_vector = dataframe[idx][self.activation_vector_key]
 
-            # Ensure correct shape
-            if activation_vector.dim() == 0:
-                activation_vector = activation_vector.unsqueeze(0)
+        if activation_vector is None:
+            raise KeyError(
+                "Activation vector missing from dataset row. Ensure the parquet file contains an"
+                f" '{self.activation_vector_key}' column with vectors for each example."
+            )
 
-            # Validate dimension
-            if activation_vector.shape[-1] != self.activation_dim:
-                raise ValueError(
-                    f"Activation vector dimension mismatch: "
-                    f"expected {self.activation_dim}, got {activation_vector.shape[-1]}"
-                )
+        # Convert to tensor if needed
+        if isinstance(activation_vector, (list, np.ndarray)):
+            activation_vector = torch.tensor(activation_vector, dtype=torch.float32)
+        elif not isinstance(activation_vector, torch.Tensor):
+            activation_vector = torch.tensor(activation_vector, dtype=torch.float32)
 
-            sample["activation_vectors"] = activation_vector
-        else:
-            # Create a zero vector if no activation provided (for testing)
-            sample["activation_vectors"] = torch.zeros(self.activation_dim, dtype=torch.float32)
+        if activation_vector.dim() == 0:
+            activation_vector = activation_vector.unsqueeze(0)
+
+        if activation_vector.shape[-1] != self.activation_dim:
+            raise ValueError(
+                "Activation vector dimension mismatch: "
+                f"expected {self.activation_dim}, got {activation_vector.shape[-1]}"
+            )
+
+        sample["activation_vectors"] = activation_vector
 
         # Add injection token to input_ids if not already present
         if self.injection_token_id not in sample["input_ids"]:
@@ -203,6 +250,7 @@ def create_nla_rl_dataset(
     base_config = {
         "prompt_key": config.get("prompt_key", "prompt"),
         "max_prompt_length": config.get("max_prompt_length", 512),
+        "return_raw_chat": config.get("return_raw_chat", True),
     }
 
     dataset = NLARLDataset(

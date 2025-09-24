@@ -90,6 +90,7 @@ class AsyncLLMServerManager:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
+        input_embeds: Optional[Any] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -97,16 +98,24 @@ class AsyncLLMServerManager:
             request_id (str): request id for sticky session.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            image_data (Optional[List[Any]]): Optional multimodal payload.
+            input_embeds (Optional[Any]): Optional prompt embeddings overriding token ids.
 
         Returns:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
+        if input_embeds is not None:
+            if hasattr(input_embeds, "detach") and callable(getattr(input_embeds, "detach")):
+                input_embeds = input_embeds.detach().cpu().tolist()
+            elif hasattr(input_embeds, "tolist") and callable(getattr(input_embeds, "tolist")):
+                input_embeds = input_embeds.tolist()
         output = await server.generate.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            input_embeds=input_embeds,
         )
         return output
 
@@ -446,8 +455,22 @@ class AgentLoopWorker:
         )
 
         tasks = []
+        input_embeds_batch = None
+        if batch.batch is not None:
+            try:
+                input_embeds_batch = batch.batch.get("input_embeds", None)
+            except AttributeError:
+                keys = getattr(batch.batch, "keys", lambda: [])()
+                if "input_embeds" in keys:
+                    input_embeds_batch = batch.batch["input_embeds"]
+
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            if input_embeds_batch is not None:
+                sample_embed = input_embeds_batch[i]
+                if hasattr(sample_embed, "detach") and callable(getattr(sample_embed, "detach")):
+                    sample_embed = sample_embed.detach().cpu()
+                kwargs["input_embeds"] = sample_embed
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
         outputs = await asyncio.gather(*tasks)
 
@@ -593,8 +616,9 @@ class AgentLoopWorker:
                     },
                     batch_size=1,
                 )
+                reward_kwargs = {k: v for k, v in kwargs.items() if k != "input_embeds"}
                 non_tensor_batch = {
-                    **{k: np.array([v]) for k, v in kwargs.items()},
+                    **{k: np.array([v]) for k, v in reward_kwargs.items()},
                     "__num_turns__": np.array([output.num_turns]),
                 }
                 data = DataProto(
@@ -800,6 +824,31 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+
+        def _get_batch_field(batch: TensorDict | None, key: str):
+            if batch is None:
+                return None
+            try:
+                return batch.get(key, None)
+            except AttributeError:
+                keys = getattr(batch, "keys", lambda: [])()
+                return batch[key] if key in keys else None
+
+        def _has_input_embeds(data: DataProto) -> bool:
+            return _get_batch_field(data.batch, "input_embeds") is not None
+
+        def _has_activation_vectors(data: DataProto) -> bool:
+            if data.meta_info and data.meta_info.get("activation_vectors") is not None:
+                return True
+            return _get_batch_field(data.batch, "activation_vectors") is not None
+
+        prepare_input_fn = getattr(self.worker_group, "prepare_input_embeddings", None) if self.worker_group else None
+        if (
+            prepare_input_fn is not None
+            and not _has_input_embeds(prompts)
+            and _has_activation_vectors(prompts)
+        ):
+            prompts = prepare_input_fn(prompts)
 
         if self.rm_micro_batch_size and len(prompts) % self.rm_micro_batch_size != 0:
             raise ValueError(

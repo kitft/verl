@@ -21,7 +21,7 @@ import multiprocessing as mp
 import os
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Generator, Optional
+from typing import Any, AsyncGenerator, Generator, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -29,6 +29,7 @@ import ray
 import sglang.srt.entrypoints.engine
 import torch
 import torch.distributed as dist
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -129,6 +130,63 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+    def generate(
+        self,
+        prompt: str | list[str] | None = None,
+        sampling_params: dict | list[dict] | None = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+        input_embeds: list[list[list[float]]] | list[list[float]] | None = None,
+        image_data: list[list[Any]] | list[Any] | Any | None = None,
+        return_logprob: list[bool] | bool | None = False,
+        logprob_start_len: list[int] | int | None = None,
+        top_logprobs_num: list[int] | int | None = None,
+        token_ids_logprob: list[list[int]] | list[int] | None = None,
+        lora_path: list[str | None] | None = None,
+        custom_logit_processor: list[str] | str | None = None,
+        return_hidden_states: bool = False,
+        stream: bool = False,
+    ) -> dict | Generator[dict, None, None]:
+        """Override Engine.generate to plumb optional input embeddings.
+
+        SGLang's upstream engine already accepts `input_embeds` (parity with its
+        OpenAI-compatible `/generate` endpoint). These overrides ensure the
+        rollout worker can surface the field without waiting for the base class
+        to catch up.
+        """
+
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+            lora_path=lora_path,
+            custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
+            stream=stream,
+        )
+        loop = asyncio.get_event_loop()
+        generator = self.tokenizer_manager.generate_request(obj, None)
+
+        if stream:
+
+            def generator_wrapper():
+                while True:
+                    try:
+                        chunk = loop.run_until_complete(generator.__anext__())
+                        yield chunk
+                    except StopAsyncIteration:
+                        break
+
+            return generator_wrapper()
+        else:
+            ret = loop.run_until_complete(generator.__anext__())
+            return ret
+
     async def release_memory_occupation(self, tags: Optional[list[str]] = None):
         """Release GPU occupation temporarily."""
         if tags is None:
@@ -160,6 +218,46 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
         """
         return self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
+    async def async_generate(
+        self,
+        prompt: str | list[str] | None = None,
+        sampling_params: dict | list[dict] | None = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+        input_embeds: list[list[list[float]]] | list[list[float]] | None = None,
+        image_data: list[list[Any]] | list[Any] | Any | None = None,
+        return_logprob: list[bool] | bool | None = False,
+        logprob_start_len: list[int] | int | None = None,
+        top_logprobs_num: list[int] | int | None = None,
+        token_ids_logprob: list[list[int]] | list[int] | None = None,
+        lora_path: list[str | None] | None = None,
+        custom_logit_processor: list[str] | str | None = None,
+        return_hidden_states: bool = False,
+        stream: bool = False,
+    ) -> dict | AsyncGenerator[dict, None]:
+        """Async counterpart that also supports input embeddings."""
+
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+            lora_path=lora_path,
+            custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
+            stream=stream,
+        )
+        generator = self.tokenizer_manager.generate_request(obj, None)
+
+        if stream:
+            return generator
+        else:
+            return await generator.__anext__()
+
 
 # NOTE(sgm): add for verl. We can optimize it by making
 #  the dataloader yield List[int] without padding.
@@ -170,6 +268,108 @@ def _pre_process_inputs(
     # remove the left padding in the prompt token_id
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     return prompt_token_ids[non_pad_index:]
+
+
+def _normalize_input_embeds(value: Any):
+    """Convert tensors/arrays into nested Python lists for SGLang `input_embeds`.
+
+    SGLang's HTTP and engine APIs expect JSON-serialisable lists. We detach and
+    move tensors to CPU so the rollout worker can broadcast them across ranks
+    without keeping device references alive.
+    """
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_input_embeds(elem)
+            if not isinstance(elem, (float, int, np.floating, np.integer))
+            else float(elem)
+            for elem in value
+        ]
+    raise TypeError(f"Unsupported input_embeds type: {type(value)}")
+
+
+def _normalize_batch_input_embeds(raw_embeds: Any, batch_size: int) -> list[Optional[list[list[float]]]]:
+    """Prepare one list entry per batch element for optional input embeddings."""
+    if raw_embeds is None:
+        return [None] * batch_size
+
+    samples: list[Any]
+    if isinstance(raw_embeds, torch.Tensor):
+        tensor = raw_embeds.detach().cpu()
+        if tensor.dim() == 3:
+            samples = [item for item in torch.unbind(tensor, dim=0)]
+        elif tensor.dim() == 2:
+            if batch_size != 1:
+                raise ValueError(
+                    f"input_embeds tensor with shape {tensor.shape} does not match batch size {batch_size}"
+                )
+            samples = [tensor]
+        else:
+            raise ValueError(f"Unsupported tensor shape for input_embeds: {tensor.shape}")
+    elif isinstance(raw_embeds, np.ndarray):
+        if raw_embeds.dtype == object:
+            samples = list(raw_embeds)
+        elif raw_embeds.ndim == 3:
+            samples = [raw_embeds[i] for i in range(raw_embeds.shape[0])]
+        elif raw_embeds.ndim == 2:
+            if batch_size != 1:
+                raise ValueError(
+                    f"input_embeds array with shape {raw_embeds.shape} does not match batch size {batch_size}"
+                )
+            samples = [raw_embeds]
+        elif raw_embeds.ndim == 1 and raw_embeds.shape[0] == batch_size:
+            samples = list(raw_embeds)
+        else:
+            raise ValueError(f"Unsupported ndarray shape for input_embeds: {raw_embeds.shape}")
+    elif isinstance(raw_embeds, (list, tuple)):
+        samples = list(raw_embeds)
+    else:
+        samples = [raw_embeds]
+
+    if len(samples) != batch_size:
+        if batch_size == 1 and len(samples) == 0:
+            samples = [None]
+        elif batch_size == 1 and len(samples) != 1:
+            samples = [samples]
+        elif len(samples) == 0:
+            samples = [None] * batch_size
+        elif len(samples) != batch_size:
+            raise ValueError(f"input_embeds batch size mismatch: expected {batch_size}, got {len(samples)}")
+
+    return [None if sample is None else _normalize_input_embeds(sample) for sample in samples]
+
+
+def _extract_batch_input_embeds(
+    prompts: DataProto, batch_size: int, *, pop_from_non_tensor: bool = False
+) -> list[Optional[list[list[float]]]]:
+    """Collect optional embeddings from DataProto (meta, non-tensor or tensor slots)."""
+    raw_embeds = None
+
+    if prompts.meta_info and prompts.meta_info.get("input_embeds") is not None:
+        raw_embeds = prompts.meta_info["input_embeds"]
+
+    if raw_embeds is None:
+        if pop_from_non_tensor:
+            raw_embeds = prompts.non_tensor_batch.pop("input_embeds", None)
+        else:
+            raw_embeds = prompts.non_tensor_batch.get("input_embeds")
+
+    if raw_embeds is None and prompts.batch is not None:
+        try:
+            raw_embeds = prompts.batch.get("input_embeds", None)
+        except AttributeError:
+            batch_keys = getattr(prompts.batch, "keys", lambda: [])()
+            if "input_embeds" in batch_keys:
+                raw_embeds = prompts.batch["input_embeds"]
+
+    return _normalize_batch_input_embeds(raw_embeds, batch_size)
 
 
 def _extract_logprob_from_output(output):
@@ -457,7 +657,13 @@ class SGLangRollout(BaseRollout):
                 "attention_backend": attention_backend if attention_backend is not None else "fa3",
                 # In async mode, we want token in token out.
                 "skip_tokenizer_init": self.config.skip_tokenizer_init,
+                "disable_radix_cache": self.config.disable_radix_cache,
             }
+            if self.config.disable_radix_cache:
+                logger.info("DISABLING RADIX CACHE")
+                print("DISABLING RADIX CACHE")
+
+            logger.info(f"args: {args}")
 
             if is_server_mode:
                 # add server specific args
@@ -591,7 +797,8 @@ class SGLangRollout(BaseRollout):
             `prompts`. This includes handling padding and preparing raw
             token ID lists.
         2.  Preparing inputs for the SGLang engine, including multi-modal
-            data if present.
+            data if present and optional `input_embeds` that override the
+            raw token IDs when supplied.
         3.  Invoking the SGLang engine (`self._engine.async_generate`,
             an async coroutine) with the batch of processed inputs and
             specified sampling parameters on the master TP rank.
@@ -644,26 +851,48 @@ class SGLangRollout(BaseRollout):
                 dtype=object,
             )
 
+        input_embeds_per_sample = _extract_batch_input_embeds(prompts, batch_size, pop_from_non_tensor=True)
+
+        raw_prompt_ids_array = non_tensor_batch.pop("raw_prompt_ids")
+        raw_prompt_ids_list = (
+            raw_prompt_ids_array.tolist()
+            if isinstance(raw_prompt_ids_array, np.ndarray)
+            else list(raw_prompt_ids_array)
+        )
+
+        if len(raw_prompt_ids_list) != batch_size:
+            raise ValueError(f"raw_prompt_ids length mismatch: expected {batch_size}, got {len(raw_prompt_ids_list)}")
+
         if "multi_modal_data" in non_tensor_batch:
-            sglang_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"),
-                non_tensor_batch.pop("multi_modal_data"),
-                strict=True,
-            ):
-                sglang_inputs.append(
-                    {
-                        "prompt_token_ids": raw_prompt_ids,
-                        "multi_modal_data": multi_modal_data,
-                        "image_data": (
-                            multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None
-                        ),
-                    }
-                )
+            multi_modal_raw = non_tensor_batch.pop("multi_modal_data")
+            multi_modal_list = (
+                multi_modal_raw.tolist() if isinstance(multi_modal_raw, np.ndarray) else list(multi_modal_raw)
+            )
         else:
-            sglang_inputs = [
-                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
-            ]
+            multi_modal_list = [None] * batch_size
+
+        if len(multi_modal_list) != batch_size:
+            raise ValueError(f"multi_modal_data length mismatch: expected {batch_size}, got {len(multi_modal_list)}")
+
+        sglang_inputs = []
+        for raw_prompt_ids, multi_modal_data, prompt_embeds in zip(
+            raw_prompt_ids_list, multi_modal_list, input_embeds_per_sample, strict=True
+        ):
+            prompt_token_ids = (
+                raw_prompt_ids.tolist() if isinstance(raw_prompt_ids, np.ndarray) else list(raw_prompt_ids)
+            )
+
+            input_entry = {"prompt_token_ids": prompt_token_ids}
+
+            if multi_modal_data is not None:
+                input_entry["multi_modal_data"] = multi_modal_data
+                if isinstance(multi_modal_data, dict):
+                    input_entry["image_data"] = multi_modal_data.get("image")
+
+            if prompt_embeds is not None:
+                input_entry["input_embeds"] = prompt_embeds
+
+            sglang_inputs.append(input_entry)
 
         for input_data in sglang_inputs:
             # Ensure token IDs are lists or numpy arrays
@@ -677,6 +906,14 @@ class SGLangRollout(BaseRollout):
         # Extract token IDs and image data for SGLang Engine
         idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
         image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
+        input_embeds_list = [input_data.get("input_embeds") for input_data in sglang_inputs]
+
+        has_input_embeds = any(embed is not None for embed in input_embeds_list)
+        if has_input_embeds and not all(embed is not None for embed in input_embeds_list):
+            raise ValueError("input_embeds must be provided for all samples when supplied.")
+
+        engine_input_ids = None if has_input_embeds else idx_list
+        engine_input_embeds = input_embeds_list if has_input_embeds else None
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -720,7 +957,8 @@ class SGLangRollout(BaseRollout):
                     prompt=None,  # because we have already convert it to prompt token id
                     sampling_params=request_sampling_params,
                     return_logprob=True,
-                    input_ids=idx_list,
+                    input_ids=engine_input_ids,
+                    input_embeds=engine_input_embeds,
                     image_data=image_list,
                 )
             )
@@ -1031,20 +1269,41 @@ class SGLangRollout(BaseRollout):
         self, _req: AsyncRolloutRequest, sampling_params: dict, image_data: Optional[list[Any]] = None
     ) -> dict:
         generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
-        return await self._handle_engine_generate(generation_prompt_ids, sampling_params, image_data)
+        generation_prompt_embeds = _req.get_generation_prompt_embeds()
+        # Avoid reusing stale embeddings across turns once we've consumed them.
+        _req.input_embeds = None
+        return await self._handle_engine_generate(
+            generation_prompt_ids, sampling_params, image_data, generation_prompt_embeds
+        )
 
     async def _handle_engine_generate(
-        self, generation_prompt_ids: list[int], sampling_params: dict, image_data: Optional[list[Any]] = None
+        self,
+        generation_prompt_ids: list[int] | None,
+        sampling_params: dict,
+        image_data: Optional[list[Any]] = None,
+        generation_prompt_embeds: Optional[list[list[float]]] = None,
     ) -> dict:
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1)
+        prompt_length = 0
+        if generation_prompt_ids is not None:
+            prompt_length = len(generation_prompt_ids)
+        elif generation_prompt_embeds is not None:
+            prompt_length = len(generation_prompt_embeds)
+
+        max_new_tokens = min(self.config.response_length, self.config.max_model_len - prompt_length - 1)
 
         kwargs = sampling_params.copy()
         kwargs["max_new_tokens"] = max_new_tokens
         kwargs["n"] = 1  # group size is supported in preprocess
         return_logprob = kwargs.pop("logprobs", False)
 
+        input_ids_arg = generation_prompt_ids if generation_prompt_embeds is None else None
+        input_embeds_arg = None
+        if generation_prompt_embeds is not None:
+            input_embeds_arg = [generation_prompt_embeds]
+
         output = await self._engine.async_generate(
-            input_ids=generation_prompt_ids,
+            input_ids=input_ids_arg,
+            input_embeds=input_embeds_arg,
             sampling_params=kwargs,
             return_logprob=return_logprob,
             image_data=image_data,
@@ -1410,6 +1669,11 @@ class SGLangRollout(BaseRollout):
         multi_modal_data_list = prompts.non_tensor_batch.get(
             "multi_modal_data", [None] * len(prompts.non_tensor_batch["raw_prompt"])
         )
+        input_embeds_batch = _extract_batch_input_embeds(
+            prompts,
+            len(prompts.non_tensor_batch["raw_prompt"]),
+            pop_from_non_tensor=True,
+        )
 
         for data_idx, (raw_prompt, multi_modal_data) in enumerate(
             zip(prompts.non_tensor_batch["raw_prompt"], multi_modal_data_list, strict=True)
@@ -1430,6 +1694,11 @@ class SGLangRollout(BaseRollout):
             else:
                 _interaction_kwargs = {}
 
+            raw_input_embeds = input_embeds_batch[data_idx]
+            _input_embeds = (
+                torch.tensor(raw_input_embeds, dtype=torch.float32) if raw_input_embeds is not None else None
+            )
+
             if not isinstance(raw_prompt, list | np.ndarray):
                 raise TypeError(f"raw_prompt must be a list or numpy array, got {type(raw_prompt)}")
 
@@ -1444,6 +1713,7 @@ class SGLangRollout(BaseRollout):
                 tools_kwargs=_tools_kwargs,
                 interaction_kwargs=_interaction_kwargs,
                 input_ids=_input_ids,
+                input_embeds=_input_embeds,
                 response_ids=None,
                 attention_mask=_attention_mask,
                 response_attention_mask=None,

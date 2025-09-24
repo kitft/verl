@@ -121,70 +121,55 @@ class NLAGRPOTrainer(RayPPOTrainer):
         Returns:
             DataProto with expanded batch (batch_size * N) and group_ids
         """
-        batch_size = prompts.data["input_ids"].shape[0]
+        batch_size = prompts.batch["input_ids"].shape[0]
         n_trajectories = self.grpo_config.num_trajectories_per_prompt
 
         # Extract activation vectors before expansion (if present)
         activation_vectors = None
-        if "activation_vectors" in prompts.data:
-            activation_vectors = prompts.data["activation_vectors"]
-        elif hasattr(prompts, 'metadata') and prompts.metadata and "activation_vectors" in prompts.metadata:
-            activation_vectors = prompts.metadata["activation_vectors"]
+        if "activation_vectors" in prompts.batch.keys():
+            activation_vectors = prompts.batch["activation_vectors"]
+        elif prompts.meta_info and "activation_vectors" in prompts.meta_info:
+            activation_vectors = prompts.meta_info["activation_vectors"]
 
         # Expand prompts to generate N responses per prompt
-        expanded_data = {}
-        for key, value in prompts.data.items():
-            if isinstance(value, torch.Tensor):
-                # Repeat each prompt N times
-                expanded_value = value.repeat_interleave(n_trajectories, dim=0)
-                expanded_data[key] = expanded_value
-            else:
-                expanded_data[key] = value
+        expanded_prompts = prompts.repeat(repeat_times=n_trajectories, interleave=True)
 
         # Create group IDs to track which responses belong to which prompt
         group_ids = torch.arange(batch_size).repeat_interleave(n_trajectories)
 
-        # Create expanded DataProto
-        expanded_prompts = DataProto(
-            data=expanded_data,
-            metadata={
+        # Clone meta info to avoid modifying original prompts
+        expanded_meta = dict(expanded_prompts.meta_info) if expanded_prompts.meta_info else {}
+        expanded_meta.update(
+            {
                 "group_ids": group_ids,
                 "original_batch_size": batch_size,
                 "num_trajectories": n_trajectories,
             }
         )
-
-        # Add activation vectors to expanded prompts if available
         if activation_vectors is not None:
-            # Expand activation vectors to match the repeated prompts
-            expanded_activation_vectors = activation_vectors.repeat_interleave(n_trajectories, dim=0)
-
-            # Store in both data and metadata for compatibility
-            expanded_prompts.data["activation_vectors"] = expanded_activation_vectors
-            expanded_prompts.metadata["activation_vectors"] = expanded_activation_vectors
-
-            # Also store original unexpanded vectors for reference
-            expanded_prompts.metadata["original_activation_vectors"] = activation_vectors
-
-        # Preserve any other metadata from original prompts
-        if hasattr(prompts, 'metadata') and prompts.metadata:
-            for key, value in prompts.metadata.items():
-                if key not in expanded_prompts.metadata:
-                    expanded_prompts.metadata[key] = value
+            expanded_meta["original_activation_vectors"] = activation_vectors
+        expanded_prompts.meta_info = expanded_meta
 
         # Generate responses with the actor (with activation injection if vectors present)
         responses = self.actor_rollout_ref_worker.generate_sequences(expanded_prompts)
 
         # Preserve group information and activation vectors in responses
-        responses.metadata["group_ids"] = group_ids
-        responses.metadata["original_batch_size"] = batch_size
-        responses.metadata["num_trajectories"] = n_trajectories
-
-        # Preserve activation vectors for critic computation
+        response_meta = dict(responses.meta_info) if responses.meta_info else {}
+        response_meta.update(
+            {
+                "group_ids": group_ids,
+                "original_batch_size": batch_size,
+                "num_trajectories": n_trajectories,
+            }
+        )
         if activation_vectors is not None:
-            responses.metadata["original_activation_vectors"] = activation_vectors
-            if "activation_vectors" not in responses.data:
-                responses.data["activation_vectors"] = expanded_activation_vectors
+            response_meta["original_activation_vectors"] = activation_vectors
+        responses.meta_info = response_meta
+
+        # Ensure activation vectors stay available for downstream modules
+        if activation_vectors is not None and "activation_vectors" not in responses.batch.keys():
+            expanded_activation_vectors = activation_vectors.repeat_interleave(n_trajectories, dim=0)
+            responses.batch.update({"activation_vectors": expanded_activation_vectors})
 
         return responses
 
@@ -199,8 +184,8 @@ class NLAGRPOTrainer(RayPPOTrainer):
         Works on expanded batch (batch_size * N).
         """
         # Extract response tokens
-        response_ids = data.data.get("response_ids", data.data["input_ids"])
-        attention_mask = data.data.get("attention_mask")
+        response_ids = data.batch["response_ids"] if "response_ids" in data.batch.keys() else data.batch["input_ids"]
+        attention_mask = data.batch["attention_mask"] if "attention_mask" in data.batch.keys() else None
 
         # Get critic's activation predictions
         with torch.no_grad():
@@ -223,9 +208,13 @@ class NLAGRPOTrainer(RayPPOTrainer):
         )
 
         # Add rewards to data
-        data.data["rewards"] = reward_dict["rewards"]
-        data.data["mse_values"] = reward_dict["mse"]
-        data.data["predicted_activations"] = predicted_activations
+        data.batch.update(
+            {
+                "rewards": reward_dict["rewards"],
+                "mse_values": reward_dict["mse"],
+                "predicted_activations": predicted_activations,
+            }
+        )
 
         # Track metrics
         self.grpo_metrics["avg_mse"].append(reward_dict["mse"].mean().item())
@@ -244,11 +233,14 @@ class NLAGRPOTrainer(RayPPOTrainer):
         relative to each other, providing a strong learning signal about
         which responses are better for that specific prompt.
         """
-        rewards = data.data["rewards"]  # Shape: (batch_size * N,)
+        rewards = data.batch["rewards"]  # Shape: (batch_size * N,)
 
         # Get group information
-        group_ids = data.metadata["group_ids"]  # Shape: (batch_size * N,)
-        batch_size = data.metadata.get("original_batch_size", group_ids.max().item() + 1)
+        if not data.meta_info:
+            raise ValueError("Group metadata missing from DataProto")
+
+        group_ids = data.meta_info["group_ids"]  # Shape: (batch_size * N,)
+        batch_size = data.meta_info.get("original_batch_size", group_ids.max().item() + 1)
 
         advantages = torch.zeros_like(rewards)
         returns = torch.zeros_like(rewards)
@@ -290,8 +282,10 @@ class NLAGRPOTrainer(RayPPOTrainer):
         if self.config.trainer.normalize_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        data.data["advantages"] = advantages
-        data.data["returns"] = returns
+        data.batch.update({
+            "advantages": advantages,
+            "returns": returns,
+        })
 
         return data
 
@@ -305,8 +299,8 @@ class NLAGRPOTrainer(RayPPOTrainer):
 
         The critic learns from all N trajectories per prompt.
         """
-        response_ids = data.data.get("response_ids", data.data["input_ids"])
-        attention_mask = data.data.get("attention_mask")
+        response_ids = data.batch["response_ids"] if "response_ids" in data.batch.keys() else data.batch["input_ids"]
+        attention_mask = data.batch["attention_mask"] if "attention_mask" in data.batch.keys() else None
         target_activations = self.adapter.extract_activation_vectors_from_dataproto(data)
 
         if target_activations is None:
@@ -354,7 +348,7 @@ class NLAGRPOTrainer(RayPPOTrainer):
         the other N-1 alternatives for the same prompt.
         """
         # Ensure we have advantages
-        if "advantages" not in data.data:
+        if "advantages" not in data.batch.keys():
             raise ValueError("Advantages not computed. Run compute_advantage_and_returns first.")
 
         # Standard PPO update with GRPO advantages

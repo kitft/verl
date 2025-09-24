@@ -18,16 +18,18 @@ class NLADataProtoAdapter:
         injection_positions: Optional[List[List[int]]] = None,
     ) -> DataProto:
         """Add activation vectors to a DataProto object."""
-        # Store activation vectors in the DataProto metadata
-        if not hasattr(data_proto, "metadata") or data_proto.metadata is None:
-            data_proto.metadata = {}
+        meta_info = data_proto.meta_info if data_proto.meta_info is not None else {}
+        # Ensure we do not mutate other references in-place
+        if meta_info is data_proto.meta_info:
+            meta_info = dict(meta_info)
 
-        data_proto.metadata["activation_vectors"] = activation_vectors
+        meta_info["activation_vectors"] = activation_vectors
 
         if injection_positions is not None:
-            data_proto.metadata["injection_positions"] = injection_positions
+            meta_info["injection_positions"] = injection_positions
 
-        data_proto.metadata["has_nla"] = True
+        meta_info["has_nla"] = True
+        data_proto.meta_info = meta_info
 
         return data_proto
 
@@ -35,16 +37,18 @@ class NLADataProtoAdapter:
         self, data_proto: DataProto
     ) -> Optional[torch.Tensor]:
         """Extract activation vectors from a DataProto object."""
-        if hasattr(data_proto, "metadata") and data_proto.metadata is not None:
-            return data_proto.metadata.get("activation_vectors", None)
+        meta_info = getattr(data_proto, "meta_info", None)
+        if meta_info:
+            return meta_info.get("activation_vectors")
         return None
 
     def extract_injection_positions_from_dataproto(
         self, data_proto: DataProto
     ) -> Optional[List[List[int]]]:
         """Extract injection positions from a DataProto object."""
-        if hasattr(data_proto, "metadata") and data_proto.metadata is not None:
-            return data_proto.metadata.get("injection_positions", None)
+        meta_info = getattr(data_proto, "meta_info", None)
+        if meta_info:
+            return meta_info.get("injection_positions")
         return None
 
     def find_injection_positions_in_prompts(
@@ -56,7 +60,7 @@ class NLADataProtoAdapter:
         injection_token_id = tokenizer.convert_tokens_to_ids(self.injection_token)
         positions = []
 
-        input_ids = prompts.data["input_ids"]
+        input_ids = prompts.batch["input_ids"]
         batch_size = input_ids.shape[0]
 
         for batch_idx in range(batch_size):
@@ -86,11 +90,12 @@ class NLADataProtoAdapter:
         )
 
         # Create DataProto
-        data_proto = DataProto(
-            data={
+        data_proto = DataProto.from_dict(
+            tensors={
                 "input_ids": encoded["input_ids"],
                 "attention_mask": encoded["attention_mask"],
-            }
+            },
+            meta_info={},
         )
 
         # Find injection positions

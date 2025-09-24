@@ -38,24 +38,47 @@ algorithm:
 # Override model paths for tiny model
 actor_rollout_ref:
   model:
-    path: yujiepan/gemma-2-tiny-random
+    path: google/gemma-2-2b-it
+    tokenizer_path: google/gemma-2-2b-it
+
+  # Actor FSDP configuration
+  actor:
+    strategy: fsdp
+    ppo_micro_batch_size_per_gpu: 2  # Required for actor training
+    fsdp_config:
+      model_dtype: bf16  # TODO: Flash Attention warning about dtype - may need to address later
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
 
   # Reduce rollout batch size for testing
   rollout:
-    micro_batch_size: 2
+    name: nla_sglang  # Use NLA-specific SGLang rollout
+    mode: sync  # Use sync mode for simpler setup
     tensor_model_parallel_size: 1
-    gpu_memory_utilization: 0.2
+    disable_radix_cache: true
 
-    # Smaller generation for testing
-    generation_kwargs:
-      max_new_tokens: 50
-      temperature: 0.7
+    # Generation parameters
+    response_length: 50  # Max tokens to generate
+    temperature: 0.7  # Sampling temperature
+    do_sample: true  # Enable sampling
 
 # Tiny model critic settings
 critic:
   enable: true  # Explicitly enable critic for NLA GRPO
+  strategy: fsdp
   model:
-    path: yujiepan/gemma-2-tiny-random
+    path: google/gemma-2-2b-it
+    fsdp_config:
+      model_dtype: bf16  # TODO: Flash Attention warning about dtype - may need to address later
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+
+  # Set PPO micro batch size for critic training
+  ppo_micro_batch_size_per_gpu: 2
 
 # NLA settings for tiny model
 nla:
@@ -64,6 +87,12 @@ nla:
 
   # activation_dim will be auto-determined from model's hidden_size
   # No need to specify it explicitly
+
+  # Injection settings for activation vectors
+  injection:
+    mode: replace  # Replace embedding at injection position
+    layer_indices: [0]  # Not used for embedding injection, kept for compatibility
+    injection_token: null  # Auto-detect special token or use position 1
 
   # Reduce GRPO settings for testing
   grpo:

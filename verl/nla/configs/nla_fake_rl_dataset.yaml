@@ -1,0 +1,14 @@
+defaults:
+  - _self_
+
+num_samples: 1000
+activation_dim: null
+
+model:
+  name: google/gemma-2-2b-it
+  trust_remote_code: true
+  injection_token: null
+
+output:
+  path: data/testing/fake_nla_dataset.parquet
+  overwrite: false

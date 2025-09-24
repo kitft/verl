@@ -18,16 +18,22 @@ from verl.utils.fsdp_utils import (
     fsdp2_load_full_state_dict,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
+    init_fn,
 )
 from verl.utils.torch_dtypes import PrecisionType
 
 
 class NLAFSDPSFTTrainer(FSDPSFTTrainer):
     """
-    NLA-specific FSDP SFT Trainer that:
-    1. Wraps actor model with NLAModelWrapper for activation injection
-    2. Optionally trains a critic model with vector value head
-    3. Supports joint training of actor and critic
+    NLA-specific FSDP SFT Trainer that supports EITHER actor OR critic training.
+
+    Actor mode:
+    - Wraps base model with NLAModelWrapper for activation injection
+    - Trains model to generate responses with injected activation vectors
+
+    Critic mode:
+    - Uses base model to predict activation vectors from inputs
+    - Outputs activation vectors directly from last hidden states
     """
 
     def __init__(
@@ -41,7 +47,11 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
     ):
         # Store NLA config before calling parent
         self.nla_config = config.get("nla", {})
-        self.train_mode = self.nla_config.get("train_mode", "actor")  # 'actor', 'critic', or 'both'
+        self.train_mode = self.nla_config.get("train_mode", "actor")  # 'actor' or 'critic' only
+
+        # Validate train_mode
+        if self.train_mode not in ["actor", "critic"]:
+            raise ValueError(f"train_mode must be 'actor' or 'critic', got '{self.train_mode}'")
 
         # Call parent constructor
         super().__init__(
@@ -53,21 +63,14 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             val_dataset=val_dataset,
         )
 
-        # Build critic if needed
-        if self.train_mode in ["critic", "both"]:
-            self._build_critic_model_optimizer()
-
     def _build_model_optimizer(self):
-        """Override to wrap model with NLA wrapper if training actor."""
-
-        if self.train_mode in ["actor", "both"]:
-            # Build and wrap actor model with NLA wrapper
+        """Build either actor or critic model based on train_mode."""
+        if self.train_mode == "actor":
+            # Build NLA-wrapped actor model
             self._build_nla_actor_model_optimizer()
-        elif self.train_mode == "critic":
-            # Only build critic, skip actor
-            pass
-        else:
-            raise ValueError(f"Unknown train_mode: {self.train_mode}")
+        else:  # critic mode
+            # Build critic model and set it as the main model
+            self._build_critic_model_optimizer()
 
     def _build_nla_actor_model_optimizer(self):
         """Build NLA-wrapped actor model and optimizer."""
@@ -154,34 +157,87 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        # Setup FSDP
-        mixed_precision = None
-        if self.config.model.fsdp_config.get("mixed_precision", False):
-            from torch.distributed.fsdp import MixedPrecision
-
-            mixed_precision = MixedPrecision(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
-            )
-
-        auto_wrap_policy = get_fsdp_wrap_policy(
-            self.model.base_model,  # Use base model for policy
-            config=self.config.model.fsdp_config.wrap_policy,
-            is_lora=self.config.model.get("lora_rank", 0) > 0,
+        # Apply FSDP wrapping
+        # For actor, we wrap the base_model inside the NLAModelWrapper
+        self._apply_fsdp_wrapping(
+            model_to_wrap=self.model,
+            model_for_policy=self.model.base_model,
+            inner_model_for_fsdp2=self.model.base_model
         )
 
-        # Apply FSDP2 or FSDP1 based on strategy
+        # Create optimizer and scheduler
+        self._create_optimizer_and_scheduler()
+
+    def _build_critic_model_optimizer(self):
+        """Build critic model that outputs activation vectors from last hidden states."""
+        critic_config = self.nla_config.get("critic", {})
+        critic_model_path = critic_config.get("model_path", self.config.model.partial_pretrain)
+
+        if self.device_mesh.get_rank() == 0:
+            print(f"Building NLA critic model from: {critic_model_path}")
+
+        # Create critic with vector value head
+        # Set as self.model for unified handling
+        self.model = AutoModelForCausalLMWithVectorValueHead(
+            pretrained_model_name_or_path=critic_model_path,
+            dropout=critic_config.get("dropout", 0.1),
+            trust_remote_code=self.config.model.trust_remote_code,
+            attn_implementation="flash_attention_2" if self.config.model.get("enable_flashattn", False) else "eager",
+        )
+
+        # Apply FSDP wrapping
+        # For critic, we wrap the pretrained_model inside AutoModelForCausalLMWithVectorValueHead
+        self._apply_fsdp_wrapping(
+            model_to_wrap=self.model,
+            model_for_policy=self.model.pretrained_model,
+            inner_model_for_fsdp2=self.model.pretrained_model
+        )
+
+        # Create optimizer and scheduler
+        self._create_optimizer_and_scheduler()
+
+    def _apply_fsdp_wrapping(self, model_to_wrap, model_for_policy, inner_model_for_fsdp2):
+        """Apply FSDP wrapping to the model based on the configured strategy.
+
+        Args:
+            model_to_wrap: The outer model to wrap with FSDP (for FSDP1)
+            model_for_policy: The model to use for auto wrap policy generation
+            inner_model_for_fsdp2: The inner model to wrap with FSDP2
+        """
         fsdp_strategy = self.config.model.strategy
+
         if fsdp_strategy == "fsdp":
+            # Setup FSDP1 with consistent configuration for both actor and critic
             from torch.distributed.fsdp import CPUOffload, ShardingStrategy
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import MixedPrecision
 
+            # Setup mixed precision if configured
+            mixed_precision = None
+            if self.config.model.fsdp_config.get("mixed_precision", False):
+                mixed_precision = MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.float32,
+                    buffer_dtype=torch.float32
+                )
+
+            # Setup auto wrap policy
+            auto_wrap_policy = get_fsdp_wrap_policy(
+                model_for_policy,
+                config=self.config.model.fsdp_config.wrap_policy,
+                is_lora=self.config.model.get("lora_rank", 0) > 0,
+            )
+
+            # Setup CPU offload if configured
             cpu_offload = None
             if self.config.model.fsdp_config.cpu_offload:
                 cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
 
+            # Apply FSDP1
             self.fsdp_model = FSDP(
-                self.model,
+                model_to_wrap,
                 cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
                 use_orig_params=False,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
@@ -191,127 +247,78 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
             )
+
         elif fsdp_strategy == "fsdp2":
+            # Setup FSDP2 with consistent configuration for both actor and critic
+            from verl.utils.fsdp_utils import CPUOffloadPolicy
+
             mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                cast_forward_inputs=True
             )
+
+            # Setup CPU offload if configured
+            cpu_offload = None
+            if self.config.model.fsdp_config.cpu_offload:
+                cpu_offload = CPUOffloadPolicy(offload_params=self.config.model.fsdp_config.offload_params)
 
             fsdp_kwargs = {
                 "mesh": self.device_mesh,
                 "mp_policy": mp_policy,
-                "offload_policy": None,
+                "offload_policy": cpu_offload,
                 "reshard_after_forward": True,
             }
 
-            # Apply FSDP2 to the base model inside the wrapper, not the wrapper itself
-            # This matches how VERL handles wrapped models (e.g., with LoRA)
-            full_state = self.model.base_model.state_dict()
-            apply_fsdp2(self.model.base_model, fsdp_kwargs, self.config.model.fsdp_config)
-            fsdp2_load_full_state_dict(self.model.base_model, full_state, self.device_mesh, None)
-            # Keep the wrapper as the interface but the base model is now FSDP-wrapped
-            self.fsdp_model = self.model
+            # Apply FSDP2 to the inner model
+            full_state = inner_model_for_fsdp2.state_dict()
+            apply_fsdp2(inner_model_for_fsdp2, fsdp_kwargs, self.config.model.fsdp_config)
+            fsdp2_load_full_state_dict(inner_model_for_fsdp2, full_state, self.device_mesh, cpu_offload)
+            # Keep the outer model as the interface
+            self.fsdp_model = model_to_wrap
+
         else:
             raise NotImplementedError(f"Strategy {fsdp_strategy} not implemented")
 
-        # Create optimizer for actor - use fsdp_model.parameters() like base trainer
+    def _create_optimizer_and_scheduler(self):
+        """Create optimizer and learning rate scheduler for either actor or critic training."""
+        # Determine learning rate
+        if self.train_mode == "critic":
+            lr = self.nla_config.get("critic_lr", self.config.optim.lr)
+        else:
+            lr = self.config.optim.lr
+
+        # Create optimizer
         self.optimizer = torch.optim.AdamW(
             self.fsdp_model.parameters(),
-            lr=self.config.optim.lr,
+            lr=lr,
             betas=self.config.optim.betas,
             weight_decay=self.config.optim.weight_decay,
         )
 
-        # Setup learning rate scheduler
+        # Calculate training steps
         self.steps_per_epoch = len(self.train_dataloader)
         self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
         num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
+        # Create learning rate scheduler
         from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 
         self.lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-        )
-
-    def _build_critic_model_optimizer(self):
-        """Build NLA critic model with vector value head."""
-        critic_config = self.nla_config.get("critic", {})
-        critic_model_path = critic_config.get("model_path", self.config.model.partial_pretrain)
-
-        if self.device_mesh.get_rank() == 0:
-            print(f"Building NLA critic model from: {critic_model_path}")
-
-        # Get model config to determine activation_dim
-        from transformers import AutoConfig
-
-        critic_model_config = AutoConfig.from_pretrained(
-            critic_model_path, trust_remote_code=self.config.model.trust_remote_code
-        )
-
-        # Create critic with vector value head
-        self.critic_model = AutoModelForCausalLMWithVectorValueHead(
-            pretrained_model_name_or_path=critic_model_path,
-            activation_dim=critic_model_config.hidden_size,  # Use model's hidden_size
-            dropout=critic_config.get("dropout", 0.1),
-            trust_remote_code=self.config.model.trust_remote_code,
-            attn_implementation="flash_attention_2" if self.config.model.get("enable_flashattn", False) else "eager",
-        )
-
-        # Apply FSDP to critic
-        fsdp_strategy = self.config.model.strategy
-        if fsdp_strategy == "fsdp2":
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
-            )
-
-            fsdp_kwargs = {
-                "mesh": self.device_mesh,
-                "mp_policy": mp_policy,
-                "offload_policy": None,
-                "reshard_after_forward": True,
-            }
-
-            full_state = self.critic_model.state_dict()
-            apply_fsdp2(self.critic_model, fsdp_kwargs, self.config.model.fsdp_config)
-            fsdp2_load_full_state_dict(self.critic_model, full_state, self.device_mesh, None)
-            self.fsdp_critic = self.critic_model
-        else:
-            # Use FSDP1
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy
-
-            self.fsdp_critic = FSDP(
-                self.critic_model,
-                use_orig_params=False,
-                device_id=get_device_id(),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                sync_module_states=True,
-                device_mesh=self.device_mesh,
-            )
-
-        # Create critic optimizer
-        critic_lr = self.nla_config.get("critic_lr", self.config.optim.lr)
-        self.critic_optimizer = torch.optim.AdamW(
-            self.fsdp_critic.parameters(),
-            lr=critic_lr,
-            betas=self.config.optim.betas,
-            weight_decay=self.config.optim.weight_decay,
-        )
-
-        # Create critic scheduler
-        from verl.utils.torch_functional import get_cosine_schedule_with_warmup
-
-        num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
-        self.critic_lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=self.critic_optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+            optimizer=self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=self.total_steps
         )
 
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Override to handle activation injection for actor."""
+        """Override to handle activation injection for actor training.
 
+        Only used in actor mode - adds activation vectors to batch for NLA wrapper.
+        """
         # Extract activation vectors if present
         activation_vectors = batch.get("activation_vectors", None)
 
-        if self.train_mode in ["actor", "both"] and activation_vectors is not None:
+        if self.train_mode == "actor" and activation_vectors is not None:
             # Add activation vectors to the batch for NLA wrapper
             batch["activation_vectors"] = activation_vectors.to(self.device_name)
 
@@ -320,18 +327,25 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
 
     def _compute_critic_loss(self, batch):
         """Compute MSE loss for critic training."""
-        # Get response tokens and target activations
-        response_ids = batch["response_ids"].to(self.device_name)
-        response_mask = batch.get("response_attention_mask", torch.ones_like(response_ids)).to(self.device_name)
+        # Get input tokens and target activations
+        # Use the full input_ids since we don't have separate response_ids
+        input_ids = batch["input_ids"].to(self.device_name)
+        attention_mask = batch.get("attention_mask", torch.ones_like(input_ids)).to(self.device_name)
         target_activations = batch["activation_vectors"].to(self.device_name)
 
         # Forward pass through critic
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            critic_output = self.fsdp_critic(
-                input_ids=response_ids,
-                attention_mask=response_mask,
+            critic_output = self.fsdp_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
             )
-            predicted_activations = critic_output.predicted_activation
+            # Extract the last position's activation vector
+            values = critic_output.value  # (batch, seq_len, hidden_size)
+            # Get the last non-padding position for each sequence
+            seq_lengths = attention_mask.sum(dim=-1) - 1
+            batch_size = input_ids.shape[0]
+            predicted_activations = values[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
 
             # Compute MSE loss
             loss = nn.functional.mse_loss(predicted_activations, target_activations)
@@ -339,18 +353,17 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         return loss
 
     def training_step(self, batch):
-        """Override to support critic training."""
-        metrics = {}
+        """Training step for either actor or critic."""
+        if self.train_mode == "actor":
+            # Use parent's training_step for actor
+            return super().training_step(batch)
+        else:
+            # Critic training
+            import time
+            start_time = time.time()
 
-        # Train actor if needed
-        if self.train_mode in ["actor", "both"]:
-            actor_metrics = super().training_step(batch)
-            metrics.update({f"actor/{k}": v for k, v in actor_metrics.items()})
-
-        # Train critic if needed
-        if self.train_mode in ["critic", "both"]:
-            self.fsdp_critic.train()
-            self.critic_optimizer.zero_grad()
+            self.fsdp_model.train()
+            self.optimizer.zero_grad()
 
             # Compute critic loss
             critic_loss = self._compute_critic_loss(batch)
@@ -359,41 +372,36 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             # Clip gradients
             if self.config.model.strategy == "fsdp2":
                 from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
-
-                critic_grad_norm = fsdp2_clip_grad_norm_(
-                    self.fsdp_critic.parameters(), max_norm=self.config.optim.clip_grad
+                grad_norm = fsdp2_clip_grad_norm_(
+                    self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad
                 )
             else:
-                critic_grad_norm = self.fsdp_critic.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+                grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
             # Step optimizer
-            if torch.isfinite(critic_grad_norm):
-                self.critic_optimizer.step()
-                self.critic_lr_scheduler.step()
+            if torch.isfinite(grad_norm):
+                self.optimizer.step()
+                self.lr_scheduler.step()
             else:
-                self.critic_optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-            # Add critic metrics
-            metrics["critic/loss"] = critic_loss.item()
-            metrics["critic/grad_norm"] = critic_grad_norm.item() if torch.isfinite(critic_grad_norm) else float("inf")
-            metrics["critic/lr(1e-3)"] = self.critic_lr_scheduler.get_last_lr()[0] * 1e3
-
-        return metrics
+            # Return metrics
+            end_time = time.time()
+            return {
+                "train/loss": critic_loss.item(),
+                "train/grad_norm": grad_norm.item() if torch.isfinite(grad_norm) else float("inf"),
+                "train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
+                "train/time(s)": end_time - start_time,
+            }
 
     def validation_step(self, batch):
-        """Override to validate both actor and critic."""
-        metrics = {}
-
-        # Validate actor if needed
-        if self.train_mode in ["actor", "both"]:
-            actor_loss = super().validation_step(batch)
-            metrics["val/actor_loss"] = actor_loss.item()
-
-        # Validate critic if needed
-        if self.train_mode in ["critic", "both"]:
-            self.fsdp_critic.eval()
+        """Validation step for either actor or critic."""
+        if self.train_mode == "actor":
+            # Use parent's validation_step for actor
+            return super().validation_step(batch)
+        else:
+            # Critic validation
+            self.fsdp_model.eval()
             with torch.no_grad():
                 critic_loss = self._compute_critic_loss(batch)
-            metrics["val/critic_loss"] = critic_loss.item()
-
-        return metrics
+            return critic_loss

@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Optional
 
 import torch
+import numpy as np
 from pydantic import BaseModel, ConfigDict, model_validator
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin
 
@@ -95,6 +96,7 @@ class AsyncRolloutRequest(BaseModel):
     tools_kwargs: dict[str, Any] = {}
     interaction_kwargs: dict[str, Any] = {}
     input_ids: Optional[torch.Tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
     prompt_ids: Optional[torch.Tensor] = None
     response_ids: Optional[torch.Tensor] = None
     attention_mask: Optional[torch.Tensor] = None
@@ -372,6 +374,40 @@ class AsyncRolloutRequest(BaseModel):
             return generation_prompt_ids.squeeze(0).tolist()
         else:
             return self.input_ids.squeeze(0).tolist()
+
+    def get_generation_prompt_embeds(self) -> Optional[list[list[float]]]:
+        """
+        Return the prompt embeddings formatted for engine consumption.
+
+        We currently only support providing embeddings when inference chat templates
+        are disabled. If templates are enabled, token ids regenerate dynamically
+        and the stored embeddings may no longer align, so we fall back to ids.
+        """
+        if self.input_embeds is None:
+            return None
+
+        if self.use_inference_chat_template:
+            logger.warning(
+                "input_embeds are provided but use_inference_chat_template is enabled; "
+                "falling back to input_ids."
+            )
+            return None
+
+        embeds = self.input_embeds
+        if isinstance(embeds, torch.Tensor):
+            if embeds.dim() == 3:
+                if embeds.shape[0] != 1:
+                    raise ValueError(
+                        f"Expect input_embeds batch dim 1, got shape {embeds.shape}"
+                    )
+                embeds = embeds.squeeze(0)
+            return embeds.detach().cpu().tolist()
+        if isinstance(embeds, np.ndarray):
+            return embeds.tolist()
+        if isinstance(embeds, list):
+            return embeds
+
+        raise TypeError(f"Unsupported input_embeds type: {type(embeds)}")
 
     def add_user_message(
         self,

@@ -814,6 +814,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         prompt: Optional[str] = None,
         sampling_params: Optional[dict[str, Any]] = None,
         input_ids: Optional[list[int]] = None,
+        input_embeds: Optional[list[Any]] = None,
         image_data: Optional[Any] = None,
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
@@ -822,7 +823,13 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         lora_path: Optional[str] = None,
         custom_logit_processor: Optional[Callable] = None,
     ) -> dict[str, Any]:
-        """Generate text using the SGLang server asynchronously."""
+        """Generate text using the SGLang server asynchronously.
+
+        `input_embeds` mirrors the in-process engine contract: when provided, the
+        request bypasses SGLang's embedding lookup and feeds the payload directly
+        into the model. This requires the underlying server build to recognise the
+        field, matching recent SGLang input plumbing.
+        """
         logger.info("generate() started")
 
         payload = {
@@ -830,6 +837,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             "sampling_params": sampling_params,
             "input_ids": input_ids,
             "image_data": image_data,
+            "input_embeds": input_embeds,
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
@@ -851,6 +859,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         prompt: Optional[str] = None,
         sampling_params: Optional[dict[str, Any]] = None,
         input_ids: Optional[list[int]] = None,
+        input_embeds: Optional[list[Any]] = None,
         image_data: Optional[Any] = None,
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
@@ -897,6 +906,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             sampling_params=sampling_params,
             input_ids=input_ids,
             image_data=image_data,
+            input_embeds=input_embeds,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,

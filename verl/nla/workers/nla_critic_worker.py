@@ -74,7 +74,7 @@ class NLACriticWorker(CriticWorker):
             print(f"Loaded NLA critic model with vector value head (hidden_size={self.critic_module.hidden_size})")
 
         # Set up FSDP if needed
-        from verl.utils.model import get_init_weight_context_manager
+        from verl.utils.fsdp_utils import get_init_weight_context_manager
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
         from verl.utils.fs import copy_local_path_from_hdfs
 

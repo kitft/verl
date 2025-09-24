@@ -1,20 +1,23 @@
 """NLA Critic Model using base model + vector value head."""
 
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Union
 from transformers import AutoModelForCausalLM
-from dataclasses import dataclass
 from transformers.modeling_outputs import ModelOutput
+
 
 @dataclass
 class CausalLMOutputWithValue(ModelOutput):
     """Output type for models that output both logits and value predictions."""
+
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     value: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
 
 
 class NLAVectorValueHead(nn.Module):
@@ -24,7 +27,7 @@ class NLAVectorValueHead(nn.Module):
     The output is the same dimension as the hidden states (residual stream).
     """
 
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
         super().__init__()
         self.hidden_size = hidden_size
         # No projection needed - we output hidden_size dimensional vectors
@@ -50,48 +53,34 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
     Compatible with VERL's critic infrastructure.
     """
 
-    def __init__(
-        self,
-        pretrained_model_name_or_path: str,
-        dropout: float = 0.1,
-        **model_kwargs
-    ):
+    def __init__(self, pretrained_model_name_or_path: str, dropout: float = 0.1, **model_kwargs):
         super().__init__()
 
         # Load the base model (same as actor)
-        self.pretrained_model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path,
-            **model_kwargs
-        )
+        self.pretrained_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
 
         # Get hidden size from model config
         self.config = self.pretrained_model.config
         self.hidden_size = self.config.hidden_size
 
-        # Add the vector value head that outputs hidden_size dimensional vectors
-        self.v_head = NLAVectorValueHead(
-            hidden_size=self.hidden_size,
-            dropout=dropout
-        )
-
-        # Initialize value head with small random weights
-        nn.init.normal_(self.v_head.linear.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.v_head.linear.bias)
+        # No value head - we directly use the hidden states as activation vectors
+        # This simplifies FSDP wrapping since we don't have extra modules
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **kwargs
-    ) -> Union[Tuple, CausalLMOutputWithValue]:
+        **kwargs,
+    ) -> tuple | CausalLMOutputWithValue:
         """
         Forward pass compatible with VERL's critic interface.
 
@@ -115,7 +104,7 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=True,  # We need hidden states for the value head
             return_dict=True,
-            **kwargs
+            **kwargs,
         )
 
         # Get the last hidden states from the final layer
@@ -131,12 +120,14 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             # If no mask, just take the last position
             last_hidden = hidden_states[:, -1, :]  # (batch, hidden_size)
 
-        # Apply value head to get the activation vector (hidden_size dimensional)
-        activation_vector = self.v_head(last_hidden)  # (batch, hidden_size)
+        # Directly use the last hidden state as activation vector (with optional dropout)
+        activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
 
         # For compatibility, expand back to sequence dimension with zeros except last position
         batch_size, seq_len = hidden_states.shape[:2]
-        values = torch.zeros(batch_size, seq_len, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        values = torch.zeros(
+            batch_size, seq_len, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype
+        )
         if attention_mask is not None:
             values[torch.arange(batch_size), seq_lengths] = activation_vector
         else:
@@ -152,7 +143,7 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             logits=outputs.logits,
             value=values,
             hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions
+            attentions=outputs.attentions,
         )
 
     @classmethod
@@ -165,7 +156,4 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             pretrained_model_name_or_path: Model name or path
             **kwargs: Additional arguments for model loading
         """
-        return cls(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            **kwargs
-        )
+        return cls(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)

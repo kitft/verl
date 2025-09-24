@@ -31,7 +31,7 @@ data:
     activation_vector_key: "activation_vector"
     max_prompt_length: 128
     max_response_length: 128
-    mode: "both"  # Train both actor and critic
+    mode: "actor"  # Train actor or critic
     # activation_dim determined dynamically from model's hidden_size
     injection_token: null  # Auto-detect
     injection_position: "manual"  # Already in prompts
@@ -43,7 +43,7 @@ data:
     activation_vector_key: "activation_vector"
     max_prompt_length: 128
     max_response_length: 128
-    mode: "both"
+    mode: "actor"
     # activation_dim determined dynamically from model's hidden_size
     injection_token: null
     injection_position: "manual"

@@ -146,10 +146,11 @@ class MSERewardComputer:
             DataProto with rewards added
         """
         # Extract target activations
-        if hasattr(data, "metadata") and "activation_vectors" in data.metadata:
-            target_activations = data.metadata["activation_vectors"]
-        elif "activation_vectors" in data.data:
-            target_activations = data.data["activation_vectors"]
+        meta_info = getattr(data, "meta_info", None)
+        if meta_info and "activation_vectors" in meta_info:
+            target_activations = meta_info["activation_vectors"]
+        elif "activation_vectors" in data.batch.keys():
+            target_activations = data.batch["activation_vectors"]
         else:
             raise ValueError("No activation vectors found in DataProto")
 
@@ -161,8 +162,10 @@ class MSERewardComputer:
         )
 
         # Add rewards to DataProto
-        data.data["rewards"] = reward_dict["rewards"]
-        data.data["mse_loss"] = reward_dict["mse"]
+        data.batch.update({
+            "rewards": reward_dict["rewards"],
+            "mse_loss": reward_dict["mse"],
+        })
 
         return data
 

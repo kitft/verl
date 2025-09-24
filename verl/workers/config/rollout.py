@@ -174,3 +174,5 @@ class RolloutConfig(BaseConfig):
     limit_images: Optional[int] = None
 
     skip_tokenizer_init: bool = False
+
+    disable_radix_cache: bool = False

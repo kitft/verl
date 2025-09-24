@@ -29,7 +29,7 @@ data:
     max_length: 512  # Reduced for testing
     truncation: "right"
     use_shm: false
-    mode: "both"  # "actor", "critic", or "both"
+    mode: "actor"  # "actor" or "critic"
     # activation_dim determined dynamically from model's hidden_size
     injection_token: "<INJECT>"
 
@@ -40,7 +40,7 @@ data:
     max_length: 512  # Reduced for testing
     truncation: "right"
     use_shm: false
-    mode: "both"
+    mode: "actor"  # "actor" or "critic"
     # activation_dim determined dynamically from model's hidden_size
     injection_token: "<INJECT>"
 
@@ -73,7 +73,7 @@ trainer:
   logging_steps: 1  # Log every step for testing
 
   # Mode settings
-  train_mode: "both"  # "actor", "critic", or "both"
+  train_mode: "actor"  # "actor" or "critic"
   critic_epochs: 1  # Epochs per critic training step
 
   # Checkpoint settings

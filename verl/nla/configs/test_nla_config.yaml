@@ -35,14 +35,14 @@ dataset:
     activation_dim: 8  # Match the model's hidden_size
     injection_token: "<INJECT>"
     max_length: 512
-    mode: "both"  # Train both actor and critic
+    mode: "actor"  # Train actor or critic
 
   eval:
     parquet_files: ["test_nla_dataset_tiny.parquet"]
     activation_dim: 8  # Match the model's hidden_size
     injection_token: "<INJECT>"
     max_length: 512
-    mode: "both"
+    mode: "actor"
 
 training:
   # Actor training params

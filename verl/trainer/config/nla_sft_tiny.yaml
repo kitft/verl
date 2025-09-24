@@ -78,7 +78,7 @@ engine:
 # NLA-specific configuration
 nla:
   # activation_dim now determined dynamically from model's hidden_size
-  train_mode: both  # "actor", "critic", or "both"
+  train_mode: actor  # "actor" or "critic"
 
   # Injection configuration for actor
   injection:
@@ -89,7 +89,7 @@ nla:
 
   # Critic model configuration
   critic:
-    model_path: yujiepan/gemma-2-tiny-random
+    model_path: google/gemma-2-2b-it  # Should be same as actor model
     pooling: last
     dropout: 0.1
     projection_layers: 2
