@@ -912,7 +912,7 @@ class SGLangRollout(BaseRollout):
         if has_input_embeds and not all(embed is not None for embed in input_embeds_list):
             raise ValueError("input_embeds must be provided for all samples when supplied.")
 
-        engine_input_ids = None if has_input_embeds else idx_list
+        engine_input_ids = idx_list
         engine_input_embeds = input_embeds_list if has_input_embeds else None
 
         do_sample = prompts.meta_info.get("do_sample", True)
@@ -1296,10 +1296,8 @@ class SGLangRollout(BaseRollout):
         kwargs["n"] = 1  # group size is supported in preprocess
         return_logprob = kwargs.pop("logprobs", False)
 
-        input_ids_arg = generation_prompt_ids if generation_prompt_embeds is None else None
-        input_embeds_arg = None
-        if generation_prompt_embeds is not None:
-            input_embeds_arg = [generation_prompt_embeds]
+        input_ids_arg = generation_prompt_ids
+        input_embeds_arg = [generation_prompt_embeds] if generation_prompt_embeds is not None else None
 
         output = await self._engine.async_generate(
             input_ids=input_ids_arg,
