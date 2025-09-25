@@ -103,10 +103,10 @@ nla:
 data:
   # Use test datasets
   train_files:
-    - data/testing/test_nla_dataset_tiny.parquet
+    - data/generated/my_corpus_activations_layer26.parquet
 
   val_files:
-    - data/testing/test_nla_dataset.parquet
+    - data/generated/my_corpus_activations_layer26.parquet
 
   # Very small batches for testing
   train_batch_size: 2
