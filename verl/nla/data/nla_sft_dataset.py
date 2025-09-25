@@ -160,7 +160,6 @@ class NLASFTDataset(SFTDataset):
 
         metadata_keys = [
             "sample_uuid",
-            "source",
             "formatted_source",
             "tokenized_source",
             "forward_pass_text",
@@ -181,6 +180,9 @@ class NLASFTDataset(SFTDataset):
                 if isinstance(value, np.ndarray):
                     value = value.tolist()
                 extra_info[key] = value
+
+        # Drop raw source string (actor/critic code should rely on formatted/tokenized views).
+        sample.pop("source", None)
 
         extra_info["response"] = self.responses[idx]
         sample["extra_info"] = extra_info

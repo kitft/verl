@@ -39,7 +39,9 @@ prompt:
   chat_template: null
   messages:
     - role: user
-      template: "Explain the following text {injection_token}\n\n{source}"
+      template: |
+        Explain the following text {injection_token}
+
 
 response:
   template: "{source}"

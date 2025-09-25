@@ -172,7 +172,6 @@ class NLARLDataset(RLHFDataset):
 
         metadata_keys = [
             "sample_uuid",
-            "source",
             "formatted_source",
             "tokenized_source",
             "forward_pass_text",
@@ -190,7 +189,12 @@ class NLARLDataset(RLHFDataset):
         for key in metadata_keys:
             value = sample.pop(key, None)
             if value is not None:
+                if isinstance(value, np.ndarray):
+                    value = value.tolist()
                 extra_info[key] = value
+
+        # Drop raw source string to avoid leaking original corpus text through the loader.
+        sample.pop("source", None)
 
         if response_text is not None:
             extra_info["response"] = response_text
