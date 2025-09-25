@@ -43,7 +43,7 @@ actor_rollout_ref:
 
   # Actor FSDP configuration
   actor:
-    strategy: fsdp
+    strategy: fsdp2
     ppo_micro_batch_size_per_gpu: 2  # Required for actor training
     fsdp_config:
       model_dtype: bf16  # TODO: Flash Attention warning about dtype - may need to address later
@@ -67,7 +67,7 @@ actor_rollout_ref:
 # Tiny model critic settings
 critic:
   enable: true  # Explicitly enable critic for NLA GRPO
-  strategy: fsdp
+  strategy: fsdp2
   model:
     path: google/gemma-2-2b-it
     fsdp_config:
