@@ -10,7 +10,7 @@ import torch
 import ray
 import hydra
 from pathlib import Path
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig
 from omegaconf import OmegaConf, DictConfig
 
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
@@ -72,6 +72,20 @@ class NLATaskRunner:
             tokenizer.chat_template = "{{ messages[-1]['content'] }}"
             print("   Set simple chat template for tokenizer")
 
+        # Ensure activation dimension matches model hidden size
+        if not config.nla.get("activation_dim"):
+            model_config = AutoConfig.from_pretrained(
+                model_path,
+                trust_remote_code=config.actor_rollout_ref.model.get("trust_remote_code", False),
+            )
+            hidden_size = getattr(model_config, "hidden_size", None)
+            if hidden_size is None:
+                raise ValueError(
+                    "Could not infer hidden_size from model config; please set nla.activation_dim explicitly"
+                )
+            config.nla.activation_dim = hidden_size
+            print(f"   Set activation_dim from model hidden size: {hidden_size}")
+
         # Create NLA datasets
         print("\n4. Creating NLA datasets")
         train_dataset = create_nla_rl_dataset(
@@ -132,21 +146,19 @@ class NLATaskRunner:
         print("\n5. Creating NLA GRPO trainer")
         trainer = NLAGRPOTrainer(
             config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
             grpo_config=grpo_config,
+            ray_worker_group_cls=ray_worker_group_cls,
+            processor=None,
+            reward_fn=dummy_reward_fn,
+            val_reward_fn=dummy_reward_fn,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
         )
-
-        # Manually set the required attributes that would normally be passed to parent __init__
-        trainer.tokenizer = tokenizer
-        trainer.processor = None  # No processor for text-only model
-        trainer.role_worker_mapping = self.role_worker_mapping
-        trainer.resource_pool_manager = resource_pool_manager
-        trainer.ray_worker_group_cls = ray_worker_group_cls
-        trainer.reward_fn = dummy_reward_fn
-        trainer.val_reward_fn = dummy_reward_fn
-        trainer.train_dataset = train_dataset
-        trainer.val_dataset = val_dataset
-        trainer.collate_fn = collate_fn
-        trainer.train_sampler = train_sampler
 
         # Initialize workers
         print("\n6. Initializing workers")

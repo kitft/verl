@@ -46,32 +46,36 @@ class NLASGLangRollout(SGLangRollout):
                 print("NLA SGLang: Converting input_embeds to CPU for network transmission")
                 prompts.batch['input_embeds'] = input_embeds.cpu()
 
-        # Fallback: If embeddings weren't prepared but we have activation vectors
-        elif hasattr(prompts, 'meta_info') and prompts.meta_info:
-            activation_vectors = prompts.meta_info.get('activation_vectors')
-            injection_positions = prompts.meta_info.get('injection_positions')
+        # Prepare embeddings from activation vectors attached to the batch
+        elif 'activation_vectors' in prompts.batch:
+            activation_vectors = prompts.batch['activation_vectors']
+            injection_positions = None
+            if hasattr(prompts, 'meta_info') and prompts.meta_info:
+                injection_positions = prompts.meta_info.get('injection_positions')
 
-            if activation_vectors is not None and injection_positions is not None:
-                print(f"NLA SGLang: Fallback - preparing embeddings from activation vectors")
-                print(f"NLA SGLang: Activation vectors shape: {activation_vectors.shape}")
-                print(f"NLA SGLang: Injection positions: {injection_positions}")
+            if injection_positions is None:
+                raise ValueError("Injection positions missing while activation vectors are provided")
 
-                # Get input token IDs
-                input_ids = prompts.batch["input_ids"]
+            print("NLA SGLang: Preparing embeddings from batch activation vectors")
+            print(f"NLA SGLang: Activation vectors shape: {activation_vectors.shape}")
+            print(f"NLA SGLang: Injection positions: {injection_positions}")
 
-                # Prepare input embeddings with activation injection
-                input_embeds = self._prepare_input_embeddings(
-                    input_ids, activation_vectors, injection_positions
-                )
+            input_ids = prompts.batch["input_ids"]
+            input_embeds = self._prepare_input_embeddings(
+                input_ids, activation_vectors, injection_positions
+            )
 
-                # Convert to CPU for network transmission
-                if input_embeds.is_cuda:
-                    print("NLA SGLang: Converting input_embeds to CPU for network transmission")
-                    input_embeds = input_embeds.cpu()
+            if input_embeds.is_cuda:
+                print("NLA SGLang: Converting input_embeds to CPU for network transmission")
+                input_embeds = input_embeds.cpu()
 
-                # Store in batch for SGLang
-                prompts.batch['input_embeds'] = input_embeds
-                print(f"NLA SGLang: Prepared input_embeds with shape: {input_embeds.shape}")
+            prompts.batch['input_embeds'] = input_embeds
+            print(f"NLA SGLang: Prepared input_embeds with shape: {input_embeds.shape}")
+
+        elif hasattr(prompts, 'meta_info') and prompts.meta_info and prompts.meta_info.get('activation_vectors') is not None:
+            raise ValueError(
+                "Activation vectors present in meta_info; expected them under batch['activation_vectors']"
+            )
 
         # Call parent's generate_sequences
         # SGLang will now use input_embeds if present in the batch
@@ -119,6 +123,8 @@ class NLASGLangRollout(SGLangRollout):
         except AttributeError as e:
             print(f"WARNING: Could not access SGLang embedding layer: {e}")
             print("Using a fallback embedding layer - results may be suboptimal")
+            log.error(f"Could not access SGLang embedding layer: {e}")
+            log.error(f"FIX THIS LATER")
             vocab_size = self.model_config.hf_config.vocab_size
             embed_layer = torch.nn.Embedding(vocab_size, self.hidden_dim)
 
@@ -128,6 +134,7 @@ class NLASGLangRollout(SGLangRollout):
 
         # Project activation vectors if needed
         if activation_vectors.shape[-1] != self.hidden_dim:
+            raise ValueError(f"Activation vectors dimension {activation_vectors.shape[-1]} does not match hidden dimension {self.hidden_dim}")
             print(f"Projecting activation vectors from {activation_vectors.shape[-1]} to {self.hidden_dim}")
             # Simple linear projection - could be improved with a learned projection
             projection = torch.nn.Linear(activation_vectors.shape[-1], self.hidden_dim, bias=False)

@@ -663,9 +663,13 @@ class SGLangRollout(BaseRollout):
                 logger.info("DISABLING RADIX CACHE")
                 print("DISABLING RADIX CACHE")
 
+            # Apply any remaining engine kwargs
+            args.update(engine_kwargs)
+
             logger.info(f"args: {args}")
 
             if is_server_mode:
+                logger.info("is_server_mode")
                 # add server specific args
                 args["first_rank_in_node"] = first_rank_in_node
                 args["timeout"] = self.config.server["timeout"]
@@ -675,7 +679,9 @@ class SGLangRollout(BaseRollout):
                 args["max_start_wait_time"] = self.config.server["max_start_wait_time"]
                 self._engine = AsyncHttpServerAdapter(**args)
             else:
+                logger.info("not is_server_mode")
                 self._engine = AsyncEngine(**args)
+
         else:
             self._engine = None
 
@@ -1746,12 +1752,20 @@ class SGLangRollout(BaseRollout):
         Args:
             tag: weights or kv_cache.
         """
-        if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+        if (
+            self._engine is not None
+            and self.device_mesh["infer_tp"].get_local_rank() == 0
+            and self.config.free_cache_engine
+        ):
             await self._engine.resume_memory_occupation(tags=tags)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
-        if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+        if (
+            self._engine is not None
+            and self.device_mesh["infer_tp"].get_local_rank() == 0
+            and self.config.free_cache_engine
+        ):
             await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
@@ -1767,6 +1781,9 @@ class SGLangRollout(BaseRollout):
             - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
         """
+        if self._engine is None:
+            return
+
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
         for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
             await sgl_update_weights(

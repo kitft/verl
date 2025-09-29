@@ -137,9 +137,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     if use_critic:
         values = batch.batch["values"]
-        valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        if values.ndim > 2:
+            # Vector-valued critic: gather the last valid token for each sequence.
+            seq_lengths = response_mask.long().sum(dim=1)
+            gather_idx = seq_lengths.clamp(min=1) - 1
+            batch_idx = torch.arange(values.size(0), device=values.device)
+            values_last = values[batch_idx, gather_idx]
+            sample_mask = seq_lengths > 0
+            if sample_mask.any():
+                expanded_mask = sample_mask.unsqueeze(-1).expand_as(values_last)
+                valid_values = torch.masked_select(values_last, expanded_mask)
+            else:
+                valid_values = torch.tensor([], device=values.device)
+            return_diff_var = torch.tensor(float("nan"), device=values.device)
+            return_var = torch.tensor(float("nan"), device=values.device)
+        else:
+            valid_values = torch.masked_select(values, response_mask)
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -175,12 +190,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/returns/min": torch.min(valid_returns).detach().item(),
         **(
             {
-                # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
-                # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/values/mean": torch.mean(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
+                "critic/values/max": torch.max(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
+                "critic/values/min": torch.min(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
+                if torch.isfinite(return_diff_var) and torch.isfinite(return_var)
+                else float("nan"),
             }
             if use_critic
             else {}

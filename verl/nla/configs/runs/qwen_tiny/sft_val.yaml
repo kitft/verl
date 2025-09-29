@@ -1,43 +1,47 @@
+# @package _global_
+
 defaults:
+  - /nla_activation_dataset
   - _self_
 
-mode: rl  # "rl" or "sft"
+mode: sft
+
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct
+  trust_remote_code: true
+  layer_index: 10
+
+seed: 43
 
 dataset:
-  name: null
+  name: NeelNanda/pile-10k
   config_name: null
   split: train
   input_parquet: null
   max_samples: null
   chat_column: null
-  text_column: null
+  text_column: text
   user_role: user
   system_prompt: null
-  add_generation_prompt: true
+  add_generation_prompt: false
   expect_chat: false
-  slice_start: null
-  slice_length: null
-
-model:
-  name: Qwen/Qwen2.5-0.5B-Instruct #google/gemma-3-1b-it #google/gemma-2-2b-it
-  trust_remote_code: true
-  layer_index: 10
-  use_fp16: false
+  slice_start: 1000
+  slice_length: 100
 
 sampling:
-  total_activations: 256
+  total_activations: 100
   activations_per_sample: 1
-  max_length: 1024
+  max_length: 512
 
 output:
-  path_prefix: data/generated/activation_dataset.parquet
-  overwrite: false
+  path_prefix: data/testing/sft/val_nla_sft_dataset
+  overwrite: true
   include_layer_suffix: true
   injection_token: null
   random_variant:
     enabled: false
     path: null
-    suffix: "_random"
+    suffix: _random
     seed: null
     columns: null
     source_field: sample_uuid
@@ -45,15 +49,12 @@ output:
 
 prompt:
   default_role: user
-  add_generation_prompt: true
+  add_generation_prompt: false
   chat_template: null
   messages:
     - role: user
       template: |
         Explain the following text {injection_token}
 
-
 response:
-  template: "{source}"
-
-seed: 42
+  template: "{processed_response}"

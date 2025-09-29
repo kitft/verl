@@ -451,3 +451,7 @@ output = wrapped_model.generate(
 - [ ] Hierarchical activation structures
 - [ ] Online critic updates during generation
 - [ ] Curriculum learning for injection difficulty
+
+## SGLang attention_chunk_size
+
+When using SGLang with `input_embeds`, make sure `engine_kwargs.sglang.attention_chunk_size` is explicitly defined (for example `0` to disable SWA) so that SGLang's sliding window eviction logic does not encounter `None`. The NLA GRPO tiny config sets this explicitly; mirror that in your own rollouts if you see `TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'` coming from `chunk_cache.evict_swa`.

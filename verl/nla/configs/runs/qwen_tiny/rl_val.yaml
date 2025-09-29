@@ -1,0 +1,45 @@
+defaults:
+  - /nla_activation_dataset
+  - _self_
+
+mode: rl
+
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct
+  trust_remote_code: true
+
+seed: 43
+
+dataset:
+  name: NeelNanda/pile-10k
+  config_name: null
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: text
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: false
+  expect_chat: false
+  slice_start: 1000
+  slice_length: 100
+
+sampling:
+  total_activations: 100
+  activations_per_sample: 1
+  max_length: 1024
+
+output:
+  path_prefix: data/generated/rl_val_pile10k_qwen
+  overwrite: true
+  include_layer_suffix: true
+  injection_token: null
+  random_variant:
+    enabled: false
+    path: null
+    suffix: _random
+    seed: null
+    columns: null
+    source_field: sample_uuid
+    source_column: activation_vector_source_uuid

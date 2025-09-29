@@ -133,16 +133,13 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
     def _extract_activation_vectors(self, data: DataProto):
         activation_vectors = None
-        if data.meta_info:
-            activation_vectors = data.meta_info.get('activation_vectors')
+        if data.batch is not None:
+            batch_keys = getattr(data.batch, 'keys', lambda: [])()
+            if 'activation_vectors' in batch_keys:
+                activation_vectors = data.batch['activation_vectors']
 
-        if activation_vectors is None and data.batch is not None:
-            try:
-                activation_vectors = data.batch.get('activation_vectors', None)
-            except AttributeError:
-                batch_keys = getattr(data.batch, 'keys', lambda: [])()
-                if 'activation_vectors' in batch_keys:
-                    activation_vectors = data.batch['activation_vectors']
+        if activation_vectors is None and data.meta_info and data.meta_info.get('activation_vectors') is not None:
+            raise ValueError("Activation vectors must be provided via batch['activation_vectors']")
 
         return activation_vectors
 

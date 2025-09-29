@@ -172,11 +172,14 @@ class SFTDataset(Dataset):
         position_ids = compute_position_id_with_mask(attention_mask)
 
         loss_mask = attention_mask.clone()
-        if prompt_length > 1:
-            # mask out prompt for SFT.
-            loss_mask[: min(prompt_length, loss_mask.size(0)) - 1] = 0
+        prompt_end = min(prompt_length, loss_mask.size(0))
+        if prompt_end > 0:
+            # Mask the entire prompt so user tokens (including injection markers) never incur loss
+            loss_mask[:prompt_end] = 0
         # mask out the last token in response
-        loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
+        response_last_idx = min(prompt_length + response_length, loss_mask.size(0)) - 1
+        if response_last_idx >= 0:
+            loss_mask[response_last_idx] = 0
 
         return {
             "input_ids": input_ids,

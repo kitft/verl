@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any, List, Tuple, Union
 from dataclasses import dataclass
+from torch.utils.hooks import RemovableHandle
 from verl.nla.utils.injection_manager import InjectionTokenManager
 
 # Try to import GenerationMixin for proper generation support
@@ -89,11 +90,10 @@ class NLAModelWrapper(BaseWrapper):
         else:
             self.activation_proj = None
 
-        # Register hooks for multi-layer injection
+        # Register hooks for injection
         self._register_injection_hooks()
 
-        # Temporary storage for activation vectors during injection
-        # Only used within methods, not for state management
+        # Temporary storage for activation vectors/positions during a forward
         self._current_activations = None
         self._injection_positions = None
 
@@ -115,34 +115,30 @@ class NLAModelWrapper(BaseWrapper):
 
         raise ValueError("Could not infer hidden dimension from base model")
 
-    def _register_injection_hooks(self):
-        """Register forward hooks for multi-layer injection."""
-        self._hooks = []
+    def _register_injection_hooks(self) -> None:
+        """Register forward hooks for injection layers."""
+        self._hook_handles: list[torch.utils.hooks.RemovableHandle] = []
 
-        if len(self.injection_config.layer_indices) > 1 or 0 not in self.injection_config.layer_indices:
-            # Need hooks for layers beyond embedding
-            for layer_idx in self.injection_config.layer_indices:
-                if layer_idx > 0:
-                    hook = self._create_injection_hook(layer_idx)
-                    # Register hook on appropriate layer
-                    # This will vary by model architecture
-                    self._hooks.append(hook)
+        extra_layers = [idx for idx in self.injection_config.layer_indices if idx != 0]
+        if extra_layers:
+            raise NotImplementedError(
+                "Injection for layers beyond embeddings is not yet implemented under FSDP."
+            )
 
-    def _create_injection_hook(self, layer_idx: int):
-        """Create a hook function for a specific layer."""
-        def hook(module, input, output):
-            if self._current_activations is not None and self._injection_positions is not None:
-                # Perform injection at this layer
-                output = self._inject_at_layer(output, layer_idx)
+        if 0 in self.injection_config.layer_indices:
+            embedding_layer = self.base_model.get_input_embeddings()
+            if embedding_layer is None:
+                raise ValueError("Base model does not expose an input embedding layer.")
+            handle = embedding_layer.register_forward_hook(self._embedding_forward_hook)
+            self._hook_handles.append(handle)
+
+    def _embedding_forward_hook(self, module, inputs, output):
+        if self._current_activations is None or self._injection_positions is None:
             return output
-        return hook
+        return self._inject_hidden_states(output)
 
-    def _inject_at_layer(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int
-    ) -> torch.Tensor:
-        """Inject activation vectors at a specific layer."""
+    def _inject_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply activation injections in-place on hidden states."""
         batch_size = hidden_states.shape[0]
 
         for batch_idx in range(batch_size):
@@ -153,20 +149,19 @@ class NLAModelWrapper(BaseWrapper):
             if positions is None or positions.numel() == 0:
                 continue
 
-            # positions is now a tensor
-            for pos in positions.tolist():  # Convert to list for iteration
-                if batch_idx < self._current_activations.shape[0]:
-                    activation = self._current_activations[batch_idx]
+            for pos in positions.tolist():
+                if batch_idx >= self._current_activations.shape[0]:
+                    continue
 
-                    # Apply projection if configured
-                    if self.activation_proj is not None:
-                        activation = self.activation_proj(activation)
+                activation = self._current_activations[batch_idx]
+                if self.activation_proj is not None:
+                    activation = self.activation_proj(activation)
+                activation = activation.to(hidden_states.dtype)
 
-                    # Perform injection based on mode
-                    if self.injection_config.mode == "replace":
-                        hidden_states[batch_idx, pos] = activation
-                    elif self.injection_config.mode == "add":
-                        hidden_states[batch_idx, pos] = hidden_states[batch_idx, pos] + activation
+                if self.injection_config.mode == "replace":
+                    hidden_states[batch_idx, pos] = activation
+                elif self.injection_config.mode == "add":
+                    hidden_states[batch_idx, pos] = hidden_states[batch_idx, pos] + activation
 
         return hidden_states
 
@@ -218,52 +213,32 @@ class NLAModelWrapper(BaseWrapper):
         # (when past_key_values is None) or during a normal forward pass
         should_inject = activation_vectors is not None and past_key_values is None
 
-        # Find injection positions if needed
-        injection_positions = None
-        if should_inject and input_ids is not None:
+        if should_inject:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided for activation injection.")
             injection_positions = self._find_injection_positions(input_ids)
+            self._set_injection_state(activation_vectors, injection_positions, input_ids.device)
 
-        # Handle injection at embedding layer
-        if should_inject and 0 in self.injection_config.layer_indices and input_ids is not None and injection_positions:
-            # Get input embeddings
-            if hasattr(self.base_model, "get_input_embeddings"):
-                embed_layer = self.base_model.get_input_embeddings()
-                inputs_embeds = embed_layer(input_ids)
-
-                # Temporarily store state for _inject_at_layer
-                self._current_activations = activation_vectors
-                self._injection_positions = injection_positions
-
-                # Inject at embedding layer
-                inputs_embeds = self._inject_at_layer(inputs_embeds, 0)
-
-                # Clear temporary state
-                self._current_activations = None
-                self._injection_positions = None
-
-                # Forward with embeddings instead of input_ids
-                return self.base_model(
+        try:
+            if inputs_embeds is not None:
+                result = self.base_model(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     **kwargs
                 )
+            else:
+                result = self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    **kwargs
+                )
+        finally:
+            if should_inject:
+                self._clear_injection_state()
 
-        # Standard forward pass
-        if inputs_embeds is not None:
-            return self.base_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                **kwargs
-            )
-        else:
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                **kwargs
-            )
+        return result
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         """Prepare inputs for generation - delegate to base model."""
@@ -310,3 +285,25 @@ class NLAModelWrapper(BaseWrapper):
             activation_vectors=activation_vectors,
             **kwargs
         )
+
+    def _set_injection_state(
+        self,
+        activation_vectors: torch.Tensor,
+        positions: List[Optional[torch.Tensor]],
+        device: torch.device,
+    ) -> None:
+        if activation_vectors.dim() == 1:
+            activation_vectors = activation_vectors.unsqueeze(0)
+        self._current_activations = activation_vectors.to(device)
+
+        processed_positions: List[Optional[torch.Tensor]] = []
+        for pos in positions:
+            if pos is None:
+                processed_positions.append(None)
+            else:
+                processed_positions.append(pos.to(device))
+        self._injection_positions = processed_positions
+
+    def _clear_injection_state(self) -> None:
+        self._current_activations = None
+        self._injection_positions = None

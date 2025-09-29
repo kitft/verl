@@ -19,16 +19,19 @@ class NLADataProtoAdapter:
     ) -> DataProto:
         """Add activation vectors to a DataProto object."""
         meta_info = data_proto.meta_info if data_proto.meta_info is not None else {}
+        batch = data_proto.batch
+
         # Ensure we do not mutate other references in-place
         if meta_info is data_proto.meta_info:
             meta_info = dict(meta_info)
 
-        meta_info["activation_vectors"] = activation_vectors
-
+        meta_info["has_nla"] = True
         if injection_positions is not None:
             meta_info["injection_positions"] = injection_positions
 
-        meta_info["has_nla"] = True
+        if batch is None:
+            raise ValueError("DataProto batch must exist to attach activation vectors")
+        batch["activation_vectors"] = activation_vectors
         data_proto.meta_info = meta_info
 
         return data_proto
@@ -37,9 +40,10 @@ class NLADataProtoAdapter:
         self, data_proto: DataProto
     ) -> Optional[torch.Tensor]:
         """Extract activation vectors from a DataProto object."""
-        meta_info = getattr(data_proto, "meta_info", None)
-        if meta_info:
-            return meta_info.get("activation_vectors")
+        batch = getattr(data_proto, "batch", None)
+        if batch is not None and "activation_vectors" in batch.keys():
+            return batch["activation_vectors"]
+
         return None
 
     def extract_injection_positions_from_dataproto(

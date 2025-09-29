@@ -1,5 +1,7 @@
 """NLA FSDP SFT Trainer that extends the base FSDP trainer with NLA-specific functionality."""
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
@@ -9,7 +11,16 @@ from transformers import AutoModelForCausalLM
 
 from verl.nla.models.nla_critic_model import AutoModelForCausalLMWithVectorValueHead
 from verl.nla.models.nla_wrapper import InjectionConfig, NLAModelWrapper
-from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
+from verl.trainer.fsdp_sft_trainer import (
+    FSDPSFTTrainer,
+    gather_outputs_and_unpad,
+    get_ulysses_sequence_parallel_world_size,
+    index_first_axis,
+    pad_input,
+    rearrange,
+    ulysses_pad_and_slice_inputs,
+    unpad_input,
+)
 from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
@@ -311,19 +322,106 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         )
 
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Override to handle activation injection for actor training.
+        """Compute loss with activation injection for actor training."""
+        if self.train_mode != "actor":
+            return super()._compute_loss_and_backward(batch, do_backward, n_micro_batches)
 
-        Only used in actor mode - adds activation vectors to batch for NLA wrapper.
-        """
-        # Extract activation vectors if present
-        activation_vectors = batch.get("activation_vectors", None)
+        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
-        if self.train_mode == "actor" and activation_vectors is not None:
-            # Add activation vectors to the batch for NLA wrapper
-            batch["activation_vectors"] = activation_vectors.to(self.device_name)
+        activation_vectors = batch.get("activation_vectors")
+        if activation_vectors is not None:
+            activation_vectors = activation_vectors.to(self.device_name)
 
-        # Call parent's compute loss
-        return super()._compute_loss_and_backward(batch, do_backward, n_micro_batches)
+        if activation_vectors is not None and use_sp:
+            raise NotImplementedError(
+                "Activation injection is not implemented when use_remove_padding/sequence parallelism is enabled."
+            )
+
+        input_ids = batch["input_ids"].to(self.device_name)
+        attention_mask = batch["attention_mask"].to(self.device_name)
+        position_ids = batch["position_ids"].to(self.device_name)
+        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+        context = self.sharding_manager if use_sp else nullcontext()
+        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            if not use_sp:
+                labels = input_ids[:, 1:].contiguous()
+                output = self.fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    activation_vectors=activation_vectors,
+                )
+                logits = output.logits
+
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels.contiguous()
+                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
+                loss = loss * loss_mask.to(loss.device)
+            else:
+                batch_size, seqlen = input_ids.shape
+                input_ids_rmpad, indices, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+
+                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad,
+                    position_ids_rmpad,
+                    sp_size=get_ulysses_sequence_parallel_world_size(),
+                )
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
+                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad_rolled,
+                    None,
+                    get_ulysses_sequence_parallel_world_size(),
+                )
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
+
+                output = self.fsdp_model(
+                    input_ids=input_ids_rmpad_sliced,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad_padded,
+                    use_cache=False,
+                    activation_vectors=activation_vectors,
+                )
+
+                logits_rmpad = output.logits.squeeze(0)
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
+                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+                loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+
+                full_loss = pad_input(
+                    hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+                )
+                full_loss = full_loss.squeeze(-1)[:, :-1]
+                full_loss = full_loss.reshape(-1)
+                loss_mask = loss_mask.to(full_loss.device)
+                loss = full_loss * loss_mask
+
+            valid_token_this_rank = torch.sum(loss_mask)
+
+            if self.config.data.balance_dp_token:
+                torch.distributed.all_reduce(valid_token_this_rank)
+                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+            else:
+                dp_size = 1
+
+            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+            loss = loss / n_micro_batches
+
+            if do_backward:
+                loss.backward()
+            return loss
 
     def _compute_critic_loss(self, batch):
         """Compute MSE loss for critic training."""

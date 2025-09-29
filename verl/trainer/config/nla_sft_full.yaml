@@ -1,14 +1,14 @@
-# NLA SFT configuration - Tiny model for testing
-# Inherits from sft_trainer and overrides for NLA
+# NLA SFT configuration - Full-scale 0.5B model training
+# Inherits from sft_trainer and overrides for full NLA training
 
 defaults:
   - sft_trainer
   - _self_
 
-# Data configuration
+# Data configuration - larger batches for full training
 data:
-  train_batch_size: 8
-  micro_batch_size_per_gpu: 2
+  train_batch_size: 32
+  micro_batch_size_per_gpu: 4
   train_files: data/testing/sft/train_nla_sft_dataset_layer10.parquet
   val_files: data/testing/sft/val_nla_sft_dataset_layer10.parquet
 
@@ -23,15 +23,15 @@ data:
 
   # activation_dim now determined dynamically from model config
 
-  max_length: 512
+  max_length: 1024  # Longer sequences for full training
   truncation: error
   use_shm: false
 
-# Model configuration
+# Model configuration - 0.5B Qwen model
 model:
   partial_pretrain: Qwen/Qwen2.5-0.5B-Instruct
   trust_remote_code: true
-  enable_gradient_checkpointing: false
+  enable_gradient_checkpointing: true  # Enable for memory efficiency
   use_liger: false
   strategy: fsdp2
 
@@ -42,30 +42,30 @@ model:
     cpu_offload: false
     offload_params: false
 
-# Optimizer configuration
+# Optimizer configuration - full training settings
 optim:
-  lr: 1e-4
+  lr: 5e-5  # Lower learning rate for full training
   betas: [0.9, 0.999]
   weight_decay: 0.01
-  warmup_steps_ratio: 0.1
+  warmup_steps_ratio: 0.05  # 5% warmup for longer training
   clip_grad: 1.0
   lr_scheduler: cosine
 
-# Trainer configuration
+# Trainer configuration - full scale training
 trainer:
-  default_local_dir: checkpoints/nla_sft_tiny
+  default_local_dir: checkpoints/nla_sft_full
   project_name: null  # Auto-filled from model name + train_mode when unset
   experiment_name: null
-  total_epochs: 1
-  total_training_steps: 10
+  total_epochs: 1  # Single epoch baseline; increase as needed for longer runs
+  total_training_steps: null  # Let it run for full epochs
   logger: ["console", "wandb"]
   seed: 42
-  save_freq: 10
-  test_freq: 5
+  save_freq: 500  # Save less frequently
+  test_freq: 100  # Validate more frequently
   nnodes: 1
   n_gpus_per_node: 1
   device: cuda
-  resume_mode: disable
+  resume_mode: disable  # Start fresh by default; override to auto for resumable runs
 
   checkpoint:
     save_contents: ["model", "optimizer", "extra"]
@@ -95,5 +95,5 @@ nla:
     projection_layers: 2
 
   # Training settings
-  critic_lr: 5e-4
-  critic_epochs: 1
+  critic_lr: 2e-5  # Lower learning rate for full training
+  critic_epochs: 3  # More epochs for critic

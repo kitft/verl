@@ -23,8 +23,8 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
 
-  # Use console logging only for testing
-  logger: ["console"]
+  # Log to console and wandb
+  logger: ["console", "wandb"]
 
 # Override algorithm for GRPO
 algorithm:
@@ -38,8 +38,8 @@ algorithm:
 # Override model paths for tiny model
 actor_rollout_ref:
   model:
-    path: google/gemma-2-2b-it
-    tokenizer_path: google/gemma-2-2b-it
+    path: Qwen/Qwen2.5-0.5B-Instruct #google/gemma-3-1b-it #google/gemma-2-2b-it
+    tokenizer_path: Qwen/Qwen2.5-0.5B-Instruct #google/gemma-3-1b-it #google/gemma-2-2b-it
 
   # Actor FSDP configuration
   actor:
@@ -58,6 +58,7 @@ actor_rollout_ref:
     mode: sync  # Use sync mode for simpler setup
     tensor_model_parallel_size: 1
     disable_radix_cache: true
+    log_prob_micro_batch_size_per_gpu: 2
 
     # Generation parameters
     response_length: 50  # Max tokens to generate
@@ -69,7 +70,7 @@ critic:
   enable: true  # Explicitly enable critic for NLA GRPO
   strategy: fsdp2
   model:
-    path: google/gemma-2-2b-it
+    path: Qwen/Qwen2.5-0.5B-Instruct #Qwen/Qwen2.5-0.5B-Instruct #google/gemma-2-2b-it
     fsdp_config:
       model_dtype: bf16  # TODO: Flash Attention warning about dtype - may need to address later
       mixed_precision:
@@ -96,21 +97,21 @@ nla:
 
   # Reduce GRPO settings for testing
   grpo:
-    num_trajectories_per_prompt: 2  # Only 2 responses per prompt for speed
+    num_trajectories_per_prompt: 4  # Only 2 responses per prompt for speed
     critic_train_epochs: 1
 
 # Test data settings
 data:
   # Use test datasets
   train_files:
-    - data/generated/my_corpus_activations_layer26.parquet
+    - data/generated/my_corpus_activations_layer10.parquet
 
   val_files:
-    - data/generated/my_corpus_activations_layer26.parquet
+    - data/generated/my_corpus_activations_layer10.parquet
 
-  # Very small batches for testing
-  train_batch_size: 2
-  val_batch_size: 2
+  # Small batches for testing
+  train_batch_size: 8
+  val_batch_size: 8
 
   # No parallel workers for testing
   num_workers: 0
@@ -140,3 +141,7 @@ ray_kwargs:
         - "*.parquet"
         - "flashinfer_python*"
         - "flash_attn*"
+
+engine_kwargs:
+  sglang:
+    attention_chunk_size: 0

@@ -160,7 +160,6 @@ class NLASFTDataset(SFTDataset):
 
         metadata_keys = [
             "sample_uuid",
-            "formatted_source",
             "tokenized_source",
             "forward_pass_text",
             "prompt_text",
@@ -170,7 +169,8 @@ class NLASFTDataset(SFTDataset):
             "source_message_token_index",
             "source_sequence_token_index",
             "prompt_token_index",
-            "source_messages",
+            "is_chat",
+            "source",
         ]
 
         extra_info = sample.get("extra_info", {}) or {}
@@ -180,9 +180,6 @@ class NLASFTDataset(SFTDataset):
                 if isinstance(value, np.ndarray):
                     value = value.tolist()
                 extra_info[key] = value
-
-        # Drop raw source string (actor/critic code should rely on formatted/tokenized views).
-        sample.pop("source", None)
 
         extra_info["response"] = self.responses[idx]
         sample["extra_info"] = extra_info
