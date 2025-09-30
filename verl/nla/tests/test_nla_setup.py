@@ -169,7 +169,7 @@ def main():
         print("=" * 50)
         print("\nYour NLA setup is ready for training:")
         print("- Dataset: test_nla_dataset.parquet (10 samples)")
-        print("- Config: verl/verl/nla/configs/test_nla_config.yaml")
+        print("- Config: verl/verl/trainer/config/test_nla_config.yaml")
         print("- Model: yujiepan/gemma-2-tiny-random")
 
     except Exception as e:

@@ -1,0 +1,50 @@
+# @package _global_
+
+defaults:
+  - /nla_activation_dataset
+  - _self_
+
+mode: rl
+
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct
+  trust_remote_code: true
+  layer_index: 10
+  model_dtype: bf16
+
+seed: 42
+
+dataset:
+  name: HuggingFaceFW/fineweb
+  config_name: sample-10BT
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: text
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: false
+  expect_chat: false
+  slice_start: 51000
+  slice_length: 50000
+
+sampling:
+  total_activations: 50000
+  activations_per_sample: 1
+  max_length: 1024
+  parallel_batch_size: null  # Auto-detect based on available GPUs
+
+output:
+  path_prefix: data/generated/rl_train_fineweb10bt_qwen_small
+  overwrite: true
+  include_layer_suffix: true
+  injection_token: null
+  random_variant:
+    enabled: true
+    path: null
+    suffix: _random
+    seed: null
+    columns: null
+    source_field: sample_uuid
+    source_column: activation_vector_source_uuid

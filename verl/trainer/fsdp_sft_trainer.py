@@ -696,6 +696,7 @@ class FSDPSFTTrainer:
     def fit(self):
         rank = self.device_mesh.get_rank()
 
+        tracking = None
         # TODO: add a unified tracking
         if rank == 0:
             tracking = Tracking(
@@ -707,6 +708,24 @@ class FSDPSFTTrainer:
 
         global_step = self.resume_global_step  # Start from resumed step
         last_valid_metric = None
+
+        def run_validation(step: int):
+            """Execute validation loop and log metrics on rank 0."""
+            val_losses = []
+            for val_data in self.val_dataloader:
+                val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                    self.device_name
+                )
+                val_loss = self.validation_step(val_data)
+                val_losses.append(val_loss)
+
+            metric = None
+            if rank == 0:
+                val_loss = torch.mean(torch.stack(val_losses))
+                metric = {"val/loss": val_loss.detach().item()}
+                tracking.log(data=metric, step=step)
+            torch.distributed.barrier()
+            return metric
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -735,6 +754,12 @@ class FSDPSFTTrainer:
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
 
+        if self.config.trainer.test_freq and self.config.trainer.test_freq > 0:
+            if global_step % self.config.trainer.test_freq == 0:
+                metric = run_validation(global_step)
+                if rank == 0 and metric is not None:
+                    last_valid_metric = metric
+
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -761,20 +786,9 @@ class FSDPSFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
-                            self.device_name
-                        )
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                    metric = run_validation(global_step)
+                    if rank == 0 and metric is not None:
                         last_valid_metric = metric
-                    torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)

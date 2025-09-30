@@ -7,12 +7,14 @@ mode: rl
 model:
   name: Qwen/Qwen2.5-0.5B-Instruct
   trust_remote_code: true
+  layer_index: 10
+  model_dtype: bf16
 
 seed: 43
 
 dataset:
-  name: NeelNanda/pile-10k
-  config_name: null
+  name: HuggingFaceFW/fineweb
+  config_name: sample-10BT
   split: train
   input_parquet: null
   max_samples: null
@@ -22,16 +24,17 @@ dataset:
   system_prompt: null
   add_generation_prompt: false
   expect_chat: false
-  slice_start: 1000
-  slice_length: 100
+  slice_start: 101000
+  slice_length: 500
 
 sampling:
-  total_activations: 100
+  total_activations: 500
   activations_per_sample: 1
   max_length: 1024
+  parallel_batch_size: null  # Auto-detect based on available GPUs
 
 output:
-  path_prefix: data/generated/rl_val_pile10k_qwen
+  path_prefix: data/generated/rl_val_fineweb10bt_qwen_small
   overwrite: true
   include_layer_suffix: true
   injection_token: null

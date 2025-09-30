@@ -37,6 +37,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         self.logger = logging.getLogger(__name__)
         # Get hidden size from the critic model
         self.hidden_size = critic_module.config.hidden_size if hasattr(critic_module, 'config') else None
+        # Initialize NLA adapter for extracting activation vectors
+        from verl.nla.integration.dataproto_adapter import NLADataProtoAdapter
+        self.adapter = NLADataProtoAdapter()
 
     def _extract_value_tensor(self, model_outputs: torch.Tensor) -> torch.Tensor:
         """Return activation tensor, preferring explicit value head else hidden states."""
@@ -205,9 +208,83 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         return values
 
-    def compute_values(self, data: DataProto) -> torch.Tensor:
-        """Compute activation vector predictions without tracking gradients."""
-        return self._compute_values_internal(data, enable_grads=False)
+    def compute_values(self, data: DataProto) -> DataProto:
+        """
+        Compute MSE-based scalar values (negative reconstruction error).
+
+        Returns values as (batch, seq_len) tensor where higher values = better reconstruction.
+        This allows NLA to use standard VERL GRPO advantage computation.
+
+        Also stores target_activations in the returned batch for use by update_critic.
+
+        If values already exist in data.batch (from earlier shim call), returns them immediately
+        without recomputation.
+        """
+        # Check if values already computed (e.g., by reward shim)
+        if "values" in data.batch and "target_activations" in data.batch:
+            self.logger.debug("Values already computed, skipping recomputation")
+            return DataProto(
+                batch={
+                    "values": data.batch["values"],
+                    "target_activations": data.batch["target_activations"],
+                },
+                meta_info={"metrics": {}}  # No new metrics since we didn't recompute
+            )
+
+        # Get predicted activation vectors (batch, seq_len, hidden_dim)
+        predicted_activations = self._compute_values_internal(data, enable_grads=False)
+
+        # Extract target activations from data (batch, hidden_dim)
+        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data)
+
+        if target_activations is None:
+            raise ValueError("Target activation vectors missing from DataProto")
+
+        # Ensure target is a tensor on the correct device
+        if not isinstance(target_activations, torch.Tensor):
+            target_activations = torch.as_tensor(
+                target_activations,
+                device=predicted_activations.device,
+                dtype=predicted_activations.dtype
+            )
+        else:
+            target_activations = target_activations.to(
+                device=predicted_activations.device,
+                dtype=predicted_activations.dtype
+            )
+
+        # Broadcast target to all tokens: (batch, 1, hidden_dim) -> (batch, seq_len, hidden_dim)
+        target_expanded = target_activations.unsqueeze(1).expand_as(predicted_activations)
+
+        # Compute MSE per token and average over hidden dimension
+        mse_per_token = torch.nn.functional.mse_loss(
+            predicted_activations,
+            target_expanded,
+            reduction='none'
+        ).mean(dim=-1)  # (batch, seq_len)
+
+        # Transform to values: negative MSE (higher is better for RL)
+        values = -mse_per_token  # (batch, seq_len)
+
+        # Compute metrics for logging
+        response_mask = data.batch.get("response_mask")
+        if response_mask is not None:
+            response_mask_float = response_mask.to(values.device, dtype=values.dtype)
+            valid_mse = (mse_per_token * response_mask_float).sum() / response_mask_float.sum()
+        else:
+            valid_mse = mse_per_token.mean()
+
+        # Return as DataProto with metrics AND target_activations for update_critic
+        return DataProto(
+            batch={
+                "values": values,
+                "target_activations": target_activations,  # Store for update_critic
+            },
+            meta_info={"metrics": {
+                "critic/mse_mean": valid_mse.item(),
+                "critic/reward_mean": -valid_mse.item(),  # Same as values
+            }}
+        )
 
     def compute_activation_loss(
         self,

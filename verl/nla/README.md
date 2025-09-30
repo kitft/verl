@@ -184,7 +184,7 @@ trainer:
 
 ```bash
 python verl/nla/scripts/run_nla_sft.py \
-    --config verl/nla/configs/nla_sft_config.yaml \
+    --config verl/trainer/config/nla_sft_config.yaml \
     --train-mode both
 ```
 

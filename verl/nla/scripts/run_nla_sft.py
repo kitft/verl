@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="verl/nla/configs/nla_sft_config.yaml",
+        default="verl/trainer/config/nla_sft_config.yaml",
         help="Path to configuration file"
     )
     parser.add_argument(

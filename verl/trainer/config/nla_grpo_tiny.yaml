@@ -10,20 +10,13 @@ defaults:
 
 # Override trainer settings for NLA tiny testing
 trainer:
-  # Project and experiment names
   project_name: nla_experiments
   experiment_name: grpo_tiny_test
-
-  # Minimal training for quick testing
   total_training_steps: 10
   save_freq: 10
   test_freq: 5
-
-  # Single node/GPU for testing
   nnodes: 1
   n_gpus_per_node: 1
-
-  # Log to console and wandb
   logger: ["console", "wandb"]
 
 # Override algorithm for GRPO
@@ -56,6 +49,7 @@ actor_rollout_ref:
   rollout:
     name: nla_sglang  # Use NLA-specific SGLang rollout
     mode: sync  # Use sync mode for simpler setup
+    n: 4  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
     tensor_model_parallel_size: 1
     disable_radix_cache: true
     log_prob_micro_batch_size_per_gpu: 2
@@ -97,7 +91,7 @@ nla:
 
   # Reduce GRPO settings for testing
   grpo:
-    num_trajectories_per_prompt: 4  # Only 2 responses per prompt for speed
+    # num_trajectories_per_prompt: 4  # NOT USED - use actor_rollout_ref.rollout.n instead
     critic_train_epochs: 1
 
 # Test data settings

@@ -1,0 +1,60 @@
+defaults:
+  - _self_
+
+mode: rl  # "rl" or "sft"
+
+dataset:
+  name: null
+  config_name: null
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: null
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: true
+  expect_chat: false
+  slice_start: null
+  slice_length: null
+
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct #google/gemma-3-1b-it #google/gemma-2-2b-it
+  trust_remote_code: true
+  layer_index: 10
+  model_dtype: fp32  # Options: bf16, fp16, fp32
+
+sampling:
+  total_activations: 256
+  activations_per_sample: 1
+  max_length: 1024
+  parallel_batch_size: 1
+
+output:
+  path_prefix: data/generated/activation_dataset.parquet
+  overwrite: false
+  include_layer_suffix: true
+  injection_token: null
+  random_variant:
+    enabled: false
+    path: null
+    suffix: "_random"
+    seed: null
+    columns: null
+    source_field: sample_uuid
+    source_column: activation_vector_source_uuid
+
+prompt:
+  default_role: user
+  add_generation_prompt: true
+  chat_template: null
+  messages:
+    - role: user
+      template: |
+        Explain the following text {injection_token}
+
+
+response:
+  template: "{source}"
+
+seed: 42

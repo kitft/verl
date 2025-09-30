@@ -19,7 +19,7 @@ from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
 
-@hydra.main(config_path="config", config_name="nla_grpo_tiny", version_base=None)
+@hydra.main(config_path="config", config_name="runs/qwen_tiny/rl_grpo", version_base=None)
 def main(config):
     """Main entry point for NLA training with Hydra configuration management."""
     run_nla_grpo(config)
@@ -230,21 +230,10 @@ class NLATaskRunner:
         # Create collate function
         from verl.utils.dataset.rl_dataset import collate_fn
 
-        # Create GRPO config from YAML
-        grpo_settings = config.get("nla", {}).get("grpo", {})
-        grpo_config = GRPOTrainerConfig(
-            num_trajectories_per_prompt=grpo_settings.get("num_trajectories_per_prompt", 4),
-            group_normalize_advantages=grpo_settings.get("group_normalize_advantages", True),
-            critic_supervised_weight=grpo_settings.get("critic_supervised_weight", 1.0),
-            critic_learning_rate=grpo_settings.get("critic_learning_rate", 5e-5),
-            critic_train_epochs=grpo_settings.get("critic_train_epochs", 1),
-            reward_normalize=grpo_settings.get("reward_normalize", False),
-            reward_transform=grpo_settings.get("reward_transform", "negative"),
-            reward_scale=grpo_settings.get("reward_scale", 1.0),
-            actor_learning_rate=config.actor_rollout_ref.actor.optim.lr,
-            ppo_epochs=config.trainer.get("ppo_epochs", 1),
-            ppo_clip_ratio=config.trainer.get("clip_ratio", 0.2),
-        )
+        # NOTE: GRPOTrainerConfig is not used - all GRPO logic is in the base fit() routine
+        # The only config needed is:
+        # - config.actor_rollout_ref.rollout.n (number of trajectories per prompt)
+        # - config.algorithm.adv_estimator = "grpo" (use GRPO advantage estimation)
 
         # Initialize NLA GRPO trainer with all required parameters
         trainer = NLAGRPOTrainer(
@@ -252,7 +241,7 @@ class NLATaskRunner:
             tokenizer=tokenizer,
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
-            grpo_config=grpo_config,
+            grpo_config=None,  # Not used
             ray_worker_group_cls=ray_worker_group_cls,
             processor=processor,
             reward_fn=reward_fn,
