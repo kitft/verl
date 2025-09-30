@@ -30,15 +30,13 @@ class _ValuesAsRewardsShim:
         self.trainer = trainer
 
     def __call__(self, data: DataProto, return_dict: bool = False):
-        # Check if values already computed (they won't be on first call from reward computation)
         if "values" not in data.batch:
-            # Compute values using critic - this returns MSE-based per-token values
-            # Shape: (batch, seq_len) where values = -MSE (higher is better)
+            # Compute values using critic - returns (batch, seq_len) where values = -MSE (higher is better)
             values_output = self.trainer.critic_wg.compute_values(data)
-            # Mutate the original batch in-place so values are cached for line 1089
+            # Cache values in batch for reuse
             data.batch.update(values_output.batch)
 
-        # Use values as token_level_scores (they're already per-token rewards)
+        # Use values as token_level_scores
         token_level_scores = data.batch["values"]
 
         reward_extra_info = {}

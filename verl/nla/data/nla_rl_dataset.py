@@ -183,6 +183,7 @@ class NLARLDataset(RLHFDataset):
             "prompt_token_index",
             "is_chat",
             "source",
+            "formatted_source",
         ]
 
         extra_info = sample.get("extra_info", {}) or {}

@@ -83,7 +83,7 @@ trainer:
 
   # Hardware settings
   device: "cuda"
-  mixed_precision: "no"  # No mixed precision for testing
+  mixed_precision: "bf16"  # Use bfloat16 for better performance
   gradient_checkpointing: false
 
   # Distributed training - single GPU
@@ -95,7 +95,7 @@ trainer:
   fsdp:
     sharding_strategy: "NO_SHARD"  # No sharding for tiny model
     cpu_offload: false
-    mixed_precision: "no"
+    mixed_precision: "bf16"
     backward_prefetch: null
 
   # Logging

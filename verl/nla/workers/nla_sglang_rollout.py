@@ -117,6 +117,7 @@ class NLASGLangRollout(SGLangRollout):
                     print("WARNING: Could not find embedding layer in SGLang model, using fallback")
                     vocab_size = self.model_config.hf_config.vocab_size
                     embed_layer = torch.nn.Embedding(vocab_size, self.hidden_dim)
+                    raise AttributeError("Could not find embedding layer in SGLang model")
             else:
                 raise AttributeError("SGLang engine does not expose model")
 
@@ -127,6 +128,7 @@ class NLASGLangRollout(SGLangRollout):
             log.error(f"FIX THIS LATER")
             vocab_size = self.model_config.hf_config.vocab_size
             embed_layer = torch.nn.Embedding(vocab_size, self.hidden_dim)
+            raise e
 
         # Compute base embeddings for all tokens
         with torch.no_grad():

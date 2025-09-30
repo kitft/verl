@@ -70,7 +70,7 @@ training:
 
   # Mixed precision
   fp16: false
-  bf16: false
+  bf16: true
 
   # Evaluation
   eval_steps: 5

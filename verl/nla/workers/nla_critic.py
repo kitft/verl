@@ -13,6 +13,7 @@ from verl.utils.device import get_device_id, is_cuda_available, is_npu_available
 from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -208,30 +209,32 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         return values
 
-    def compute_values(self, data: DataProto) -> DataProto:
+    def compute_values(self, data: DataProto) -> torch.Tensor:
         """
         Compute MSE-based scalar values (negative reconstruction error).
 
         Returns values as (batch, seq_len) tensor where higher values = better reconstruction.
         This allows NLA to use standard VERL GRPO advantage computation.
 
-        Also stores target_activations in the returned batch for use by update_critic.
+        Also stores target_activations in data.batch for use by update_critic.
 
         If values already exist in data.batch (from earlier shim call), returns them immediately
         without recomputation.
         """
         # Check if values already computed (e.g., by reward shim)
-        if "values" in data.batch and "target_activations" in data.batch:
+        if "values" in data.batch.keys():
             self.logger.debug("Values already computed, skipping recomputation")
-            return DataProto(
-                batch={
-                    "values": data.batch["values"],
-                    "target_activations": data.batch["target_activations"],
-                },
-                meta_info={"metrics": {}}  # No new metrics since we didn't recompute
-            )
+            return data.batch["values"]
+
+        # Compute response_mask if not present (needed for proper masking)
+        if "response_mask" not in data.batch.keys():
+            response_mask = compute_response_mask(data)
+            # Add to batch so it's available throughout the computation
+            data.batch["response_mask"] = response_mask
+            self.logger.debug(f"Computed response_mask with shape {response_mask.shape}")
 
         # Get predicted activation vectors (batch, seq_len, hidden_dim)
+        # This only includes the response portion due to slicing in _forward_micro_batch
         predicted_activations = self._compute_values_internal(data, enable_grads=False)
 
         # Extract target activations from data (batch, hidden_dim)
@@ -266,25 +269,26 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Transform to values: negative MSE (higher is better for RL)
         values = -mse_per_token  # (batch, seq_len)
 
-        # Compute metrics for logging
-        response_mask = data.batch.get("response_mask")
+        # Compute metrics for logging using response_mask
+        # Use .get() with explicit default for tensordict compatibility
+        response_mask = data.batch.get("response_mask", default=None)
         if response_mask is not None:
             response_mask_float = response_mask.to(values.device, dtype=values.dtype)
-            valid_mse = (mse_per_token * response_mask_float).sum() / response_mask_float.sum()
+            mask_sum = response_mask_float.sum()
+            if mask_sum > 0:
+                valid_mse = (mse_per_token * response_mask_float).sum() / mask_sum
+            else:
+                self.logger.warning("Empty response_mask detected, using mean MSE")
+                valid_mse = mse_per_token.mean()
         else:
             valid_mse = mse_per_token.mean()
 
-        # Return as DataProto with metrics AND target_activations for update_critic
-        return DataProto(
-            batch={
-                "values": values,
-                "target_activations": target_activations,  # Store for update_critic
-            },
-            meta_info={"metrics": {
-                "critic/mse_mean": valid_mse.item(),
-                "critic/reward_mean": -valid_mse.item(),  # Same as values
-            }}
-        )
+        # Log metrics (these won't be automatically captured, but useful for debugging)
+        self.logger.debug(f"Computed values: mse_mean={valid_mse.item():.6f}, reward_mean={-valid_mse.item():.6f}")
+
+        # Return only values tensor (matching base class API)
+        # Note: activation_vectors remain in data.batch and will be available to update_critic
+        return values
 
     def compute_activation_loss(
         self,
@@ -358,15 +362,16 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         metrics = {}
 
-        # Get required data
-        micro_batch_size = data.meta_info.get("micro_batch_size", 1)
+        # NLA-specific: include activation_vectors in select_keys
+        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns", "activation_vectors"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Extract target activations from data
-        # These should be provided in the DataProto
-        if "target_activations" not in data.batch:
-            raise ValueError("target_activations must be provided in data.batch for NLA critic training")
-
-        target_activations = data.batch["target_activations"]  # (batch, hidden_size)
+        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data)
+        if target_activations is None:
+            raise ValueError("activation_vectors must be provided in data.batch for NLA critic training")
 
         # Compute predictions using parent's forward logic
         predicted_activations = self._compute_values_internal(data, enable_grads=True)
@@ -377,7 +382,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Compute MSE loss
         loss = self.compute_activation_loss(
             predicted_activations,
-            target_activations.to(predicted_activations.device),
+            target_activations.to(device=predicted_activations.device, dtype=predicted_activations.dtype),
             response_mask.to(predicted_activations.device) if response_mask is not None else None,
             pooling=self.config.get("pooling_strategy", "last")
         )
@@ -401,9 +406,24 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             target_mean = target_activations.mean().item()
             target_std = target_activations.std().item()
 
+            # Compute average norm of target activations (per sample)
+            target_norms = torch.norm(target_activations, dim=1)  # (batch,)
+            avg_target_norm = target_norms.mean().item()
+
             metrics["pred_activation_mean"] = pred_mean
             metrics["pred_activation_std"] = pred_std
             metrics["target_activation_mean"] = target_mean
             metrics["target_activation_std"] = target_std
+            metrics["target_activation_avg_norm"] = avg_target_norm
+
+            # Normalized MSE: mse / (average_norm^2)
+            # This gives reconstruction error relative to the typical activation magnitude
+            # Value of 1.0 means RMSE equals the average norm (poor reconstruction)
+            # Value of 0.1 means RMSE is 10% of average norm (good reconstruction)
+            if avg_target_norm > 0:
+                normalized_mse = loss.item() / (avg_target_norm ** 2)
+                metrics["normalized_mse"] = normalized_mse
+            else:
+                metrics["normalized_mse"] = float('inf')
 
         return metrics

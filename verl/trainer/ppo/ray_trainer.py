@@ -329,6 +329,13 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
         )
 
+        # Add timestamp to rollout_data_dir if configured
+        if self.config.trainer.get("rollout_data_dir", None):
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_dir = self.config.trainer.rollout_data_dir
+            self.config.trainer.rollout_data_dir = f"{base_dir}_{timestamp}"
+
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
@@ -451,9 +458,39 @@ class RayPPOTrainer:
             timing_raw (dict): Timing information for profiling
             rollout_data_dir (str): Directory path to save the rollout data
         """
+        # Dump on steps 0, 1, and then every 5 steps
+        if self.global_steps not in [0, 1] and self.global_steps % 5 != 0:
+            return
+
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            # Decode inputs and strip padding tokens
+            prompts = batch.batch["prompts"]
+            inputs = []
+            for prompt_ids in prompts:
+                # Remove padding tokens (can be at start or end)
+                if self.tokenizer.pad_token_id is not None:
+                    prompt_list = prompt_ids.tolist() if hasattr(prompt_ids, 'tolist') else prompt_ids
+                    # Remove all padding tokens
+                    prompt_list = [token_id for token_id in prompt_list if token_id != self.tokenizer.pad_token_id]
+                    inputs.append(self.tokenizer.decode(prompt_list, skip_special_tokens=False))
+                else:
+                    inputs.append(self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
+
+            # Decode responses and strip padding tokens
+            responses = batch.batch["responses"]
+            outputs = []
+            for response_ids in responses:
+                # Remove padding tokens (typically at the end)
+                if self.tokenizer.pad_token_id is not None:
+                    # Find first pad token
+                    response_list = response_ids.tolist() if hasattr(response_ids, 'tolist') else response_ids
+                    try:
+                        pad_idx = response_list.index(self.tokenizer.pad_token_id)
+                        response_ids = response_ids[:pad_idx]
+                    except (ValueError, AttributeError):
+                        pass  # No padding found
+                outputs.append(self.tokenizer.decode(response_ids, skip_special_tokens=False))
+
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -463,6 +500,21 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+
+            # Add additional useful fields for debugging
+            if "advantages" in batch.batch:
+                reward_extra_infos_to_dump["advantages"] = batch.batch["advantages"].sum(-1).cpu().tolist()
+            if "values" in batch.batch:
+                reward_extra_infos_to_dump["values"] = batch.batch["values"].sum(-1).cpu().tolist()
+
+            # Extract formatted_source (last 100 chars) from extra_info
+            formatted_sources = []
+            for item in batch:
+                extra_info = item.non_tensor_batch.get("extra_info", {})
+                formatted_source = extra_info.get("formatted_source", "")
+                # Take last 100 chars
+                formatted_sources.append(formatted_source[-100:] if formatted_source else "")
+            reward_extra_infos_to_dump["formatted_source_last100"] = formatted_sources
 
             self._dump_generations(
                 inputs=inputs,

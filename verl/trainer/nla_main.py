@@ -5,7 +5,11 @@ Based on main_ppo.py but adapted for NLA with autoencoder critic.
 """
 
 import os
+import re
 import socket
+from collections.abc import Iterable
+from pathlib import Path
+from typing import List, Optional
 
 import hydra
 import ray
@@ -19,6 +23,184 @@ from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
 
+def _slugify(value: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    """Sanitize the provided text into a wandb-friendly slug."""
+    text = str(value).strip() if value is not None else ""
+    if not text and fallback is not None:
+        text = str(fallback).strip()
+
+    if not text:
+        return None
+
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    if slug:
+        return slug
+
+    if fallback is not None:
+        fallback_slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(fallback)).strip("-").lower()
+        return fallback_slug or None
+
+    return None
+
+
+def _convert_fsdp_to_hf_if_needed(model_path: str) -> str:
+    """
+    Auto-convert FSDP checkpoint to HuggingFace format if needed.
+
+    Args:
+        model_path: Path to model (can be HF format or FSDP checkpoint)
+
+    Returns:
+        Path to HuggingFace format model (either existing or newly converted)
+    """
+    path = Path(model_path)
+
+    # If it's already pointing to huggingface subdirectory, use as-is
+    if path.name == "huggingface" or (path / "huggingface").exists():
+        if path.name == "huggingface":
+            return str(path)
+        else:
+            return str(path / "huggingface")
+
+    # Check if this is an FSDP checkpoint directory
+    # FSDP checkpoints have model_world_size_*_rank_*.pt files and fsdp_config.json
+    if path.is_dir():
+        has_fsdp_shards = any(path.glob("model_world_size_*_rank_*.pt"))
+        has_fsdp_config = (path / "fsdp_config.json").exists()
+        has_hf_subdir = (path / "huggingface").exists()
+
+        if has_fsdp_shards and has_fsdp_config:
+            # This is an FSDP checkpoint
+            if has_hf_subdir:
+                print(f"Found existing HuggingFace checkpoint at {path / 'huggingface'}")
+                return str(path / "huggingface")
+            else:
+                print(f"WARNING: FSDP checkpoint at {path} does not contain huggingface/ subdirectory.")
+                print("Please re-train with checkpoint.save_contents including 'hf_model', or manually convert.")
+                print("For now, attempting to use FSDP checkpoint directly (may fail)...")
+                return str(path)
+
+    # Otherwise assume it's a HuggingFace model path (could be local or HF Hub)
+    return str(path)
+
+
+def _detect_profile_label(config) -> Optional[str]:
+    """Return a profile label (currently only distinguishes the tiny preset)."""
+    # Check model name
+    model_path = config.actor_rollout_ref.model.path
+    if "tiny" in str(model_path).lower():
+        return "tiny"
+
+    # Check total training steps
+    total_steps = getattr(config.trainer, "total_training_steps", None)
+    if total_steps is not None and total_steps <= 100:
+        return "tiny"
+
+    return None
+
+
+def _detect_dataset_variant(train_files) -> Optional[str]:
+    """Infer whether training uses canonical or random activations."""
+    if isinstance(train_files, str):
+        paths: Iterable[str] = [train_files]
+    elif isinstance(train_files, Iterable):
+        paths = [str(p) for p in train_files]
+    else:
+        return None
+
+    paths = list(paths)
+    if not paths:
+        return None
+
+    if any("_random" in path for path in paths):
+        return "random"
+    return "canonical"
+
+
+def _extract_base_model_name(model_path: str) -> Optional[str]:
+    """Extract the base model name from checkpoint or model path."""
+    from pathlib import Path
+    import json
+
+    # If it's a checkpoint path, try to read config.json
+    path_obj = Path(model_path)
+    if path_obj.exists():
+        config_json = path_obj / "config.json"
+        if config_json.exists():
+            try:
+                with open(config_json) as f:
+                    model_config = json.load(f)
+                    base_name = model_config.get("_name_or_path")
+                    if base_name and not base_name.startswith(".") and "checkpoint" not in base_name.lower():
+                        # Extract just the model name (e.g., "Qwen2.5-0.5B-Instruct" from full path)
+                        return base_name.split("/")[-1] if "/" in base_name else base_name
+            except Exception:
+                pass
+
+    # If path looks like a checkpoint, extract meaningful parts
+    # e.g., "checkpoints/nla_sft_full/canonical/global_step_156/huggingface" -> "nla-sft-full"
+    path_str = str(model_path)
+    if "checkpoint" in path_str.lower() or "global_step" in path_str:
+        parts = path_str.split("/")
+        for i, part in enumerate(parts):
+            if "checkpoint" in part.lower() and i + 1 < len(parts):
+                # Return the next meaningful directory name
+                return parts[i + 1]
+
+    # Otherwise just return the last component
+    return path_str.split("/")[-1] if "/" in path_str else path_str
+
+
+def _build_experiment_name(config, user_label: Optional[str]) -> str:
+    """Construct a descriptive run name for tracking backends."""
+    model_path = config.actor_rollout_ref.model.path
+    model_id = _extract_base_model_name(str(model_path))
+
+    # Get training mode from NLA config (actor or critic focus)
+    mode = config.get("nla", {}).get("train_mode", "rl")
+
+    profile_label = _detect_profile_label(config)
+    dataset_variant = _detect_dataset_variant(config.data.train_files)
+
+    components: List[str] = []
+    seen = set()
+
+    def add_component(value: Optional[str], *, fallback: Optional[str] = None) -> None:
+        slug = _slugify(value, fallback)
+        if slug and slug not in seen:
+            components.append(slug)
+            seen.add(slug)
+
+    add_component(model_id, fallback="model")
+    add_component(mode, fallback="rl")
+    add_component(profile_label)
+    add_component(dataset_variant)
+    add_component(user_label)
+
+    return "-".join(components)
+
+
+def _ensure_tracking_defaults(config) -> None:
+    """Populate default tracking project/run names when missing."""
+    project_name = getattr(config.trainer, "project_name", None)
+    if not project_name:
+        model_path = config.actor_rollout_ref.model.path
+        model_id = _extract_base_model_name(str(model_path))
+        mode = config.get("nla", {}).get("train_mode", "rl")
+        model_slug = _slugify(model_id, fallback="model") or "model"
+        mode_slug = _slugify(mode, fallback="rl") or "rl"
+        config.trainer.project_name = f"{model_slug}-{mode_slug}-grpo"
+
+    # Check if user provided a custom experiment_name in config
+    user_label = getattr(config.trainer, "experiment_name", None)
+    # If it looks like one of our auto-generated names or is generic, regenerate
+    if not user_label or user_label in ["qwen-tiny-canonical", "nla-grpo", "nla-rl", "grpo_training"]:
+        user_label = None
+
+    run_name = _build_experiment_name(config, user_label)
+    config.trainer.experiment_name = run_name
+
+
 @hydra.main(config_path="config", config_name="runs/qwen_tiny/rl_grpo", version_base=None)
 def main(config):
     """Main entry point for NLA training with Hydra configuration management."""
@@ -27,6 +209,22 @@ def main(config):
 
 def run_nla_grpo(config) -> None:
     """Initialize Ray cluster and run distributed NLA GRPO training process."""
+
+    # Auto-convert FSDP checkpoints to HuggingFace format if needed
+    print("Checking model paths for FSDP→HF conversion...")
+    actor_path = config.actor_rollout_ref.model.path
+    critic_path = config.critic.model.path
+
+    converted_actor_path = _convert_fsdp_to_hf_if_needed(actor_path)
+    converted_critic_path = _convert_fsdp_to_hf_if_needed(critic_path)
+
+    if converted_actor_path != actor_path:
+        print(f"Actor model path converted: {actor_path} → {converted_actor_path}")
+        config.actor_rollout_ref.model.path = converted_actor_path
+
+    if converted_critic_path != critic_path:
+        print(f"Critic model path converted: {critic_path} → {converted_critic_path}")
+        config.critic.model.path = converted_critic_path
 
     # Check if Ray is not initialized
     if not ray.is_initialized():
@@ -197,6 +395,10 @@ class NLATaskRunner:
         print(f"Train dataset size: {len(train_dataset)}")
         if val_dataset:
             print(f"Val dataset size: {len(val_dataset)}")
+
+        # Ensure tracking defaults are set (auto-generate experiment names)
+        _ensure_tracking_defaults(config)
+        print(f"Project: {config.trainer.project_name}, Experiment: {config.trainer.experiment_name}")
 
         # Create reward functions
         if config.reward_model.enable:

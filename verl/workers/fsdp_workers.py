@@ -1247,6 +1247,41 @@ class CriticWorker(Worker, DistProfilerExtension):
                 config.model.get("trust_remote_code", False),
             )
 
+            # Optionally truncate critic at specified layer (for NLA training efficiency)
+            # NOTE: truncate_at_layer corresponds to hidden_states index from dataset generation
+            # hidden_states[0] = embeddings, hidden_states[N] = output of layer N-1
+            # So to match hidden_states[10], we need to keep layers 0-9 (truncate after layer 9)
+            truncate_at_layer = config.model.get("truncate_at_layer", None)
+            if truncate_at_layer is not None:
+                # Get the model's layers (handle different architectures)
+                if hasattr(critic_module, "model"):
+                    base_model = critic_module.model
+                else:
+                    base_model = critic_module
+
+                if hasattr(base_model, "layers"):
+                    # Standard transformer architecture (Llama, Qwen, etc.)
+                    # truncate_at_layer is the hidden_states index, so we keep layers 0..truncate_at_layer-1
+                    num_layers_to_keep = truncate_at_layer  # hidden_states[10] = output of layer 9, keep layers 0-9
+                    original_num_layers = len(base_model.layers)
+
+                    if num_layers_to_keep < original_num_layers:
+                        base_model.layers = base_model.layers[:num_layers_to_keep]
+
+                        # Update model config to reflect new number of layers
+                        if hasattr(base_model, "config"):
+                            base_model.config.num_hidden_layers = num_layers_to_keep
+                        if hasattr(critic_module, "config"):
+                            critic_module.config.num_hidden_layers = num_layers_to_keep
+
+                        if self.rank == 0:
+                            print(f"Truncated critic from {original_num_layers} to {num_layers_to_keep} layers "
+                                  f"(to match hidden_states[{truncate_at_layer}] from dataset generation)")
+                    elif self.rank == 0:
+                        print(f"Warning: truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation")
+                elif self.rank == 0:
+                    print(f"Warning: Could not find 'layers' attribute for truncation")
+
             use_remove_padding = config.model.get("use_remove_padding", False)
 
             apply_monkey_patch(

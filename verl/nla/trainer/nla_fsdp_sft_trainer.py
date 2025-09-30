@@ -285,8 +285,12 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             full_state = inner_model_for_fsdp2.state_dict()
             apply_fsdp2(inner_model_for_fsdp2, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(inner_model_for_fsdp2, full_state, self.device_mesh, cpu_offload)
-            # Keep the outer model as the interface
-            self.fsdp_model = model_to_wrap
+            # For checkpoint saving/loading, point to the FSDP-wrapped inner model
+            # The outer wrapper (NLAModelWrapper or AutoModelForCausalLMWithVectorValueHead)
+            # contains the FSDP-wrapped model and handles forward passes correctly
+            self.fsdp_model = inner_model_for_fsdp2
+            # Keep reference to the outer model for forward passes
+            self.model = model_to_wrap
 
         else:
             raise NotImplementedError(f"Strategy {fsdp_strategy} not implemented")

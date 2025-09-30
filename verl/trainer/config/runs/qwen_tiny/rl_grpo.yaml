@@ -22,10 +22,13 @@ critic:
   model:
     path: Qwen/Qwen2.5-0.5B-Instruct
     trust_remote_code: true
+    truncate_at_layer: 10  # Truncate critic at layer 10 (matching activation extraction layer)
+    fsdp_config:
+      model_dtype: bf16
   optim:
-    lr: 5e-5
+    lr: 1e-6
     weight_decay: 0.01
-    lr_warmup_steps: 50
+    lr_warmup_steps: 100
 
 trainer:
   total_training_steps: 100
@@ -36,6 +39,9 @@ trainer:
   experiment_name: qwen-tiny-canonical
   logger: ["console", "wandb"]
   resume_mode: disable
+  log_val_generations: 10  # Log 10 validation samples to wandb
+  test_freq: 10  # Run validation every 10 steps
+  rollout_data_dir: ./rollout_outputs/qwen_tiny_canonical  # Dump rollouts to disk
   
 ray_kwargs:
   ray_init:
@@ -67,6 +73,6 @@ engine_kwargs:
 # (use the canonical layer10 activations by default).
 data:
   train_files:
-    - /workspace-vast/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_layer10.parquet
+    - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_layer10.parquet
   val_files:
-    - /workspace-vast/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_layer10.parquet
+    - /workspace/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_layer10.parquet

@@ -230,6 +230,7 @@ class FSDPCriticModelCfg(BaseModelConfig):
         enable_activation_offload (bool): Offload activations to CPU to reduce GPU memory usage.
         use_remove_padding (bool): Use remove-padding optimization (saves compute).
         enable_gradient_checkpointing (bool): Enable gradient checkpointing for memory efficiency.
+        truncate_at_layer (Optional[int]): Truncate model at specified layer (for NLA training).
         fsdp_config (FSDPEngineConfig): FSDP-specific configuration block.
         lora_rank (int): Set to positive value to enable LoRA (e.g., 32).
         lora_alpha (int): LoRA scaling factor.
@@ -240,6 +241,7 @@ class FSDPCriticModelCfg(BaseModelConfig):
     enable_activation_offload: bool = False
     use_remove_padding: bool = False
     enable_gradient_checkpointing: bool = True
+    truncate_at_layer: Optional[int] = None
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     lora_rank: int = 0
     lora_alpha: int = 16

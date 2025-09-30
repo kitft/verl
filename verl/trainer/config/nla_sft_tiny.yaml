@@ -9,8 +9,8 @@ defaults:
 data:
   train_batch_size: 8
   micro_batch_size_per_gpu: 2
-  train_files: data/testing/sft/train_nla_sft_dataset_layer10.parquet
-  val_files: data/testing/sft/val_nla_sft_dataset_layer10.parquet
+  train_files: data/testing/sft/train_nla_sft_dataset_fineweb_layer10.parquet
+  val_files: data/testing/sft/val_nla_sft_dataset_fineweb_layer10.parquet
 
   # Dataset keys
   prompt_key: prompt_text
@@ -60,7 +60,7 @@ trainer:
   total_training_steps: 10
   logger: ["console", "wandb"]
   seed: 42
-  save_freq: 10
+  save_freq: -1  # Only save at end of training
   test_freq: 10
   nnodes: 1
   n_gpus_per_node: 1
@@ -68,7 +68,7 @@ trainer:
   resume_mode: disable
 
   checkpoint:
-    save_contents: ["model", "optimizer", "extra"]
+    save_contents: ["model", "optimizer", "extra", "hf_model"]  # Include HF model for RL training
     load_contents: ["model", "optimizer", "extra"]
 
 # Engine configuration (for non-FSDP trainer)
