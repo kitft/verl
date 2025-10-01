@@ -1253,6 +1253,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             # So to match hidden_states[10], we need to keep layers 0-9 (truncate after layer 9)
             truncate_at_layer = config.model.get("truncate_at_layer", None)
             if truncate_at_layer is not None:
+                raise ValueError("Truncation is not supported for critic")
                 # Get the model's layers (handle different architectures)
                 if hasattr(critic_module, "model"):
                     base_model = critic_module.model
@@ -1279,8 +1280,10 @@ class CriticWorker(Worker, DistProfilerExtension):
                                   f"(to match hidden_states[{truncate_at_layer}] from dataset generation)")
                     elif self.rank == 0:
                         print(f"Warning: truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation")
+                        raise ValueError(f"truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation")
                 elif self.rank == 0:
                     print(f"Warning: Could not find 'layers' attribute for truncation")
+                    raise ValueError("Could not find 'layers' attribute for truncation")
 
             use_remove_padding = config.model.get("use_remove_padding", False)
 

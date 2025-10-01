@@ -15,7 +15,7 @@ trainer:
   use_tensorboard: false
   default_local_dir: "./local_output"
   checkpoint:
-    save_freq: 10
+    save_freq: 1000
     load_path: null
   total_epochs: 1
   total_training_steps: 10
@@ -23,8 +23,8 @@ trainer:
   ppo_mini_batch_size: 2
   ppo_epochs: 1
   gradient_checkpointing: false
-  clip_ratio: 0.2
-  value_clip: 0.2
+  clip_ratio: 1
+  value_clip: 10000000000 # this shouldn't d anything
   max_grad_norm: 1.0
   normalize_reward: false
   normalize_advantages: true
@@ -61,6 +61,7 @@ actor_rollout_ref:
     temperature: 0.7
     top_p: 0.9
     do_sample: true
+    calculate_log_probs: true
   ref:
     enable: false
 

@@ -133,6 +133,12 @@ class NLAGRPOTrainer(RayPPOTrainer):
         if val_reward_fn is None:
             self.val_reward_fn = _ValuesAsRewardsShim(self)
 
+        # Initialize metadata tracking for RL
+        self.best_reward_mean = float("-inf")
+        self.final_reward_mean = None
+        self.final_reward_std = None
+        self.training_start_time = None
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         """Override to include activation_vectors in generation batch."""
         from collections import defaultdict
@@ -242,3 +248,68 @@ class NLAGRPOTrainer(RayPPOTrainer):
     #         self.grpo_metrics[key] = []
     #
     #     return metrics
+
+    def fit(self):
+        """Override fit to track training time."""
+        import time
+
+        self.training_start_time = time.time()
+
+        # Call parent's fit
+        super().fit()
+
+    def _save_checkpoint(self):
+        """Override to save NLA metadata with RL checkpoint."""
+        import time
+        import os
+        from pathlib import Path
+        from verl.utils.checkpoint.nla_metadata import (
+            create_rl_metadata_from_config,
+            save_metadata,
+            extract_lineage_from_checkpoint,
+        )
+
+        # Call parent's _save_checkpoint first
+        super()._save_checkpoint()
+
+        # Save metadata
+        checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+
+        # Calculate training time
+        training_time_hours = None
+        if self.training_start_time is not None:
+            training_time_hours = (time.time() - self.training_start_time) / 3600.0
+
+        # Get WandB info if available
+        wandb_run_id = None
+        wandb_run_url = None
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb_run_id = wandb.run.id
+                wandb_run_url = wandb.run.get_url()
+        except Exception:
+            pass
+
+        # Extract lineage from SFT checkpoints if they exist
+        actor_checkpoint_path = self.config.actor_rollout_ref.model.get("path")
+        critic_checkpoint_path = self.config.critic.model.get("path")
+
+        # Create metadata with lineage
+        metadata = create_rl_metadata_from_config(
+            config=self.config,
+            global_step=self.global_steps,
+            actor_checkpoint_path=actor_checkpoint_path,
+            critic_checkpoint_path=critic_checkpoint_path,
+            final_reward_mean=self.final_reward_mean,
+            final_reward_std=self.final_reward_std,
+            best_reward_mean=self.best_reward_mean if self.best_reward_mean != float("-inf") else None,
+            training_time_hours=training_time_hours,
+            wandb_run_id=wandb_run_id,
+            wandb_run_url=wandb_run_url,
+        )
+
+        # Save metadata
+        save_metadata(checkpoint_dir, metadata)
+        print(f"Saved NLA RL metadata for step {self.global_steps}")

@@ -506,18 +506,18 @@ class RayPPOTrainer:
 
             # Add additional useful fields for debugging
             if "advantages" in batch.batch:
-                reward_extra_infos_to_dump["advantages"] = batch.batch["advantages"].sum(-1).cpu().tolist()
+                reward_extra_infos_to_dump["advantages"] = batch.batch["advantages"][:, 0].cpu().tolist()
             if "values" in batch.batch:
-                reward_extra_infos_to_dump["values"] = batch.batch["values"].sum(-1).cpu().tolist()
+                reward_extra_infos_to_dump["values"] = batch.batch["values"][:, 0].cpu().tolist()
 
             # Extract formatted_source (last 100 chars) from extra_info
-            formatted_sources = []
+            immediate_prefixes = []
             for item in batch:
                 extra_info = item.non_tensor_batch.get("extra_info", {})
-                formatted_source = extra_info.get("formatted_source", "")
+                immediate_prefix = extra_info.get("immediate_prefix", "")
                 # Take last 100 chars
-                formatted_sources.append(formatted_source[-100:] if formatted_source else "")
-            reward_extra_infos_to_dump["formatted_source_last100"] = formatted_sources
+                immediate_prefixes.append(immediate_prefix[-100:] if immediate_prefix else "")
+            reward_extra_infos_to_dump["immediate_prefix"] = immediate_prefixes
 
             self._dump_generations(
                 inputs=inputs,

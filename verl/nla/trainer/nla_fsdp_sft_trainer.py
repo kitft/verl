@@ -64,6 +64,12 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         if self.train_mode not in ["actor", "critic"]:
             raise ValueError(f"train_mode must be 'actor' or 'critic', got '{self.train_mode}'")
 
+        # Initialize metadata tracking
+        self.best_val_loss = float("inf")
+        self.final_train_loss = None
+        self.final_val_loss = None
+        self.training_start_time = None
+
         # Call parent constructor
         super().__init__(
             config=config,
@@ -511,3 +517,163 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             with torch.no_grad():
                 critic_loss = self._compute_critic_loss(batch)
             return critic_loss
+
+    def fit(self):
+        """Override fit to track training time and metrics."""
+        import time
+        import torch
+        from omegaconf import OmegaConf
+        from tensordict import TensorDict
+        from tqdm import tqdm
+        from verl.utils.tracking import Tracking
+
+        self.training_start_time = time.time()
+        rank = self.device_mesh.get_rank()
+
+        tracking = None
+        if rank == 0:
+            tracking = Tracking(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True),
+            )
+
+        global_step = self.resume_global_step
+        last_valid_metric = None
+
+        def run_validation(step: int):
+            """Execute validation loop and log metrics."""
+            val_losses = []
+            for val_data in self.val_dataloader:
+                val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                    self.device_name
+                )
+                val_loss = self.validation_step(val_data)
+                val_losses.append(val_loss)
+
+            metric = None
+            if rank == 0:
+                val_loss = torch.mean(torch.stack(val_losses))
+                metric = {"val/loss": val_loss.detach().item()}
+                tracking.log(data=metric, step=step)
+
+                # Update best val loss
+                self._update_metrics(val_loss=metric["val/loss"])
+
+            torch.distributed.barrier()
+            return metric
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
+
+        start_epoch = global_step // self.steps_per_epoch
+
+        if self.config.trainer.test_freq and self.config.trainer.test_freq > 0:
+            if global_step % self.config.trainer.test_freq == 0:
+                metric = run_validation(global_step)
+                if rank == 0 and metric is not None:
+                    last_valid_metric = metric
+
+        train_time = 0
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            self.train_sampler.set_epoch(epoch=epoch)
+
+            for step_in_epoch, data in enumerate(
+                tqdm(
+                    self.train_dataloader,
+                    initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
+                    total=self.steps_per_epoch,
+                    desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
+                    disable=rank != 0,
+                )
+            ):
+                global_step += 1
+                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                metric = self.training_step(data)
+                train_time += metric["train/time(s)"]
+
+                if rank == 0:
+                    tracking.log(data=metric, step=global_step)
+                    # Update train loss
+                    self._update_metrics(train_loss=metric["train/loss"])
+
+                is_last_step = global_step >= self.total_training_steps
+                is_valid_step = global_step % self.config.trainer.test_freq == 0
+                is_save_step = global_step % self.config.trainer.save_freq == 0
+
+                if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                    metric = run_validation(global_step)
+                    if rank == 0 and metric is not None:
+                        last_valid_metric = metric
+
+                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                    self.save_checkpoint(step=global_step)
+
+                if is_last_step:
+                    if rank == 0:
+                        print(f"Total time for train steps: {train_time:.2f}s")
+                        print(f"Final validation metrics: {last_valid_metric}")
+                    return
+
+    def save_checkpoint(self, step):
+        """Override save_checkpoint to include NLA metadata."""
+        import time
+        from verl.utils.checkpoint.nla_metadata import create_sft_metadata_from_config, save_metadata
+
+        # Call parent's save_checkpoint first
+        super().save_checkpoint(step)
+
+        # Only save metadata on rank 0
+        if self.device_mesh.get_rank() == 0:
+            import os
+            from pathlib import Path
+
+            checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
+
+            # Calculate training time
+            training_time_hours = None
+            if self.training_start_time is not None:
+                training_time_hours = (time.time() - self.training_start_time) / 3600.0
+
+            # Get WandB info if available
+            wandb_run_id = None
+            wandb_run_url = None
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb_run_id = wandb.run.id
+                    wandb_run_url = wandb.run.get_url()
+            except Exception:
+                pass  # WandB not initialized or not available
+
+            # Create metadata
+            metadata = create_sft_metadata_from_config(
+                config=self.config,
+                global_step=step,
+                final_train_loss=self.final_train_loss,
+                final_val_loss=self.final_val_loss,
+                best_val_loss=self.best_val_loss if self.best_val_loss != float("inf") else None,
+                training_time_hours=training_time_hours,
+                model_config=self.model_config if hasattr(self, "model_config") else None,
+                wandb_run_id=wandb_run_id,
+                wandb_run_url=wandb_run_url,
+            )
+
+            # Save metadata
+            save_metadata(checkpoint_dir, metadata)
+
+            print(f"Saved NLA metadata for step {step}")
+
+    def _update_metrics(self, train_loss: float = None, val_loss: float = None):
+        """Update tracked metrics."""
+        if train_loss is not None:
+            self.final_train_loss = train_loss
+
+        if val_loss is not None:
+            self.final_val_loss = val_loss
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss

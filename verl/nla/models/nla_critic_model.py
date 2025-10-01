@@ -108,6 +108,7 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
         )
 
         # Get the last hidden states from the final layer
+        
         hidden_states = outputs.hidden_states[-1]  # (batch, seq_len, hidden_size)
 
         # Extract last token for each sequence (where we'll get the activation vector)
@@ -117,33 +118,31 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             batch_size = hidden_states.shape[0]
             last_hidden = hidden_states[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
         else:
+            raise ValueError("Attention mask is required for last pooling")
             # If no mask, just take the last position
             last_hidden = hidden_states[:, -1, :]  # (batch, hidden_size)
 
         # Directly use the last hidden state as activation vector (with optional dropout)
-        activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
+        #activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
+        # no dropout
+        activation_vector = last_hidden
+        # Return activation vector as (batch, hidden_size)
+        values = activation_vector
+        #print("shape of values inside the forward pass:", values.shape)
+        #raise ValueError("Stop here - not properly implemented")
 
-        # For compatibility, expand back to sequence dimension with zeros except last position
-        batch_size, seq_len = hidden_states.shape[:2]
-        values = torch.zeros(
-            batch_size, seq_len, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        if attention_mask is not None:
-            values[torch.arange(batch_size), seq_lengths] = activation_vector
-        else:
-            values[:, -1] = activation_vector
-
-        # Return in format expected by VERL
-        # The dp_critic.py expects output[2] to be the values (line 108, 132)
         if not return_dict:
-            return (outputs.loss, outputs.logits, values) + outputs.hidden_states
+            return (None, None, values)
 
+        print(f"""#########################################################################
+            Should never occur in training
+            ################################################################################""")
         return CausalLMOutputWithValue(
-            loss=outputs.loss,
-            logits=outputs.logits,
+            loss=None,
+            logits=None,
             value=values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=[values],
+            attentions=None,
         )
 
     def can_generate(self) -> bool:

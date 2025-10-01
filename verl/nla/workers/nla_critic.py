@@ -44,12 +44,15 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
     def _extract_value_tensor(self, model_outputs: torch.Tensor) -> torch.Tensor:
         """Return activation tensor, preferring explicit value head else hidden states."""
-        if hasattr(model_outputs, "value") and model_outputs.value is not None:
-            value = model_outputs.value
-            if value.dim() >= 3:
-                return value
+        # print(f"model outputs keys: {model_outputs.keys()}" if isinstance(model_outputs, dict) else f"model outputs type: {type(model_outputs)}")
+        # print("length of hidden states:", len(model_outputs.hidden_states) if hasattr(model_outputs, "hidden_states") else "hidden_states not found")
+
+        # if hasattr(model_outputs, "value") and model_outputs.value is not None:
+        #     value = model_outputs.value
+        #     if value.dim() >= 3:
+        #         return value
         if hasattr(model_outputs, "hidden_states") and model_outputs.hidden_states is not None:
-            return model_outputs.hidden_states[-1]
+            return model_outputs.hidden_states[self.config.output_layer_index]
         if isinstance(model_outputs, (tuple, list)) and len(model_outputs) > 2:
             candidate = model_outputs[2]
             if isinstance(candidate, torch.Tensor) and candidate.dim() >= 3:
@@ -67,18 +70,48 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            input_ids = micro_batch["input_ids"]
+            # Use only responses as model input
+            input_ids = responses
             batch, seqlen = input_ids.shape
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
-            if position_ids.dim() == 3:  # qwen2vl mrope
+
+            # Extract attention mask for responses only
+            attention_mask_full = micro_batch["attention_mask"]
+            attention_mask = attention_mask_full[:, -response_length:]
+
+            # Create fresh position IDs starting from 0 for responses
+            # This is needed for Flash Attention which expects position IDs to start from 0
+            position_ids_full = micro_batch["position_ids"]
+            if position_ids_full.dim() == 3:  # qwen2vl mrope
+                # For multi-rope, create position IDs from scratch based on attention mask
+                # Keep the same structure but reset values
+                position_ids_full_transposed = position_ids_full.transpose(0, 1)
+                num_ropes = position_ids_full_transposed.shape[0]
+                position_ids = torch.zeros(
+                    (num_ropes, batch, response_length),
+                    dtype=position_ids_full.dtype,
+                    device=position_ids_full.device
+                )
+                for rope_idx in range(num_ropes):
+                    for b_idx in range(batch):
+                        valid_len = attention_mask[b_idx].sum().item()
+                        position_ids[rope_idx, b_idx, :valid_len] = torch.arange(
+                            valid_len, dtype=position_ids_full.dtype, device=position_ids_full.device
+                        )
                 position_ids = position_ids.transpose(0, 1)
+            else:
+                # Standard case: create position IDs from 0 based on attention mask
+                position_ids = torch.zeros_like(attention_mask, dtype=torch.long)
+                for b_idx in range(batch):
+                    valid_len = attention_mask[b_idx].sum().item()
+                    position_ids[b_idx, :valid_len] = torch.arange(
+                        valid_len, dtype=torch.long, device=attention_mask.device
+                    )
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(
+                input_ids_rmpad, indices, cu_seqlens, max_seqlen = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                )
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
 
                 if position_ids.dim() == 3:
                     position_ids_rmpad = (
@@ -120,7 +153,6 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                     )
 
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen)
-                values = values[:, -response_length - 1 : -1, :]
             else:
                 outputs = self.critic_module(
                     input_ids=input_ids,
@@ -131,7 +163,6 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                     output_hidden_states=True,
                 )
                 values = self._extract_value_tensor(outputs)
-                values = values[:, -response_length - 1 : -1, :]
 
         return values
 
@@ -229,64 +260,64 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Compute response_mask if not present (needed for proper masking)
         if "response_mask" not in data.batch.keys():
             response_mask = compute_response_mask(data)
-            # Add to batch so it's available throughout the computation
             data.batch["response_mask"] = response_mask
             self.logger.debug(f"Computed response_mask with shape {response_mask.shape}")
 
-        # Get predicted activation vectors (batch, seq_len, hidden_dim)
-        # This only includes the response portion due to slicing in _forward_micro_batch
-        predicted_activations = self._compute_values_internal(data, enable_grads=False)
+        # Predicted activations for response tokens only
+        full_activations = self._compute_values_internal(data, enable_grads=False)  # (b, L, H)
 
-        # Extract target activations from data (batch, hidden_dim)
-        # raise_on_missing=True ensures we fail fast if activations are missing
+        # Targets (b, H)
         target_activations = self.adapter.extract_activation_vectors_from_dataproto(data, raise_on_missing=True)
-
-        # Ensure target is a tensor on the correct device
         if not isinstance(target_activations, torch.Tensor):
             target_activations = torch.as_tensor(
                 target_activations,
-                device=predicted_activations.device,
-                dtype=predicted_activations.dtype
+                device=full_activations.device,
+                dtype=full_activations.dtype
             )
         else:
             target_activations = target_activations.to(
-                device=predicted_activations.device,
-                dtype=predicted_activations.dtype
+                device=full_activations.device,
+                dtype=full_activations.dtype
             )
 
-        # Broadcast target to all tokens: (batch, 1, hidden_dim) -> (batch, seq_len, hidden_dim)
-        # Note: For GRPO, activation_vectors are automatically repeated by batch.repeat() in the trainer
-        target_expanded = target_activations.unsqueeze(1).expand_as(predicted_activations)
+        # Pool last non-padded token for each response
+        response_mask = data.batch.get("response_mask", None)  # (b, L)
+        pooled = self.extract_predicted_activations(
+            full_activations, response_mask, pooling="last"
+        )  # (b, H)
+        if response_mask.shape != full_activations.shape[:2]:
+            raise ValueError(f"Response mask shape {response_mask.shape} does not match full activations shape {full_activations.shape[:2]}")
+        print(f"Number of nonzero elements of response mask of 0th sequence: {response_mask[0].sum().item()}")
+        print(f"first response: {data.batch['responses'][0]}")
 
-        # Compute MSE per token and average over hidden dimension
-        mse_per_token = torch.nn.functional.mse_loss(
-            predicted_activations,
-            target_expanded,
-            reduction='none'
-        ).mean(dim=-1)  # (batch, seq_len)
+        # Per-sample MSE on the pooled last token
+        mse_per_sample = ((pooled - target_activations) ** 2).mean(dim=-1)  # (b,)
 
-        # Transform to values: negative MSE (higher is better for RL)
-        values = -mse_per_token  # (batch, seq_len)
+        # Broadcast scalar to all response positions for compatibility
+        resp_len = data.batch["responses"].size(-1)
+        values = (-mse_per_sample).unsqueeze(-1).expand(-1, resp_len).to(full_activations.dtype)
 
-        # Compute metrics for logging using response_mask
-        # Use .get() with explicit default for tensordict compatibility
-        response_mask = data.batch.get("response_mask", default=None)
+        # Put value only on last valid token
         if response_mask is not None:
-            response_mask_float = response_mask.to(values.device, dtype=values.dtype)
-            mask_sum = response_mask_float.sum()
-            if mask_sum > 0:
-                valid_mse = (mse_per_token * response_mask_float).sum() / mask_sum
-            else:
-                self.logger.warning("Empty response_mask detected, using mean MSE")
-                valid_mse = mse_per_token.mean()
+            last_indices = response_mask.sum(dim=1) - 1
+            last_indices = last_indices.clamp(min=0)
+            values = torch.zeros_like(values)
+            values[torch.arange(values.shape[0]), last_indices] = (-mse_per_sample).to(values.dtype)
         else:
-            valid_mse = mse_per_token.mean()
+            raise ValueError("Response mask is required for last pooling")
 
-        # Log metrics (these won't be automatically captured, but useful for debugging)
-        self.logger.debug(f"Computed values: mse_mean={valid_mse.item():.6f}, reward_mean={-valid_mse.item():.6f}")
+        # Log metrics
+        with torch.no_grad():
+            if response_mask is not None:
+                mask_sum = response_mask.to(values.dtype).sum()
+                if mask_sum > 0:
+                    valid_mse = mse_per_sample.mean()
+                else:
+                    valid_mse = mse_per_sample.mean()
+            else:
+                valid_mse = mse_per_sample.mean()
+            self.logger.debug(f"Computed values: mse_mean={valid_mse.item():.6f}, reward_mean={-valid_mse.item():.6f}")
 
-        # Return only values tensor (matching base class API)
-        # Note: activation_vectors remain in data.batch and will be available to update_critic
         return values
 
     def extract_predicted_activations(self, full_activations: torch.Tensor, response_mask: Optional[torch.Tensor] = None, pooling: str = "last") -> torch.Tensor:
@@ -314,7 +345,14 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 pooled_predictions = full_activations[
                     torch.arange(batch_size), last_indices
                 ]  # (batch, activation_dim)
+                # print(f"last indices (count of each): {last_indices.unique(return_counts=True)}, for shape of full_activations: {full_activations.shape}")
+                # print(f"avg norms of extraction vector by position")
+                # #for i in range(len(last_indices)):
+                # #    print(f"position {i}: {torch.norm(full_activations[i, last_indices[i]]).item()}")
+                # print(f"norms of first sequence: {[torch.norm(full_activations[0,i]) for i in range(full_activations.shape[1])]}")
+                # print(f"norms of second sequence: {[torch.norm(full_activations[1,i]) for i in range(full_activations.shape[1])]}")
             else:
+                raise ValueError("Response mask is required for last pooling")
                 pooled_predictions = full_activations[:, -1, :]
 
         elif pooling == "mean":
@@ -342,8 +380,6 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         self,
         predicted_activations: torch.Tensor,
         target_activations: torch.Tensor,
-        response_mask: Optional[torch.Tensor] = None,
-        pooling: str = "last"
     ) -> torch.Tensor:
         """
         Compute MSE loss between predicted and target activations.
@@ -387,7 +423,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         # Compute predictions using parent's forward logic
         full_activations = self._compute_values_internal(data, enable_grads=True)
-        predicted_activations = self.extract_predicted_activations(full_activations, response_mask, pooling=self.config.get("pooling_strategy", "last"))
+        predicted_activations = self.extract_predicted_activations(full_activations, data.batch["response_mask"], pooling=self.config.get("pooling_strategy", "last"))
 
         # Get response mask if available
         response_mask = data.batch.get("response_mask", None)
@@ -396,7 +432,6 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         loss = self.compute_activation_loss(
             predicted_activations,
             target_activations.to(device=predicted_activations.device, dtype=predicted_activations.dtype),
-            response_mask.to(predicted_activations.device) if response_mask is not None else None,
         )
 
         # Backward pass
@@ -421,15 +456,21 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             # Compute average norm of target activations (per sample)
             target_norms = torch.norm(target_activations, dim=1)  # (batch,)
             avg_target_norm = target_norms.mean().item()
-            mse_with_zero_pred = nn.functional.mse_loss(torch.zeros_like(predicted_activations), target_activations)
-            mse_with_mean_pred_over_batch = nn.functional.mse_loss(target_activations.mean(dim=0).unsqueeze(0).expand_as(predicted_activations), target_activations)
+            pred_norms = torch.norm(predicted_activations, dim=1)  # (batch,)
+            avg_pred_norm = pred_norms.mean().item()    
+            max_target_norm = target_norms.max().item()
+            mse_with_zero_pred = nn.functional.mse_loss(torch.zeros_like(predicted_activations).to(target_activations.device), target_activations).item()
+            mse_with_mean_pred_over_batch = nn.functional.mse_loss(target_activations.mean(dim=0).unsqueeze(0).expand_as(predicted_activations), target_activations).item()
 
             metrics["pred_activation_mean"] = pred_mean
             metrics["pred_activation_std"] = pred_std
             metrics["target_activation_mean"] = target_mean
             metrics["target_activation_std"] = target_std
             metrics["target_activation_avg_norm"] = avg_target_norm
-            metrics["mse_with_zero_pred"] = mse_with_zero_pred.item()
+            metrics["target_activation_max_norm"] = max_target_norm
+            metrics["pred_activation_avg_norm"] = avg_pred_norm
+            metrics["mse_with_zero_pred"] = mse_with_zero_pred
+            metrics["mse_with_mean_pred_over_batch"] = mse_with_mean_pred_over_batch
 
             # Normalized MSE: mse / (average_norm^2)
             # This gives reconstruction error relative to the typical activation magnitude
@@ -442,13 +483,13 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 metrics["normalized_mse"] = float('inf')
             
             if mse_with_zero_pred > 0:
-                normalized_mse_with_zero_pred = loss.item() / (mse_with_zero_pred)
+                normalized_mse_with_zero_pred = loss.item() / mse_with_zero_pred
                 metrics["normalized_mse_by_zero"] = normalized_mse_with_zero_pred
             else:
                 metrics["normalized_mse_by_zero"] = float('inf')
 
             if mse_with_mean_pred_over_batch > 0:
-                normalized_mse_with_mean_pred_over_batch = loss.item() / (mse_with_mean_pred_over_batch)
+                normalized_mse_with_mean_pred_over_batch = loss.item() / mse_with_mean_pred_over_batch
                 metrics["normalized_mse_by_mean_pred_over_batch"] = normalized_mse_with_mean_pred_over_batch
             else:
                 metrics["normalized_mse_by_mean_pred_over_batch"] = float('inf')

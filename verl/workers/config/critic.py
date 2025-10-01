@@ -194,6 +194,7 @@ class FSDPCriticConfig(CriticConfig):
     forward_micro_batch_size_per_gpu: int = 1
     ulysses_sequence_parallel_size: int = 1
     grad_clip: float = 1.0
+    output_layer_index: Optional[int] = None # added for NLA
 
     def __post_init__(self):
         """Validate FSDP critic configuration parameters."""

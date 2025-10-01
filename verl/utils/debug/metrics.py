@@ -78,6 +78,10 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_probs_diff_mean": mean value of logprob diff of rollout vs. actor
             "training/rollout_probs_diff_std": std value of logprob diff of rollout vs. actor
             "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
+            "training/kl_k3_rollout_vs_recomputed_mean": mean k3 KL estimator between rollout and recomputed
+            "training/kl_k3_rollout_vs_recomputed_max": max k3 KL estimator between rollout and recomputed
+            "training/kl_k3_rollout_vs_recomputed_std": std k3 KL estimator between rollout and recomputed
+            "training/kl_k3_rollout_vs_recomputed_sum": sum k3 KL estimator between rollout and recomputed
     """
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
@@ -100,10 +104,26 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     response_mask_bool = response_mask.bool()
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+
+    # k3 KL divergence estimator for sampled tokens
+    # For samples x ~ q (rollout policy), r = p(x)/q(x) (recomputed/rollout ratio)
+    # k3 = (r - 1) - log(r)
+    # Note: Both rollout_log_probs and actor_old_log_probs are aligned:
+    #   - rollout: SGLang's input_token_logprobs[1:] gives log P(token_i | context)
+    #   - actor: slices [-response_length-1:-1] after rolling inputs, also gives log P(token_i | context)
+    log_ratio = actor_old_log_probs - rollout_old_log_probs  # log(p/q)
+    ratio = torch.exp(log_ratio)  # r = p(x)/q(x)
+    k3_kl = (ratio - 1.0) - log_ratio  # k3 estimator
+    k3_kl_masked = torch.masked_select(k3_kl, response_mask_bool)
+
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
+        "training/kl_k3_rollout_vs_recomputed_mean": torch.mean(k3_kl_masked).detach().item() if k3_kl_masked.numel() > 0 else 0.0,
+        "training/kl_k3_rollout_vs_recomputed_max": torch.max(k3_kl_masked).detach().item() if k3_kl_masked.numel() > 0 else 0.0,
+        "training/kl_k3_rollout_vs_recomputed_std": torch.std(k3_kl_masked).detach().item() if k3_kl_masked.numel() > 0 else 0.0,
+        "training/kl_k3_rollout_vs_recomputed_sum": torch.sum(k3_kl_masked).detach().item() if k3_kl_masked.numel() > 0 else 0.0,
     }

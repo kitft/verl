@@ -457,9 +457,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        # NLAs - add a maximum clip value to the entropy bonus to prevent it from being too large
+                        entropy_clipped_above = torch.clamp(entropy_loss, max=0.8)
 
                         # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        policy_loss = pg_loss - entropy_coeff * entropy_clipped_above
                     else:
                         policy_loss = pg_loss
 
