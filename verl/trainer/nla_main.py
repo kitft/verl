@@ -5,6 +5,8 @@ Based on main_ppo.py but adapted for NLA with autoencoder critic.
 """
 
 import os
+import sys
+import shlex
 import re
 import socket
 from collections.abc import Iterable
@@ -84,6 +86,14 @@ def _convert_fsdp_to_hf_if_needed(model_path: str) -> str:
     return str(path)
 
 
+def _detect_model_init_type(model_path: str) -> Optional[str]:
+    """Detect if model is randomly initialized."""
+    path_str = str(model_path).lower()
+    if "random" in path_str:
+        return "random"
+    return None
+
+
 def _detect_profile_label(config) -> Optional[str]:
     """Return a profile label (currently only distinguishes the tiny preset)."""
     # Check model name
@@ -153,14 +163,21 @@ def _extract_base_model_name(model_path: str) -> Optional[str]:
 
 def _build_experiment_name(config, user_label: Optional[str]) -> str:
     """Construct a descriptive run name for tracking backends."""
+    from datetime import datetime
+
     model_path = config.actor_rollout_ref.model.path
     model_id = _extract_base_model_name(str(model_path))
 
     # Get training mode from NLA config (actor or critic focus)
     mode = config.get("nla", {}).get("train_mode", "rl")
 
+    model_init_type = _detect_model_init_type(str(model_path))
     profile_label = _detect_profile_label(config)
     dataset_variant = _detect_dataset_variant(config.data.train_files)
+
+    # Add timestamp (MM-DD_HHMMSS format, coordinated with rollout_data_dir)
+    now = datetime.now()
+    timestamp = now.strftime("%m-%d_%H%M%S")
 
     components: List[str] = []
     seen = set()
@@ -173,9 +190,11 @@ def _build_experiment_name(config, user_label: Optional[str]) -> str:
 
     add_component(model_id, fallback="model")
     add_component(mode, fallback="rl")
+    add_component(model_init_type)
     add_component(profile_label)
     add_component(dataset_variant)
     add_component(user_label)
+    add_component(timestamp)  # Always add timestamp at the end
 
     return "-".join(components)
 
@@ -209,6 +228,13 @@ def main(config):
 
 def run_nla_grpo(config) -> None:
     """Initialize Ray cluster and run distributed NLA GRPO training process."""
+
+    # Record launch command and CWD for tracking
+    from omegaconf import open_dict
+    launch_cmd = " ".join([shlex.quote(sys.executable)] + [shlex.quote(a) for a in sys.argv])
+    with open_dict(config.trainer):
+        config.trainer.launch_command = launch_cmd
+        config.trainer.launch_cwd = os.getcwd()
 
     # Auto-convert FSDP checkpoints to HuggingFace format if needed
     print("Checking model paths for FSDP→HF conversion...")
@@ -429,8 +455,8 @@ class NLATaskRunner:
         else:
             train_sampler = SequentialSampler(data_source=train_dataset)
 
-        # Create collate function
-        from verl.utils.dataset.rl_dataset import collate_fn
+        # Create NLA collate function that preserves activation_vectors
+        from verl.nla.data.nla_rl_dataset import nla_collate_fn as collate_fn
 
         # NOTE: GRPOTrainerConfig is not used - all GRPO logic is in the base fit() routine
         # The only config needed is:

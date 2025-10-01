@@ -957,6 +957,23 @@ class SGLangRollout(BaseRollout):
         request_sampling_params.update(kwargs)
 
         if self._tp_rank == 0:
+            # TEMPORARY DEBUG: Show what's being passed to SGLang engine
+            print("=" * 80)
+            print("SGLANG ROLLOUT: About to call async_generate")
+            print(f"  prompt: {None}")
+            print(f"  input_ids: {type(engine_input_ids)}, len={len(engine_input_ids) if engine_input_ids else 0}")
+            if engine_input_ids:
+                print(f"    first sample: {type(engine_input_ids[0])}, len={len(engine_input_ids[0]) if engine_input_ids[0] else 0}")
+            print(f"  input_embeds: {type(engine_input_embeds)}")
+            if engine_input_embeds:
+                print(f"    len={len(engine_input_embeds)}, first sample type={type(engine_input_embeds[0])}")
+                if engine_input_embeds[0] is not None:
+                    import torch
+                    if isinstance(engine_input_embeds[0], (list, torch.Tensor)):
+                        shape = len(engine_input_embeds[0]) if isinstance(engine_input_embeds[0], list) else engine_input_embeds[0].shape
+                        print(f"    first sample shape/len={shape}")
+            print("=" * 80)
+
             loop = asyncio.get_event_loop()
             output = loop.run_until_complete(
                 self._engine.async_generate(

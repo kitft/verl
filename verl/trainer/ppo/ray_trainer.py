@@ -329,12 +329,15 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
         )
 
-        # Add timestamp to rollout_data_dir if configured
+        # Add experiment name to rollout_data_dir if configured
         if self.config.trainer.get("rollout_data_dir", None):
             from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            now = datetime.now()
+            date_dir = now.strftime("%m-%d")  # e.g., "10-01"
             base_dir = self.config.trainer.rollout_data_dir
-            self.config.trainer.rollout_data_dir = f"{base_dir}_{timestamp}"
+            experiment_name = self.config.trainer.experiment_name
+            # Organize by date folder, experiment_name already contains full timestamp (MM-DD_HHMMSS)
+            self.config.trainer.rollout_data_dir = f"{base_dir}/{date_dir}/{experiment_name}"
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -1277,6 +1280,16 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
+
+                # Check for stop signal from tracking backends (e.g., wandb)
+                if logger.should_stop():
+                    print("Received stop signal from tracking backend. Saving checkpoint and stopping training...")
+                    if self.config.trainer.save_freq > 0:
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint()
+                    pprint(f"Training stopped at step {self.global_steps}. Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

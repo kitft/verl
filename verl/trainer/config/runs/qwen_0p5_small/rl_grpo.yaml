@@ -11,14 +11,17 @@ actor_rollout_ref:
     enable_gradient_checkpointing: false
     use_shm: false
   actor:
-    ppo_micro_batch_size_per_gpu: 2
+    ppo_micro_batch_size_per_gpu: 32
+    ppo_mini_batch_size: 32
     optim:
       lr: 1e-5
-      weight_decay: 0.01
+      weight_decay: 0.001 # reduced from 0.01
       lr_warmup_steps: 50
+    fsdp_config:
+      model_dtype: bf16
 
 critic:
-  ppo_micro_batch_size_per_gpu: 2
+  ppo_micro_batch_size_per_gpu: 32
   model:
     path: Qwen/Qwen2.5-0.5B-Instruct
     trust_remote_code: true
@@ -27,21 +30,21 @@ critic:
       model_dtype: bf16
   optim:
     lr: 1e-9
-    weight_decay: 0.01
+    weight_decay: 0.001 # reduced from 0.01
     lr_warmup_steps: 50
 
 trainer:
   total_training_steps: 1000
-  ppo_mini_batch_size: 8
-  ppo_epochs: 2
-  steps_per_update: 2
+  ppo_mini_batch_size: 32
+  ppo_epochs: 1
+  steps_per_update: 1
   project_name: nla-rl
   experiment_name: qwen-small-canonical
   logger: ["console", "wandb"]
   resume_mode: disable
   log_val_generations: 10  # Log 10 validation samples to wandb
   test_freq: 10  # Run validation every 10 steps
-  rollout_data_dir: ./rollout_outputs/qwen_small_canonical  # Dump rollouts to disk
+  rollout_data_dir: ./rollout_outputs  # Dump rollouts to disk
   
 ray_kwargs:
   ray_init:

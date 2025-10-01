@@ -56,7 +56,7 @@ prompt:
   messages:
     - role: user
       template: |
-        Explain the following text {injection_token}
+        Explain the following: <concept>{injection_token}</concept>
 
 response:
   template: "{processed_response}"

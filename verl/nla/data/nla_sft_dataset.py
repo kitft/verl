@@ -89,6 +89,57 @@ class NLASFTDataset(SFTDataset):
 
             self.activation_vectors.append(vec)
 
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a training sample.
+
+        Returns different formats based on training mode:
+        - actor: Sample with injection token and activation vector
+        - critic: Sample with response and target activation
+        - both: Combined sample with all fields
+        """
+        if self.mode == "actor":
+            return self._prepare_actor_sample(idx)
+        elif self.mode == "critic":
+            return self._prepare_critic_sample(idx)
+        elif self.mode == "both":
+            # Combine both actor and critic samples
+            actor_sample = self._prepare_actor_sample(idx)
+            critic_sample = self._prepare_critic_sample(idx)
+
+            # Merge samples, with critic fields prefixed
+            combined_sample = actor_sample.copy()
+            combined_sample.update({
+                "response_ids": critic_sample["response_ids"],
+                "response_attention_mask": critic_sample["response_attention_mask"],
+            })
+            return combined_sample
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _get_raw_prompt(self, idx: int) -> str:
+        """
+        Extract raw prompt content from the prompt field.
+
+        The prompt field is an array of message objects. We extract the first
+        'user' role message content as the raw prompt.
+        """
+        prompt_data = self.prompts[idx]
+
+        # Handle numpy array or list
+        if hasattr(prompt_data, 'tolist'):
+            prompt_data = prompt_data.tolist()
+        elif isinstance(prompt_data, str):
+            # Already a string, return as-is
+            return prompt_data
+
+        # Extract user message content
+        for msg in prompt_data:
+            if isinstance(msg, dict) and msg.get('role') == 'user':
+                return msg.get('content', '').strip()
+
+        raise ValueError(f"No user message found in prompt at index {idx}")
+
     def _prepare_actor_sample(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Prepare sample for actor training with activation injection.
@@ -96,8 +147,19 @@ class NLASFTDataset(SFTDataset):
         The prompt should contain the injection token where the activation
         vector should be injected.
         """
-        # Get base sample from parent class
-        sample = super().__getitem__(idx)
+        # Extract raw prompt content instead of using pre-formatted prompt_text
+        raw_prompt = self._get_raw_prompt(idx)
+
+        # Temporarily replace prompt with raw content for parent processing
+        original_prompt = self.prompts[idx]
+        self.prompts[idx] = raw_prompt
+
+        try:
+            # Get base sample from parent class (will apply chat template correctly)
+            sample = super().__getitem__(idx)
+        finally:
+            # Restore original prompt
+            self.prompts[idx] = original_prompt
 
         # Attach activation vector
         sample["activation_vectors"] = self.activation_vectors[idx]
@@ -117,13 +179,8 @@ class NLASFTDataset(SFTDataset):
         """
         Prepare sample for critic training.
 
-        The critic needs:
-        - response_ids: The generated response tokens
-        - response_attention_mask: Attention mask for the response
-        - target_activations: The target activation vector to predict
+        The critic only needs the response text to predict activation vectors.
         """
-        # Get the raw prompt and response
-        prompt = self.prompts[idx]
         response = self.responses[idx]
 
         # Tokenize response only
@@ -138,21 +195,11 @@ class NLASFTDataset(SFTDataset):
         )
 
         sample = {
-            "response_ids": response_output["input_ids"][0],
-            "response_attention_mask": response_output["attention_mask"][0],
+            "input_ids": response_output["input_ids"][0],
+            "attention_mask": response_output["attention_mask"][0],
             "activation_vectors": self.activation_vectors[idx],  # Target for critic
         }
 
-        # Also include full sequence for potential joint training
-        full_sample = super().__getitem__(idx)
-        sample.update({
-            "input_ids": full_sample["input_ids"],
-            "attention_mask": full_sample["attention_mask"],
-            "loss_mask": full_sample["loss_mask"],
-        })
-
-        # Skip metadata attachment for now to avoid TensorDict batch issues
-        # sample = self._attach_metadata(idx, sample)
         return sample
 
     def _attach_metadata(self, idx: int, sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -185,34 +232,6 @@ class NLASFTDataset(SFTDataset):
         sample["extra_info"] = extra_info
 
         return sample
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a training sample.
-
-        Returns different formats based on training mode:
-        - actor: Sample with injection token and activation vector
-        - critic: Sample with response and target activation
-        - both: Combined sample with all fields
-        """
-        if self.mode == "actor":
-            return self._prepare_actor_sample(idx)
-        elif self.mode == "critic":
-            return self._prepare_critic_sample(idx)
-        elif self.mode == "both":
-            # Combine both actor and critic samples
-            actor_sample = self._prepare_actor_sample(idx)
-            critic_sample = self._prepare_critic_sample(idx)
-
-            # Merge samples, with critic fields prefixed
-            combined_sample = actor_sample.copy()
-            combined_sample.update({
-                "response_ids": critic_sample["response_ids"],
-                "response_attention_mask": critic_sample["response_attention_mask"],
-            })
-            return combined_sample
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
 
 
 class NLASFTCollator:

@@ -238,10 +238,8 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         predicted_activations = self._compute_values_internal(data, enable_grads=False)
 
         # Extract target activations from data (batch, hidden_dim)
-        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data)
-
-        if target_activations is None:
-            raise ValueError("Target activation vectors missing from DataProto")
+        # raise_on_missing=True ensures we fail fast if activations are missing
+        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data, raise_on_missing=True)
 
         # Ensure target is a tensor on the correct device
         if not isinstance(target_activations, torch.Tensor):
@@ -257,6 +255,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             )
 
         # Broadcast target to all tokens: (batch, 1, hidden_dim) -> (batch, seq_len, hidden_dim)
+        # Note: For GRPO, activation_vectors are automatically repeated by batch.repeat() in the trainer
         target_expanded = target_activations.unsqueeze(1).expand_as(predicted_activations)
 
         # Compute MSE per token and average over hidden dimension
@@ -290,6 +289,55 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Note: activation_vectors remain in data.batch and will be available to update_critic
         return values
 
+    def extract_predicted_activations(self, full_activations: torch.Tensor, response_mask: Optional[torch.Tensor] = None, pooling: str = "last") -> torch.Tensor:
+        """
+        Args:
+            full_activations: (batch, seq_len, hidden_size)
+            response_mask: Optional mask for valid tokens
+            pooling: How to pool sequence predictions ("last", "mean", "max")
+
+        Returns:
+            Predicted activations tensor (batch, hidden_size)
+        Extract predicted activations from the full activations tensor.
+        """
+        batch_size = full_activations.shape[0]
+
+        # Pool the sequence dimension based on strategy
+        if pooling == "last":
+            # Take the last token's prediction
+            if response_mask is not None:
+                # Find last valid token for each sequence
+                last_indices = response_mask.sum(dim=1) - 1  # (batch,)
+                last_indices = last_indices.clamp(min=0)
+
+                # Gather predictions at last positions
+                pooled_predictions = full_activations[
+                    torch.arange(batch_size), last_indices
+                ]  # (batch, activation_dim)
+            else:
+                pooled_predictions = full_activations[:, -1, :]
+
+        elif pooling == "mean":
+            if response_mask is not None:
+                # Masked mean over sequence
+                mask_expanded = response_mask.unsqueeze(-1)  # (batch, seq_len, 1)
+                pooled_predictions = (full_activations * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+            else:
+                pooled_predictions = full_activations.mean(dim=1)
+
+        elif pooling == "max":
+            if response_mask is not None:
+                # Set masked positions to very negative value before max
+                mask_expanded = response_mask.unsqueeze(-1)
+                masked_predictions = full_activations.masked_fill(~mask_expanded.bool(), -1e9)
+                pooled_predictions, _ = masked_predictions.max(dim=1)
+            else:
+                pooled_predictions, _ = full_activations.max(dim=1)
+        else:
+            raise ValueError(f"Unknown pooling strategy: {pooling}")
+
+        return pooled_predictions
+
     def compute_activation_loss(
         self,
         predicted_activations: torch.Tensor,
@@ -301,7 +349,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         Compute MSE loss between predicted and target activations.
 
         Args:
-            predicted_activations: (batch, seq_len, hidden_size)
+            predicted_activations: (batch, hidden_size)
             target_activations: (batch, hidden_size)
             response_mask: Optional mask for valid tokens
             pooling: How to pool sequence predictions ("last", "mean", "max")
@@ -309,44 +357,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         Returns:
             MSE loss scalar
         """
-        batch_size = predicted_activations.shape[0]
-
-        # Pool the sequence dimension based on strategy
-        if pooling == "last":
-            # Take the last token's prediction
-            if response_mask is not None:
-                # Find last valid token for each sequence
-                last_indices = response_mask.sum(dim=1) - 1  # (batch,)
-                last_indices = last_indices.clamp(min=0)
-
-                # Gather predictions at last positions
-                pooled_predictions = predicted_activations[
-                    torch.arange(batch_size), last_indices
-                ]  # (batch, activation_dim)
-            else:
-                pooled_predictions = predicted_activations[:, -1, :]
-
-        elif pooling == "mean":
-            if response_mask is not None:
-                # Masked mean over sequence
-                mask_expanded = response_mask.unsqueeze(-1)  # (batch, seq_len, 1)
-                pooled_predictions = (predicted_activations * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
-            else:
-                pooled_predictions = predicted_activations.mean(dim=1)
-
-        elif pooling == "max":
-            if response_mask is not None:
-                # Set masked positions to very negative value before max
-                mask_expanded = response_mask.unsqueeze(-1)
-                masked_predictions = predicted_activations.masked_fill(~mask_expanded.bool(), -1e9)
-                pooled_predictions, _ = masked_predictions.max(dim=1)
-            else:
-                pooled_predictions, _ = predicted_activations.max(dim=1)
-        else:
-            raise ValueError(f"Unknown pooling strategy: {pooling}")
 
         # Compute MSE loss
-        mse_loss = nn.functional.mse_loss(pooled_predictions, target_activations)
+        mse_loss = nn.functional.mse_loss(predicted_activations, target_activations)
 
         return mse_loss
 
@@ -369,12 +382,12 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Extract target activations from data
-        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data)
-        if target_activations is None:
-            raise ValueError("activation_vectors must be provided in data.batch for NLA critic training")
+        # raise_on_missing=True ensures we fail fast if activations are missing
+        target_activations = self.adapter.extract_activation_vectors_from_dataproto(data, raise_on_missing=True)
 
         # Compute predictions using parent's forward logic
-        predicted_activations = self._compute_values_internal(data, enable_grads=True)
+        full_activations = self._compute_values_internal(data, enable_grads=True)
+        predicted_activations = self.extract_predicted_activations(full_activations, response_mask, pooling=self.config.get("pooling_strategy", "last"))
 
         # Get response mask if available
         response_mask = data.batch.get("response_mask", None)
@@ -384,7 +397,6 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             predicted_activations,
             target_activations.to(device=predicted_activations.device, dtype=predicted_activations.dtype),
             response_mask.to(predicted_activations.device) if response_mask is not None else None,
-            pooling=self.config.get("pooling_strategy", "last")
         )
 
         # Backward pass
@@ -409,12 +421,15 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             # Compute average norm of target activations (per sample)
             target_norms = torch.norm(target_activations, dim=1)  # (batch,)
             avg_target_norm = target_norms.mean().item()
+            mse_with_zero_pred = nn.functional.mse_loss(torch.zeros_like(predicted_activations), target_activations)
+            mse_with_mean_pred_over_batch = nn.functional.mse_loss(target_activations.mean(dim=0).unsqueeze(0).expand_as(predicted_activations), target_activations)
 
             metrics["pred_activation_mean"] = pred_mean
             metrics["pred_activation_std"] = pred_std
             metrics["target_activation_mean"] = target_mean
             metrics["target_activation_std"] = target_std
             metrics["target_activation_avg_norm"] = avg_target_norm
+            metrics["mse_with_zero_pred"] = mse_with_zero_pred.item()
 
             # Normalized MSE: mse / (average_norm^2)
             # This gives reconstruction error relative to the typical activation magnitude
@@ -425,5 +440,17 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 metrics["normalized_mse"] = normalized_mse
             else:
                 metrics["normalized_mse"] = float('inf')
+            
+            if mse_with_zero_pred > 0:
+                normalized_mse_with_zero_pred = loss.item() / (mse_with_zero_pred)
+                metrics["normalized_mse_by_zero"] = normalized_mse_with_zero_pred
+            else:
+                metrics["normalized_mse_by_zero"] = float('inf')
+
+            if mse_with_mean_pred_over_batch > 0:
+                normalized_mse_with_mean_pred_over_batch = loss.item() / (mse_with_mean_pred_over_batch)
+                metrics["normalized_mse_by_mean_pred_over_batch"] = normalized_mse_with_mean_pred_over_batch
+            else:
+                metrics["normalized_mse_by_mean_pred_over_batch"] = float('inf')
 
         return metrics

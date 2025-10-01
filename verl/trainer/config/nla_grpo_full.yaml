@@ -34,6 +34,7 @@ trainer:
 
 actor_rollout_ref:
   hybrid_engine: true
+  nla: ${nla}
   model:
     path: "yujiepan/gemma-2-tiny-random"
     use_shm: false
@@ -41,8 +42,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: false
   actor:
     strategy: fsdp2  # fsdp2 fixes pidfd_getfd crash with SGLang weight updates
-    ppo_mini_batch_size: 2
-    ppo_micro_batch_size_per_gpu: 2
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 32
     use_kl_loss: false
     optim:
       lr: 1e-5
@@ -51,8 +52,8 @@ actor_rollout_ref:
   rollout:
     name: "nla_sglang"
     mode: "sync"
-    n: 2  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
-    log_prob_micro_batch_size_per_gpu: 2
+    n: 4  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
+    log_prob_micro_batch_size_per_gpu: 32
     tensor_model_parallel_size: 1
     disable_radix_cache: true
     gpu_memory_utilization: 0.4
@@ -66,7 +67,7 @@ actor_rollout_ref:
 critic:
   enable: true
   strategy: fsdp2  # fsdp2 fixes pidfd_getfd crash with SGLang weight updates
-  ppo_micro_batch_size_per_gpu: 2
+  ppo_micro_batch_size_per_gpu: 32
   model:
     path: "yujiepan/gemma-2-tiny-random"
     trust_remote_code: true
@@ -86,7 +87,7 @@ algorithm:
 
 data:
   train_batch_size: 32
-  micro_batch_size_per_gpu: 4
+  micro_batch_size_per_gpu: 32
   val_batch_size: 32
   batch_size: 32
   max_prompt_length: 128

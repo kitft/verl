@@ -6,6 +6,7 @@ from verl.protocol import DataProto
 from verl.workers.fsdp_workers import ActorRolloutRefWorker as FSDPActorRolloutRefWorker
 from verl.single_controller.base.decorator import register, Dispatch, make_nd_compute_dataproto_dispatch_fn
 from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
+from ..utils.injection_manager import InjectionTokenManager
 
 
 class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
@@ -19,73 +20,101 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         """Initialize model with NLA wrapper."""
+        print("=" * 80)
+        print("NLA ACTOR WORKER: init_model() called")
+        print("=" * 80)
+
         # First call parent's init_model to set up the base model
         super().init_model()
+
+        print(f"NLA ACTOR: After super().init_model(), has rollout: {hasattr(self, 'rollout')}")
+        print(f"NLA ACTOR: Config has nla: {hasattr(self.config, 'nla')}")
+        if hasattr(self.config, 'nla'):
+            print(f"NLA ACTOR: Config.nla = {self.config.nla}")
 
         # Store reference to the embedding layer for later use
         self._store_embedding_layer()
 
-        # Now wrap the rollout model with NLA capabilities
+        # Now wrap the rollout model with NLA capabilities (if not using SGLang)
         if hasattr(self, 'rollout') and hasattr(self.config, 'nla'):
+            print("NLA ACTOR: Setting up NLA injection configuration")
             # Extract NLA configuration
             nla_config = self.config.get('nla', {})
             injection_config = nla_config.get('injection', {})
+            print(f"NLA ACTOR: injection_config = {injection_config}")
 
             # Configure injection settings
-            injection_cfg = InjectionConfig(
+            self.injection_cfg = InjectionConfig(
                 mode=injection_config.get("mode", "replace"),
                 layer_indices=injection_config.get("layer_indices", [0]),
                 projection_dim=injection_config.get("projection_dim", None),
                 injection_token=injection_config.get("injection_token", None),
             )
 
-            # Get the rollout's module (the actual model)
-            base_model = self.rollout.module
-            hidden_dim = base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None
-            activation_dim = nla_config.get("activation_dim", hidden_dim or 768)
 
-            # Get tokenizer from model config
+            # For SGLang rollout (nla_sglang), we use embedding-based injection
+            # The rollout itself doesn't need wrapping - we prepare input_embeds before calling it
+            rollout_name = self.config.rollout.name if hasattr(self.config, 'rollout') else 'unknown'
+            print(f"NLA ACTOR: Rollout type: {rollout_name}")
+
+            if rollout_name == 'nla_sglang':
+                print("NLA ACTOR: Using SGLang with embedding-based injection (no rollout wrapping needed)")
+                # Store injection config for use in generate_sequences
+                self.nla_injection_mode = 'embedding'
+            elif hasattr(self.rollout, 'module'):
+                # For other rollouts that have a module attribute (e.g., HF rollout)
+                print("NLA ACTOR: Wrapping rollout module with NLA capabilities")
+                base_model = self.rollout.module
+                hidden_dim = base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None
+                activation_dim = nla_config.get("activation_dim", hidden_dim or 768)
+
+                # Get tokenizer from model config
+                tokenizer = self.model_config.tokenizer if hasattr(self, 'model_config') else None
+
+                # Wrap rollout's module with NLA wrapper
+                self.nla_wrapper = NLAModelWrapper(
+                    base_model=base_model,
+                    tokenizer=tokenizer,
+                    injection_config=self.injection_cfg,
+                    hidden_dim=hidden_dim,
+                    activation_dim=activation_dim,
+                )
+
+                # Replace the rollout's module with the wrapped version
+                self.rollout.module = self.nla_wrapper
+                self.nla_injection_mode = 'wrapper'
+
+                print(f"Wrapped rollout model with NLAModelWrapper")
+                print(f"Injection token: '{self.nla_wrapper.injection_config.injection_character}' (ID: {self.nla_wrapper.injection_config.injection_token_id})")
+            else:
+                print(f"WARNING: Rollout type '{rollout_name}' doesn't have a module attribute and isn't nla_sglang")
+                self.nla_injection_mode = 'unknown'
+
+            
             tokenizer = self.model_config.tokenizer if hasattr(self, 'model_config') else None
-
-            # Wrap rollout's module with NLA wrapper
-            self.nla_wrapper = NLAModelWrapper(
-                base_model=base_model,
-                tokenizer=tokenizer,
-                injection_config=injection_cfg,
-                hidden_dim=hidden_dim,
-                activation_dim=activation_dim,
+            if tokenizer is not None:
+                # Use InjectionTokenManager for consistent token selection
+                injection_manager = InjectionTokenManager(tokenizer, self.injection_cfg.injection_token)
+                # Update injection config with auto-selected token info
+                self.injection_cfg.injection_token_id = injection_manager.token_id
+                self.injection_cfg.injection_character = injection_manager.character
+                object.__setattr__(self, "injection_manager", injection_manager)
+            elif self.injection_cfg.injection_token_id is not None and self.injection_cfg.injection_token_id >= 0:
+                # Token ID was manually specified - use it directly
+                object.__setattr__(self, "injection_manager", None)
+            else:
+                raise ValueError(
+                    "Either provide a tokenizer for auto-selection or specify injection_token_id in config. "
+                    "The tokenizer ensures consistency with the dataset's injection token."
             )
-
-            # Replace the rollout's module with the wrapped version
-            self.rollout.module = self.nla_wrapper
-
-            print(f"Wrapped rollout model with NLAModelWrapper")
-            print(f"Injection token: '{self.nla_wrapper.injection_config.injection_character}' (ID: {self.nla_wrapper.injection_config.injection_token_id})")
 
         # Also wrap actor model if it exists (for compute_log_prob)
         if hasattr(self, 'actor') and hasattr(self.config, 'nla'):
-            # Reuse the same wrapper config
-            base_actor_model = self.actor.model if hasattr(self.actor, 'model') else self.actor
-
-            # Create a separate wrapper for the actor model
-            self.actor_nla_wrapper = NLAModelWrapper(
-                base_model=base_actor_model,
-                tokenizer=tokenizer if 'tokenizer' in locals() else self.model_config.tokenizer,
-                injection_config=injection_cfg if 'injection_cfg' in locals() else InjectionConfig(
-                    mode=self.config.get('nla', {}).get('injection', {}).get("mode", "replace"),
-                    layer_indices=self.config.get('nla', {}).get('injection', {}).get("layer_indices", [0]),
-                ),
-                hidden_dim=base_actor_model.config.hidden_size if hasattr(base_actor_model.config, 'hidden_size') else None,
-                activation_dim=self.config.get('nla', {}).get("activation_dim", 768),
-            )
-
-            # Replace actor's model with wrapped version
-            if hasattr(self.actor, 'model'):
-                self.actor.model = self.actor_nla_wrapper
-            else:
-                self.actor = self.actor_nla_wrapper
-
-            print(f"Wrapped actor model with NLAModelWrapper for log prob computation")
+            print("NLA ACTOR: Setting up actor model for NLA (for log prob computation)")
+            # For now, we don't wrap the actor model - we'll handle activation injection
+            # in compute_log_prob by passing activation_vectors through the data
+            # This is simpler and doesn't require wrapping the FSDP model
+            print("NLA ACTOR: Actor model wrapping skipped (using data-based injection for log probs)")
 
     def _store_embedding_layer(self):
         """Store reference to the model's embedding layer for input embedding computation."""
@@ -147,19 +176,40 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         if self.embed_layer is None:
             raise RuntimeError("Embedding layer not available. Cannot compute input embeddings.")
 
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed._tensor import DTensor
+
         target_device = self.embed_layer.weight.device if hasattr(self.embed_layer, "weight") else None
         if target_device is not None:
             input_ids = input_ids.to(target_device)
 
         with torch.no_grad():
-            input_embeds = self.embed_layer(input_ids)
+            # Check if embedding weight is sharded (DTensor from FSDP)
+            if isinstance(self.embed_layer.weight, DTensor):
+                # All-gather just the embedding weights for full embeddings
+                full_weight = self.embed_layer.weight.full_tensor()
+                # Manually do embedding lookup with gathered weights
+                input_embeds = torch.nn.functional.embedding(
+                    input_ids,
+                    full_weight,
+                    padding_idx=getattr(self.embed_layer, 'padding_idx', None)
+                )
+            else:
+                # Regular embedding layer (not sharded)
+                input_embeds = self.embed_layer(input_ids)
 
         activation_vectors = activation_vectors.to(input_embeds.device)
         batch_size = activation_vectors.shape[0]
         injection_positions = torch.ones(batch_size, dtype=torch.long, device=activation_vectors.device)
 
-        if hasattr(self, 'nla_wrapper') and self.nla_wrapper.injection_config.injection_token_id is not None:
+        # Check for injection token in the config
+        injection_token_id = None
+        if hasattr(self, 'injection_cfg') and self.injection_cfg.injection_token_id is not None:
+            injection_token_id = self.injection_cfg.injection_token_id
+        elif hasattr(self, 'nla_wrapper') and self.nla_wrapper.injection_config.injection_token_id is not None:
             injection_token_id = self.nla_wrapper.injection_config.injection_token_id
+
+        if injection_token_id is not None:
             injection_mask = (input_ids == injection_token_id)
             if injection_mask.any():
                 injection_positions = injection_mask.float().argmax(dim=1)
@@ -176,11 +226,21 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
             pos = injection_positions[i].item()
             if 0 <= pos < input_embeds.shape[1]:
                 input_embeds[i, pos] = activation_vectors[i]
-                print(f"NLA Actor: Injected activation at position {pos} for sequence {i}")
+                print(f"NLA Actor: Injected activation at position {pos} for sequence {i} at token # input_ids[{i}, {pos}] = {input_ids[i, pos]}, counting left-padding.")
 
-        if input_embeds.is_cuda:
-            print("NLA Actor: Converting input_embeds to CPU for SGLang transmission")
-            input_embeds = input_embeds.cpu()
+        attention_mask = data.batch['attention_mask']
+
+        if attention_mask is None:
+            raise ValueError("Attention mask is required to remove padding vectors.")
+
+        # attention_mask: [batch, seq]
+        # input_embeds: [batch, seq, hidden]
+        input_embeds_list = []
+        for i in range(input_embeds.shape[0]):
+            mask = attention_mask[i].bool()
+            input_embeds_list.append(input_embeds[i][mask].cpu())
+
+        input_embeds = input_embeds_list
 
         return input_embeds
 
@@ -192,14 +252,37 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         For SGLang: Prepares activation vectors and injection positions
         to be used as custom input embeddings.
         """
+        print("=" * 80)
+        print("NLA ACTOR: generate_sequences() called")
+        print("=" * 80)
+        print(f"NLA ACTOR: data.batch type: {type(data.batch)}")
+        print(f"NLA ACTOR: data.batch keys: {list(data.batch.keys()) if data.batch is not None else 'None'}")
+        print(f"NLA ACTOR: data.meta_info keys: {list(data.meta_info.keys()) if data.meta_info is not None else 'None'}")
+
         activation_vectors = self._extract_activation_vectors(data)
+        print(f"NLA ACTOR: Extracted activation_vectors: {activation_vectors.shape if activation_vectors is not None else None}")
+
+        # FAIL FAST: Ensure activation vectors are present
+        if activation_vectors is None:
+            raise ValueError(
+                "NLA Actor Worker: activation_vectors missing from batch! "
+                "NLA training requires activation vectors for all samples. "
+                "Check that the dataset includes 'activation_vectors' and the collate_fn preserves them."
+            )
+
+        # FAIL FAST: Ensure embedding layer is available
+        if self.embed_layer is None:
+            raise RuntimeError(
+                "NLA Actor Worker: embed_layer not initialized! "
+                "Cannot inject activations without access to the model's embedding layer. "
+                "Check that _store_embedding_layer() successfully found the embedding layer during init_model()."
+            )
 
         # Prepare for SGLang embedding-based injection
-        if activation_vectors is not None and self.embed_layer is not None:
-            input_ids = data.batch['input_ids']
-            input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
-            data.batch.update({"input_embeds": input_embeds})
-            print(f"NLA Actor: Prepared input_embeds for SGLang with shape: {input_embeds.shape}")
+        input_ids = data.batch['input_ids']
+        input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
+        data.non_tensor_batch.update({"input_embeds": input_embeds})
+        print(f"NLA Actor: Prepared input_embeds for SGLang with shape: {input_embeds[0].shape}", f"second item shape: {input_embeds[1].shape if len(input_embeds) > 1 else 'None'}")
 
         # elif activation_vectors is not None and self.embed_layer is None:
         #     print("WARNING: Cannot inject activations - embedding layer not available")
@@ -236,7 +319,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         input_ids = data.batch['input_ids']
         input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
-        data.batch.update({"input_embeds": input_embeds})
+        data.non_tensor_batch.update({"input_embeds": input_embeds})
         return data
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

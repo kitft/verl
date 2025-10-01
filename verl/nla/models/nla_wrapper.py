@@ -44,6 +44,9 @@ class NLAModelWrapper(BaseWrapper):
     needed for activation injection.
     """
 
+    # Required by HuggingFace transformers generation utils
+    _is_stateful = False
+
     def __init__(
         self,
         base_model: nn.Module,
@@ -210,8 +213,11 @@ class NLAModelWrapper(BaseWrapper):
         and past_key_values is None (first forward pass in generation).
         """
         # Injection happens only on the first forward pass of generation
-        # (when past_key_values is None) or during a normal forward pass
-        should_inject = activation_vectors is not None and past_key_values is None
+        # Check if past_key_values is None OR empty (newer transformers uses DynamicCache with len=0)
+        is_first_forward = past_key_values is None or (
+            hasattr(past_key_values, '__len__') and len(past_key_values) == 0
+        )
+        should_inject = activation_vectors is not None and is_first_forward
 
         if should_inject:
             if input_ids is None:
@@ -241,11 +247,21 @@ class NLAModelWrapper(BaseWrapper):
         return result
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
-        """Prepare inputs for generation - delegate to base model."""
+        """Prepare inputs for generation - delegate to base model and preserve activation_vectors."""
+        # Extract activation_vectors before delegating (it's not a standard arg)
+        activation_vectors = kwargs.pop("activation_vectors", None)
+
         if hasattr(self.base_model, "prepare_inputs_for_generation"):
-            return self.base_model.prepare_inputs_for_generation(*args, **kwargs)
-        # Minimal default implementation
-        return {"input_ids": kwargs.get("input_ids", args[0] if args else None)}
+            model_inputs = self.base_model.prepare_inputs_for_generation(*args, **kwargs)
+        else:
+            # Minimal default implementation
+            model_inputs = {"input_ids": kwargs.get("input_ids", args[0] if args else None)}
+
+        # Add activation_vectors back to the inputs dict so it gets passed to forward()
+        if activation_vectors is not None:
+            model_inputs["activation_vectors"] = activation_vectors
+
+        return model_inputs
 
     def can_generate(self) -> bool:
         """Check if model can generate."""

@@ -30,11 +30,19 @@ class _ValuesAsRewardsShim:
         self.trainer = trainer
 
     def __call__(self, data: DataProto, return_dict: bool = False):
+        print(f"=== _ValuesAsRewardsShim called ===")
+        print(f"Batch size: {data.batch['input_ids'].shape[0] if 'input_ids' in data.batch else 'N/A'}")
+        print(f"Has activation_vectors: {'activation_vectors' in data.batch}")
+        if 'activation_vectors' in data.batch:
+            print(f"activation_vectors shape: {data.batch['activation_vectors'].shape}")
+
         if "values" not in data.batch:
             # Compute values using critic - returns (batch, seq_len) where values = -MSE (higher is better)
+            print("Computing values via critic...")
             values_output = self.trainer.critic_wg.compute_values(data)
             # Cache values in batch for reuse
             data.batch.update(values_output.batch)
+            print(f"Values computed, shape: {data.batch['values'].shape}")
 
         # Use values as token_level_scores
         token_level_scores = data.batch["values"]
@@ -125,6 +133,32 @@ class NLAGRPOTrainer(RayPPOTrainer):
         if val_reward_fn is None:
             self.val_reward_fn = _ValuesAsRewardsShim(self)
 
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        """Override to include activation_vectors in generation batch."""
+        from collections import defaultdict
+        import numpy as np
+        import torch
+
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # Pop standard keys but NOT activation_vectors (leave them in original batch for critic)
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # Copy activation_vectors to gen_batch (don't pop from original)
+        # Note: activation_vectors will be repeated/expanded along with gen_batch by the base trainer
+        if "activation_vectors" in batch.batch:
+            gen_batch.batch["activation_vectors"] = batch.batch["activation_vectors"]
+
+        # For agent loop, we need reward model keys to compute score.
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
 
     # NOTE: _generate_multiple_trajectories is NOT NEEDED
     # The base fit() already handles N-way generation via rollout.n config parameter.

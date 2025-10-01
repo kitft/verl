@@ -297,3 +297,33 @@ def create_nla_rl_dataset(
     )
 
     return dataset
+
+
+def nla_collate_fn(data_list: list[dict]) -> dict:
+    """
+    NLA-specific collate function that preserves activation_vectors.
+
+    This extends the standard collate_fn to ensure activation_vectors are properly
+    batched and passed through to the workers.
+    """
+    from collections import defaultdict
+    import torch
+    import numpy as np
+
+    tensors = defaultdict(list)
+    non_tensors = defaultdict(list)
+
+    for data in data_list:
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                tensors[key].append(val)
+            else:
+                non_tensors[key].append(val)
+
+    for key, val in tensors.items():
+        tensors[key] = torch.stack(val, dim=0)
+
+    for key, val in non_tensors.items():
+        non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
+
+    return {**tensors, **non_tensors}

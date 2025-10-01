@@ -347,11 +347,15 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
+        # For FSDP2, self.fsdp_model points to inner base_model but we need to call
+        # self.model (the NLAModelWrapper) to get activation injection
+        forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
+
         context = self.sharding_manager if use_sp else nullcontext()
         with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             if not use_sp:
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
+                output = forward_model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -391,7 +395,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 )
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
 
-                output = self.fsdp_model(
+                output = forward_model(
                     input_ids=input_ids_rmpad_sliced,
                     attention_mask=None,
                     position_ids=position_ids_rmpad_padded,

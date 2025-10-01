@@ -152,6 +152,29 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def should_stop(self) -> bool:
+        """Check if training should stop based on backend signals.
+
+        Currently supports wandb stop signals by checking run state via Public API.
+        Returns True if any backend signals that training should stop.
+
+        Returns:
+            bool: True if training should stop, False otherwise.
+        """
+        if "wandb" in self.logger:
+            import wandb
+            if wandb.run is not None and not wandb.run.disabled:
+                try:
+                    # Use Public API to check if run was stopped from UI
+                    # We need to use the API because wandb.run doesn't expose state directly
+                    api = wandb.Api()
+                    api_run = api.run(wandb.run.path)
+                    return api_run.state == "killed"
+                except Exception as e:
+                    # If we can't check the state (e.g., network issues), don't stop training
+                    print(f"Warning: Failed to check wandb run state: {e}")
+        return False
+
     def __del__(self):
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)

@@ -37,12 +37,33 @@ class NLADataProtoAdapter:
         return data_proto
 
     def extract_activation_vectors_from_dataproto(
-        self, data_proto: DataProto
+        self, data_proto: DataProto, raise_on_missing: bool = True
     ) -> Optional[torch.Tensor]:
-        """Extract activation vectors from a DataProto object."""
+        """
+        Extract activation vectors from a DataProto object.
+
+        Args:
+            data_proto: The DataProto to extract from
+            raise_on_missing: If True, raise ValueError when activation_vectors not found.
+                            If False, return None silently (for optional cases).
+
+        Returns:
+            Activation vectors tensor, or None if raise_on_missing=False and not found.
+
+        Raises:
+            ValueError: If raise_on_missing=True and activation_vectors not in batch
+        """
         batch = getattr(data_proto, "batch", None)
         if batch is not None and "activation_vectors" in batch.keys():
             return batch["activation_vectors"]
+
+        if raise_on_missing:
+            available_keys = list(batch.keys()) if batch is not None else []
+            raise ValueError(
+                "NLA DataProto Adapter: 'activation_vectors' not found in DataProto batch! "
+                f"Available batch keys: {available_keys}. "
+                "Ensure the dataset includes activation_vectors and the collate_fn preserves them."
+            )
 
         return None
 

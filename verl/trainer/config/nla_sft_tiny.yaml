@@ -13,7 +13,7 @@ data:
   val_files: data/testing/sft/val_nla_sft_dataset_fineweb_layer10.parquet
 
   # Dataset keys
-  prompt_key: prompt_text
+  prompt_key: prompt  # Use 'prompt' (message array) not 'prompt_text' (pre-formatted string)
   response_key: response
 
   # Custom NLA dataset class

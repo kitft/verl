@@ -16,6 +16,8 @@ actor_rollout_ref:
       lr: 1e-5
       weight_decay: 0.01
       lr_warmup_steps: 50
+    fsdp_config:
+      model_dtype: bf16
 
 critic:
   ppo_micro_batch_size_per_gpu: 2
@@ -41,7 +43,7 @@ trainer:
   resume_mode: disable
   log_val_generations: 10  # Log 10 validation samples to wandb
   test_freq: 10  # Run validation every 10 steps
-  rollout_data_dir: ./rollout_outputs/qwen_tiny_canonical  # Dump rollouts to disk
+  rollout_data_dir: ./rollout_outputs  # Dump rollouts to disk
   
 ray_kwargs:
   ray_init:
