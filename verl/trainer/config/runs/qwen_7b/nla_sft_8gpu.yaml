@@ -1,0 +1,99 @@
+# NLA SFT configuration - 7B Qwen model on 8 GPUs
+# Inherits from sft_trainer and overrides for NLA
+
+defaults:
+  - sft_trainer
+  - _self_
+
+# Data configuration - 8 GPU setup
+data:
+  train_batch_size: 256
+  micro_batch_size_per_gpu: 64
+  train_files: data/q7b/sft/train_nla_sft_dataset_fineweb_layer20.parquet
+  val_files: data/q7b/sft/val_nla_sft_dataset_fineweb_layer20.parquet
+
+  # Dataset keys
+  prompt_key: prompt  # Use 'prompt' (message array) not 'prompt_text' (pre-formatted string)
+  response_key: response
+
+  # Custom NLA dataset class
+  custom_cls:
+    path: verl.nla.data.nla_sft_dataset
+    name: NLASFTDataset
+
+  # activation_dim now determined dynamically from model config
+
+  max_length: 512
+  truncation: error
+  use_shm: false
+
+# Model configuration - 7B Qwen model
+model:
+  partial_pretrain: Qwen/Qwen2.5-7B-Instruct
+  trust_remote_code: true
+  enable_gradient_checkpointing: true
+  use_liger: false
+  strategy: fsdp2
+
+  fsdp_config:
+    model_dtype: bf16
+    wrap_policy:
+      min_num_params: 0
+    cpu_offload: false
+    offload_params: false
+
+# Optimizer configuration
+optim:
+  lr: 5e-5
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.05
+  clip_grad: 1.0
+  lr_scheduler: cosine
+
+# Trainer configuration - 8 GPU setup
+trainer:
+  default_local_dir: checkpoints/nla_sft_qwen_7b_8gpu
+  project_name: null  # Auto-filled from model name + train_mode when unset
+  experiment_name: null
+  total_epochs: 1
+  total_training_steps: null
+  logger: ["console", "wandb"]
+  seed: 42
+  save_freq: -1
+  test_freq: 10
+  nnodes: 1
+  n_gpus_per_node: 8
+  device: cuda
+  resume_mode: disable
+
+  checkpoint:
+    save_contents: ["model", "optimizer", "extra", "hf_model"]  # Include HF model for RL training
+    load_contents: ["model", "optimizer", "extra"]
+
+# Engine configuration (for non-FSDP trainer)
+engine:
+  strategy: fsdp2
+
+# NLA-specific configuration
+nla:
+  # activation_dim now determined dynamically from model's hidden_size
+  train_mode: actor  # "actor" or "critic"
+
+  # Injection configuration for actor
+  injection:
+    mode: replace
+    layer_indices: [0]
+    projection_dim: null
+    injection_token: null  # Let system auto-select
+
+  # Critic model configuration
+  critic:
+    model_path: Qwen/Qwen2.5-7B-Instruct
+    pooling: last
+    dropout: 0.1
+    projection_layers: 2
+
+  # Training settings
+  critic_lr: 2e-5
+  critic_epochs: 3
