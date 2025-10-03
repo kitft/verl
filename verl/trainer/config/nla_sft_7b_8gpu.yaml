@@ -7,8 +7,8 @@ defaults:
 
 # Data configuration - 8 GPU setup
 data:
-  train_batch_size: 512
-  micro_batch_size_per_gpu: 64
+  train_batch_size: 256
+  micro_batch_size_per_gpu: 32 
   train_files: data/q7b/sft/train_nla_sft_dataset_fineweb_layer20.parquet
   val_files: data/q7b/sft/val_nla_sft_dataset_fineweb_layer20.parquet
 
