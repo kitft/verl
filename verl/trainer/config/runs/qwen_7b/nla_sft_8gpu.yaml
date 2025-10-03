@@ -2,7 +2,7 @@
 # Inherits from sft_trainer and overrides for NLA
 
 defaults:
-  - sft_trainer
+  - /sft_trainer
   - _self_
 
 # Data configuration - 8 GPU setup
