@@ -26,6 +26,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
     NLA Critic that extends the standard VERL critic but:
     1. Outputs activation vectors instead of scalar values
     2. Computes MSE loss against target activations
+    3. Optionally prepends a prompt to all inputs (e.g., "summary of the following text: ")
     """
 
     def __init__(
@@ -33,6 +34,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         config,
         critic_module: nn.Module,
         critic_optimizer: optim.Optimizer,
+        tokenizer=None,
     ):
         super().__init__(config, critic_module, critic_optimizer)
         self.logger = logging.getLogger(__name__)
@@ -41,6 +43,58 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         # Initialize NLA adapter for extracting activation vectors
         from verl.nla.integration.dataproto_adapter import NLADataProtoAdapter
         self.adapter = NLADataProtoAdapter()
+
+        # Handle critic prompt configuration
+        self.tokenizer = tokenizer
+        self.critic_prompt_text = getattr(config, 'critic_prompt', None)
+        self.critic_prompt_tokens = None
+        self.critic_prompt_length = 0
+        self._MAX_CRITIC_PROMPT_LENGTH = 128  # Maximum allowed prompt length in tokens
+
+        if self.critic_prompt_text and tokenizer is not None:
+            # Validate non-empty after stripping whitespace
+            if not self.critic_prompt_text.strip():
+                self.logger.warning("Critic prompt is empty or whitespace-only. Ignoring.")
+                self.critic_prompt_tokens = None
+                self.critic_prompt_length = 0
+                self.logger.info("Critic initialized without prompt prefix")
+            else:
+                # Tokenize the prompt once and cache it
+                # Note: add_special_tokens=False is correct here because we're prepending to
+                # raw response tokens, not creating a standalone message. Adding BOS/EOS would
+                # create semantic boundaries mid-sequence.
+                prompt_encoding = tokenizer(
+                    self.critic_prompt_text,
+                    add_special_tokens=False,  # Don't add BOS/EOS mid-sequence
+                    return_tensors='pt'
+                )
+                self.critic_prompt_tokens = prompt_encoding['input_ids'][0]  # (prompt_len,)
+                self.critic_prompt_length = len(self.critic_prompt_tokens)
+
+                # Validate prompt length
+                if self.critic_prompt_length == 0:
+                    self.logger.warning(f"Critic prompt '{self.critic_prompt_text}' tokenized to 0 tokens. Ignoring.")
+                    self.critic_prompt_tokens = None
+                    self.critic_prompt_length = 0
+                elif self.critic_prompt_length > self._MAX_CRITIC_PROMPT_LENGTH:
+                    raise ValueError(
+                        f"Critic prompt is too long ({self.critic_prompt_length} tokens). "
+                        f"Maximum allowed: {self._MAX_CRITIC_PROMPT_LENGTH} tokens. "
+                        f"This limit prevents memory issues and ensures efficient training. "
+                        f"Prompt: '{self.critic_prompt_text[:100]}...'"
+                    )
+                else:
+                    self.logger.info(
+                        f"Initialized critic with prompt: '{self.critic_prompt_text}' "
+                        f"({self.critic_prompt_length} tokens)"
+                    )
+        elif self.critic_prompt_text and tokenizer is None:
+            self.logger.warning(
+                f"Critic prompt '{self.critic_prompt_text}' configured but no tokenizer provided. "
+                "Prompt will be ignored."
+            )
+        else:
+            self.logger.info("Critic initialized without prompt prefix")
 
     def _extract_value_tensor(self, model_outputs: torch.Tensor) -> torch.Tensor:
         """Return activation tensor, preferring explicit value head else hidden states."""
@@ -60,7 +114,13 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         raise ValueError("Critic model output does not contain activation tensor")
 
     def _forward_micro_batch(self, micro_batch):
-        """Run forward pass for a micro batch returning activation vectors."""
+        """Run forward pass for a micro batch returning activation vectors.
+
+        NLA Design Note: Unlike standard PPO critics that process full_prompt + response,
+        the NLA critic intentionally processes ONLY the response text (optionally prefixed
+        with a task-specific critic_prompt). This is because NLA predicts activation vectors
+        from the response content itself, not from the user's original prompt context.
+        """
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
         multi_modal_inputs = {}
@@ -70,39 +130,62 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            # Use only responses as model input
+            # NLA design: Use only responses, not full input_ids (which include user prompt)
+            # This is intentional - we predict activations from response text only
             input_ids = responses
+
+            # Prepend prompt tokens if configured
+            if self.critic_prompt_tokens is not None and self.critic_prompt_length > 0:
+                batch_size = input_ids.shape[0]
+                # Expand prompt to batch size: (batch, prompt_len)
+                prompt_batch = self.critic_prompt_tokens.unsqueeze(0).expand(batch_size, -1).to(input_ids.device)
+                # Concatenate prompt + responses: (batch, prompt_len + response_length)
+                input_ids = torch.cat([prompt_batch, input_ids], dim=1)
+
             batch, seqlen = input_ids.shape
 
-            # Extract attention mask for responses only
+            # Extract attention mask for responses only, then prepend prompt mask if needed
             attention_mask_full = micro_batch["attention_mask"]
             attention_mask = attention_mask_full[:, -response_length:]
 
-            # Create fresh position IDs starting from 0 for responses
+            if self.critic_prompt_tokens is not None and self.critic_prompt_length > 0:
+                # Create attention mask for prompt (all ones)
+                prompt_mask = torch.ones(
+                    (batch, self.critic_prompt_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
+                # Concatenate prompt mask + response mask
+                attention_mask = torch.cat([prompt_mask, attention_mask], dim=1)
+
+            # Create fresh position IDs starting from 0
             # This is needed for Flash Attention which expects position IDs to start from 0
+            # If prompt is prepended, position IDs will span [0, prompt_len + response_len)
             position_ids_full = micro_batch["position_ids"]
             if position_ids_full.dim() == 3:  # qwen2vl mrope
                 # For multi-rope, create position IDs from scratch based on attention mask
                 # Keep the same structure but reset values
                 position_ids_full_transposed = position_ids_full.transpose(0, 1)
                 num_ropes = position_ids_full_transposed.shape[0]
+                # Use seqlen which now includes prompt if present
                 position_ids = torch.zeros(
-                    (num_ropes, batch, response_length),
+                    (num_ropes, batch, seqlen),
                     dtype=position_ids_full.dtype,
                     device=position_ids_full.device
                 )
                 for rope_idx in range(num_ropes):
                     for b_idx in range(batch):
-                        valid_len = attention_mask[b_idx].sum().item()
+                        valid_len = int(attention_mask[b_idx].sum().item())
                         position_ids[rope_idx, b_idx, :valid_len] = torch.arange(
                             valid_len, dtype=position_ids_full.dtype, device=position_ids_full.device
                         )
                 position_ids = position_ids.transpose(0, 1)
             else:
                 # Standard case: create position IDs from 0 based on attention mask
+                # Now attention_mask includes prompt tokens if present
                 position_ids = torch.zeros_like(attention_mask, dtype=torch.long)
                 for b_idx in range(batch):
-                    valid_len = attention_mask[b_idx].sum().item()
+                    valid_len = int(attention_mask[b_idx].sum().item())
                     position_ids[b_idx, :valid_len] = torch.arange(
                         valid_len, dtype=torch.long, device=attention_mask.device
                     )
@@ -163,6 +246,17 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                     output_hidden_states=True,
                 )
                 values = self._extract_value_tensor(outputs)
+
+            # Extract only the response portion if prompt was prepended
+            # values shape: (batch, seqlen, hidden_size) where seqlen = prompt_len + response_len
+            # We need: (batch, response_length, hidden_size)
+            if self.critic_prompt_length > 0:
+                # Simply remove the prompt prefix; response_mask will handle padding
+                # This is simpler and more robust than slicing with response_length
+                values = values[:, self.critic_prompt_length:, :]
+                # Ensure shape matches expected response_length (truncate if needed)
+                if values.shape[1] > response_length:
+                    values = values[:, :response_length, :]
 
         return values
 
@@ -287,8 +381,8 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         )  # (b, H)
         if response_mask.shape != full_activations.shape[:2]:
             raise ValueError(f"Response mask shape {response_mask.shape} does not match full activations shape {full_activations.shape[:2]}")
-        print(f"Number of nonzero elements of response mask of 0th sequence: {response_mask[0].sum().item()}")
-        print(f"first response: {data.batch['responses'][0]}")
+        # print(f"Number of nonzero elements of response mask of 0th sequence: {response_mask[0].sum().item()}")
+        # print(f"first response: {data.batch['responses'][0]}")
 
         # Per-sample MSE on the pooled last token
         mse_per_sample = ((pooled - target_activations) ** 2).mean(dim=-1)  # (b,)
@@ -339,7 +433,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             if response_mask is not None:
                 # Find last valid token for each sequence
                 last_indices = response_mask.sum(dim=1) - 1  # (batch,)
-                last_indices = last_indices.clamp(min=0)
+                last_indices = last_indices.clamp(min=0).long()  # Ensure long type for indexing
 
                 # Gather predictions at last positions
                 pooled_predictions = full_activations[

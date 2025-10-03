@@ -184,6 +184,7 @@ class NLARLDataset(RLHFDataset):
             "is_chat",
             "source",
             "formatted_source",
+            "immediate_prefix",
         ]
 
         extra_info = sample.get("extra_info", {}) or {}

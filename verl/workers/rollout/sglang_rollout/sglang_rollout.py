@@ -280,9 +280,15 @@ def _normalize_input_embeds(value: Any):
     if value is None:
         return None
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu().tolist()
+        print(f"DEBUG _normalize_input_embeds: Converting tensor with shape {value.shape} to list...")
+        result = value.detach().cpu().tolist()
+        print(f"DEBUG _normalize_input_embeds: Tensor conversion complete")
+        return result
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        print(f"DEBUG _normalize_input_embeds: Converting ndarray with shape {value.shape} to list...")
+        result = value.tolist()
+        print(f"DEBUG _normalize_input_embeds: Ndarray conversion complete")
+        return result
     if isinstance(value, (float, int, np.floating, np.integer)):
         return float(value)
     if isinstance(value, (list, tuple)):
@@ -589,6 +595,7 @@ class SGLangRollout(BaseRollout):
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine
+        print(f"[INIT] TP_RANK={self._tp_rank} _init_inference_engine ENTRY, tp_size={self._tp_size}")
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
         if nnodes > 1:
             ip = get_ip()
@@ -677,14 +684,19 @@ class SGLangRollout(BaseRollout):
                 args["retry_delay"] = self.config.server["retry_delay"]
                 args["max_connections"] = self.config.server["max_connections"]
                 args["max_start_wait_time"] = self.config.server["max_start_wait_time"]
+                print(f"[INIT] TP_RANK={self._tp_rank} about to create AsyncHttpServerAdapter")
                 self._engine = AsyncHttpServerAdapter(**args)
+                print(f"[INIT] TP_RANK={self._tp_rank} AsyncHttpServerAdapter created successfully")
             else:
                 logger.info("not is_server_mode")
+                print(f"[INIT] TP_RANK={self._tp_rank} about to create AsyncEngine with tp_size={self._tp_size}")
                 self._engine = AsyncEngine(**args)
+                print(f"[INIT] TP_RANK={self._tp_rank} AsyncEngine created successfully")
 
         else:
             self._engine = None
 
+        print(f"[INIT] TP_RANK={self._tp_rank} engine initialization complete, _engine={'None' if self._engine is None else 'Created'}")
         self.sharding_manager = None
         self.is_sleep = True
 
@@ -769,6 +781,7 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: generate_sequences ENTRY")
         """Generate sequences for a batch of prompts.
 
         Args:
@@ -796,6 +809,7 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: _batch_level_generate_sequences ENTRY")
         """Generates single-turn sequences for a batch of prompts.
         For single-turn generation, all prompts are processed in one request.
         `_batch_level_generate_sequences` involves:
@@ -848,16 +862,21 @@ class SGLangRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: batch_size = {batch_size}")
 
         # Extract non-tensor data
         non_tensor_batch = prompts.non_tensor_batch
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to check/create raw_prompt_ids")
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]).tolist() for i in range(batch_size)],
                 dtype=object,
             )
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: raw_prompt_ids ready")
 
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to extract input_embeds")
         input_embeds_per_sample = _extract_batch_input_embeds(prompts, batch_size, pop_from_non_tensor=True)
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: input_embeds extracted, length={len(input_embeds_per_sample)}")
 
         raw_prompt_ids_array = non_tensor_batch.pop("raw_prompt_ids")
         raw_prompt_ids_list = (
@@ -880,10 +899,13 @@ class SGLangRollout(BaseRollout):
         if len(multi_modal_list) != batch_size:
             raise ValueError(f"multi_modal_data length mismatch: expected {batch_size}, got {len(multi_modal_list)}")
 
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to build sglang_inputs from {batch_size} samples")
         sglang_inputs = []
-        for raw_prompt_ids, multi_modal_data, prompt_embeds in zip(
+        for i, (raw_prompt_ids, multi_modal_data, prompt_embeds) in enumerate(zip(
             raw_prompt_ids_list, multi_modal_list, input_embeds_per_sample, strict=True
-        ):
+        )):
+            if i == 0:
+                print(f"[TP_RANK={self._tp_rank}] DEBUG: Processing sample 0...")
             prompt_token_ids = (
                 raw_prompt_ids.tolist() if isinstance(raw_prompt_ids, np.ndarray) else list(raw_prompt_ids)
             )
@@ -899,6 +921,7 @@ class SGLangRollout(BaseRollout):
                 input_entry["input_embeds"] = prompt_embeds
 
             sglang_inputs.append(input_entry)
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: sglang_inputs built successfully, length={len(sglang_inputs)}")
 
         for input_data in sglang_inputs:
             # Ensure token IDs are lists or numpy arrays
@@ -956,6 +979,7 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
 
+        print(f"[TP_RANK={self._tp_rank}] DEBUG: Sampling params ready, about to check tp_rank for async_generate call")
         if self._tp_rank == 0:
             # TEMPORARY DEBUG: Show what's being passed to SGLang engine
             print("=" * 80)

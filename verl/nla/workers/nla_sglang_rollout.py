@@ -93,7 +93,7 @@ class NLASGLangRollout(SGLangRollout):
         they're on CPU for network transmission.
         """
         print("=" * 80)
-        print("NLA SGLang: generate_sequences() ENTRY POINT")
+        print(f"NLA SGLang: generate_sequences() ENTRY POINT (tp_rank={self._tp_rank})")
         print(f"NLA SGLang: Batch keys: {list(prompts.batch.keys())}")
         print("=" * 80)
 

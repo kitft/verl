@@ -228,6 +228,10 @@ def save_metadata(
         filename: Filename for metadata (default: nla_metadata.yaml)
     """
     checkpoint_path = Path(checkpoint_dir)
+
+    # Create directory if it doesn't exist (defensive programming)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
     metadata_path = checkpoint_path / filename
 
     metadata_dict = metadata.to_dict()
@@ -237,9 +241,14 @@ def save_metadata(
     metadata_json_str = json.dumps(metadata_dict, default=str, indent=2)
     metadata_dict = json.loads(metadata_json_str)
 
-    # Save as YAML for human readability
-    with open(metadata_path, "w") as f:
+    # Save as YAML for human readability with atomic write
+    temp_metadata_path = checkpoint_path / f"{filename}.tmp"
+    with open(temp_metadata_path, "w") as f:
         yaml.dump(metadata_dict, f, default_flow_style=False, sort_keys=False)
+
+    # Atomic rename
+    import os
+    os.rename(temp_metadata_path, metadata_path)
 
     print(f"Saved checkpoint metadata to: {metadata_path}")
 

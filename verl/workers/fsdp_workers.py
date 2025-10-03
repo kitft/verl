@@ -879,8 +879,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
+        print(f"[FSDP WORKER] generate_sequences ENTRY (rank={self.rank})")
         assert self._is_rollout
+        print(f"[FSDP WORKER] About to move prompts to device (rank={self.rank})")
         prompts = prompts.to(get_device_id())
+        print(f"[FSDP WORKER] Prompts moved to device (rank={self.rank})")
 
         meta_info = {
             "eos_token_id": self.model_config.generation_config.eos_token_id
@@ -899,7 +902,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            print(f"[FSDP WORKER] About to call rollout.generate_sequences (rank={self.rank})")
             output = self.rollout.generate_sequences(prompts=prompts)
+            print(f"[FSDP WORKER] rollout.generate_sequences returned (rank={self.rank})")
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())

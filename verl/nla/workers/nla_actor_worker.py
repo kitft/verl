@@ -565,6 +565,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     def generate_sequences(self, data: DataProto) -> DataProto:
+        print(f"[NLA ACTOR WORKER] generate_sequences ENTRY (rank={self.rank})")
         """
         Generate sequences with activation injection.
 

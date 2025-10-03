@@ -316,16 +316,78 @@ class NLATaskRunner:
         self.role_worker_mapping[Role.Critic] = ray.remote(critic_cls)
 
     def init_resource_pool_mgr(self, config):
-        """Initialize resource pool manager."""
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
+        """Initialize resource pool manager with support for split placement.
 
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
+        This method supports two modes:
+        1. Split placement: If ray_kwargs.resource_pool is configured in YAML,
+           creates separate resource pools for different roles (actor_rollout, critic, etc.)
+        2. Global pool (default): All roles share a single pool with all GPUs
 
-        # Add reward model pool if enabled
+        The split placement format matches verl's split_placement example:
+        resource_pool_spec = {pool_name: [gpus_per_node] * nnodes}
+        """
+        # Check if split resource pools are configured in YAML
+        # Note: resource_pool must exist, be non-empty, and have pools with GPUs
+        resource_pool_config = None
+        print(f"[NLA DEBUG] hasattr(config, 'ray_kwargs'): {hasattr(config, 'ray_kwargs')}")
+        if hasattr(config, 'ray_kwargs'):
+            print(f"[NLA DEBUG] hasattr(config.ray_kwargs, 'resource_pool'): {hasattr(config.ray_kwargs, 'resource_pool')}")
+            if hasattr(config.ray_kwargs, 'resource_pool'):
+                print(f"[NLA DEBUG] config.ray_kwargs.resource_pool: {config.ray_kwargs.resource_pool}")
+                print(f"[NLA DEBUG] bool(config.ray_kwargs.resource_pool): {bool(config.ray_kwargs.resource_pool)}")
+
+        if (hasattr(config, 'ray_kwargs') and
+            hasattr(config.ray_kwargs, 'resource_pool') and
+            config.ray_kwargs.resource_pool):
+            resource_pool_config = config.ray_kwargs.resource_pool
+            print(f"[NLA DEBUG] resource_pool_config set to: {resource_pool_config}")
+
+        # Try to build resource_pool_spec from YAML config
+        resource_pool_spec = {}
+        if resource_pool_config:
+            for pool_name, pool_config in resource_pool_config.items():
+                # Convert YAML format to resource_pool_spec format
+                # num_gpus in YAML means GPUs per node for this pool
+                # Defensive: skip if pool_config is not a dict
+                if not isinstance(pool_config, dict):
+                    continue
+                gpus_per_node = pool_config.get('num_gpus', 0)
+                if gpus_per_node > 0:
+                    # Format: [gpus_per_node] * nnodes
+                    resource_pool_spec[pool_name] = [gpus_per_node] * config.trainer.nnodes
+
+        # Only use split placement if we successfully built valid pools
+        if resource_pool_spec:
+            # Split placement mode: map roles to pools based on pool names
+            # Convention: pool names should contain role identifiers
+            for pool_name in resource_pool_spec.keys():
+                pool_name_lower = pool_name.lower()
+                if 'actor' in pool_name_lower or 'rollout' in pool_name_lower:
+                    self.mapping[Role.ActorRollout] = pool_name
+                if 'critic' in pool_name_lower:
+                    self.mapping[Role.Critic] = pool_name
+
+            print(f"[NLA] Split placement enabled")
+            print(f"[NLA] resource_pool_spec: {resource_pool_spec}")
+            print(f"[NLA] Role mapping: {self.mapping}")
+
+            # Verify both required roles are mapped
+            if Role.ActorRollout not in self.mapping or Role.Critic not in self.mapping:
+                raise ValueError(
+                    f"Split placement requires both 'actor_rollout' and 'critic' pools. "
+                    f"Found pools: {list(resource_pool_spec.keys())}"
+                )
+        else:
+            # Default mode: single global pool with all GPUs
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+            self.mapping[Role.ActorRollout] = global_pool_id
+            self.mapping[Role.Critic] = global_pool_id
+            print(f"[NLA] Using global pool with all {config.trainer.n_gpus_per_node} GPUs")
+
+        # Add reward model pool if enabled (works with both modes)
         if config.reward_model.enable and config.reward_model.enable_resource_pool:
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool

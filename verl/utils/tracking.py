@@ -362,24 +362,38 @@ class ValidationGenerationsLogger:
     def _log_generations_to_wandb(self, samples, step, wandb):
         """Log samples to wandb as a table"""
 
+        if not samples:
+            return
+
+        # Determine field names per sample
+        field_names = ["input", "output", "score"]
+        if len(samples[0]) >= 4:
+            field_names.append("immediate_prefix")
+
         # Create column names for all samples
-        columns = ["step"] + sum(
-            [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], []
-        )
+        columns = ["step"] + sum([[f"{name}_{i + 1}" for name in field_names] for i in range(len(samples))], [])
 
         if not hasattr(self, "validation_table"):
             # Initialize the table on first call
             self.validation_table = wandb.Table(columns=columns)
 
-        # Create a new table with same columns and existing data
-        # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        # Keep only first row and last 3 rows (including new one)
+        existing_data = self.validation_table.data
+        if len(existing_data) > 3:
+            kept_data = [existing_data[0]] + existing_data[-2:]
+        else:
+            kept_data = existing_data
+
+        # # Create a new table with same columns and existing data
+        # # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
+        # new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        new_table = wandb.Table(columns=columns, data=kept_data)
 
         # Add new row with all data
-        row_data = []
-        row_data.append(step)
+        row_data = [step]
+        width = len(field_names)
         for sample in samples:
-            row_data.extend(sample)
+            row_data.extend(list(sample)[:width])
 
         new_table.add_data(*row_data)
 
@@ -393,10 +407,14 @@ class ValidationGenerationsLogger:
 
         swanlab_table = swanlab.echarts.Table()
 
-        # Create column names
-        headers = ["step", "input", "output", "score"]
+        # Create column names dynamically
+        field_names = ["input", "output", "score"]
+        if samples and len(samples[0]) >= 4:
+            field_names.append("immediate_prefix")
+        headers = ["step"] + field_names
+        width = len(field_names)
 
-        swanlab_row_list = [[step, *sample] for sample in samples]
+        swanlab_row_list = [[step] + list(sample)[:width] for sample in samples]
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab
@@ -417,6 +435,8 @@ class ValidationGenerationsLogger:
                 row_data = []
                 for sample in samples:
                     data = {"input": sample[0], "output": sample[1], "score": sample[2]}
+                    if len(sample) >= 4:
+                        data["immediate_prefix"] = sample[3]
                     row_data.append(data)
                 with open(validation_gen_step_file, "w") as file:
                     json.dump(row_data, file)
@@ -434,15 +454,17 @@ class ValidationGenerationsLogger:
         if task is None:
             return
 
-        table = [
-            {
+        table = []
+        for sample in samples:
+            row = {
                 "step": step,
                 "input": sample[0],
                 "output": sample[1],
                 "score": sample[2],
             }
-            for sample in samples
-        ]
+            if len(sample) >= 4:
+                row["immediate_prefix"] = sample[3]
+            table.append(row)
 
         logger = task.get_logger()
         logger.report_table(
@@ -481,6 +503,8 @@ class ValidationGenerationsLogger:
                 text_content += f"**Input:** {input_text}\n\n"
                 text_content += f"**Output:** {output_text}\n\n"
                 text_content += f"**Score:** {score}\n\n"
+                if len(sample) >= 4:
+                    text_content += f"**Immediate Prefix:** {sample[3]}\n\n"
             else:
                 # Handle cases where sample format might be different
                 text_content += f"**Data:** {sample}\n\n"

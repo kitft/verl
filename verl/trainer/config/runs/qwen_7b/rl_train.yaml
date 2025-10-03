@@ -7,9 +7,9 @@ defaults:
 mode: rl
 
 model:
-  name: Qwen/Qwen2.5-0.5B-Instruct
+  name: Qwen/Qwen2.5-7B-Instruct
   trust_remote_code: true
-  layer_index: 10
+  layer_index: 20
   model_dtype: bf16
 
 seed: 42
@@ -27,16 +27,16 @@ dataset:
   add_generation_prompt: false
   expect_chat: false
   slice_start: 51000
-  slice_length: 50000
+  slice_length: 500000
 
 sampling:
-  total_activations: 50000
+  total_activations: 500000
   activations_per_sample: 1
   max_length: 1024
   parallel_batch_size: null  # Auto-detect based on available GPUs
 
 output:
-  path_prefix: data/generated/rl_train_fineweb10bt_qwen_small
+  path_prefix: data/generated/rl_train_fineweb10bt_qwen_7b
   overwrite: true
   include_layer_suffix: true
   injection_token: null

@@ -250,32 +250,58 @@ class NLAGRPOTrainer(RayPPOTrainer):
     #     return metrics
 
     def fit(self):
-        """Override fit to track training time."""
+        """Override fit to track training time and metrics."""
         import time
+        import verl.utils.tracking
 
         self.training_start_time = time.time()
 
-        # Call parent's fit
-        super().fit()
+        # Monkey-patch Tracking.log to capture metrics
+        # This is necessary because parent creates its own logger internally
+        original_log_method = verl.utils.tracking.Tracking.log
+
+        def wrapped_log(logger_self, data, step):
+            # Extract reward metrics if present (before calling original)
+            if "critic/rewards/mean" in data:
+                reward_mean = data["critic/rewards/mean"]
+                self.final_reward_mean = reward_mean
+                if reward_mean > self.best_reward_mean:
+                    self.best_reward_mean = reward_mean
+
+            # Try to get std, or approximate from range
+            if "critic/rewards/std" in data:
+                self.final_reward_std = data["critic/rewards/std"]
+            elif "critic/rewards/max" in data and "critic/rewards/min" in data:
+                reward_range = data["critic/rewards/max"] - data["critic/rewards/min"]
+                self.final_reward_std = reward_range / 4.0  # Rough approximation
+
+            # Call original
+            return original_log_method(logger_self, data, step)
+
+        # Temporarily replace the method
+        verl.utils.tracking.Tracking.log = wrapped_log
+
+        try:
+            # Call parent's fit (which uses the patched logger)
+            super().fit()
+        finally:
+            # Restore original method
+            verl.utils.tracking.Tracking.log = original_log_method
 
     def _save_checkpoint(self):
         """Override to save NLA metadata with RL checkpoint."""
         import time
         import os
+        import torch
         from pathlib import Path
+        from verl.utils.fs import local_mkdir_safe
         from verl.utils.checkpoint.nla_metadata import (
             create_rl_metadata_from_config,
             save_metadata,
             extract_lineage_from_checkpoint,
         )
 
-        # Call parent's _save_checkpoint first
-        super()._save_checkpoint()
-
-        # Save metadata
-        checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
-
-        # Calculate training time
+        # Prepare metadata before calling parent
         training_time_hours = None
         if self.training_start_time is not None:
             training_time_hours = (time.time() - self.training_start_time) / 3600.0
@@ -285,7 +311,6 @@ class NLAGRPOTrainer(RayPPOTrainer):
         wandb_run_url = None
         try:
             import wandb
-
             if wandb.run is not None:
                 wandb_run_id = wandb.run.id
                 wandb_run_url = wandb.run.get_url()
@@ -310,6 +335,63 @@ class NLAGRPOTrainer(RayPPOTrainer):
             wandb_run_url=wandb_run_url,
         )
 
-        # Save metadata
+        # Duplicate parent logic to insert metadata save at the right point
+        # (before workers handle HDFS copy internally)
+        checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+
+        print(f"local_global_step_folder: {checkpoint_dir}")
+        actor_local_path = os.path.join(checkpoint_dir, "actor")
+
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        )
+
+        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
+        if remove_previous_ckpt_in_save:
+            print(
+                "Warning: remove_previous_ckpt_in_save is deprecated,"
+                + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
+            )
+        max_actor_ckpt_to_keep = (
+            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+        max_critic_ckpt_to_keep = (
+            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+
+        # CRITICAL: Save metadata BEFORE worker checkpoints (which handle HDFS copy)
+        # This ensures metadata is in the folder when workers copy to HDFS
+        local_mkdir_safe(checkpoint_dir)
         save_metadata(checkpoint_dir, metadata)
         print(f"Saved NLA RL metadata for step {self.global_steps}")
+
+        # Now save actor/critic checkpoints (workers will copy entire folder to HDFS)
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+        )
+
+        if self.use_critic:
+            critic_local_path = os.path.join(checkpoint_dir, "critic")
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
+
+        # Save dataloader
+        local_mkdir_safe(checkpoint_dir)
+        dataloader_local_path = os.path.join(checkpoint_dir, "data.pt")
+        dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # Latest checkpointed iteration tracker (for atomic usage)
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+        )
+        with open(local_latest_checkpointed_iteration, "w") as f:
+            f.write(str(self.global_steps))

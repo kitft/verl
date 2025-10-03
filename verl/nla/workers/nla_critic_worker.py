@@ -22,6 +22,7 @@ class NLACriticWorker(CriticWorker):
             config=self.config,
             critic_module=self.critic_module,
             critic_optimizer=self.critic_optimizer,
+            tokenizer=self.tokenizer,  # Pass tokenizer for critic prompt support
         )
 
     def compute_activation_predictions(self, response_ids, attention_mask):

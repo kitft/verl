@@ -1,0 +1,96 @@
+# @package _global_
+
+defaults:
+  - /nla_grpo_full
+  - _self_
+
+# Multi-GPU configuration for Qwen2.5-7B-Instruct (8 GPUs)
+#
+# GRPO Batch Size Configuration:
+# With rollout.n=4 (from nla_grpo_full), each prompt generates 4 responses.
+# Total experiences = data.batch_size × rollout.n = 16 × 4 = 64
+# For ONE gradient update per batch: ppo_mini_batch_size MUST = data.batch_size × rollout.n = 64
+# If you change rollout.n, you MUST update ppo_mini_batch_size accordingly!
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+  actor:
+    ppo_micro_batch_size_per_gpu: 2
+    ppo_mini_batch_size: 64  # 16 prompts × 4 responses (rollout.n) = 64 for one gradient update
+    optim:
+      lr: 1e-5
+      weight_decay: 0.001
+      lr_warmup_steps: 50
+    fsdp_config:
+      model_dtype: bf16
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    gpu_memory_utilization: 0.5
+    tensor_model_parallel_size: 1  # MUST be 1 without resource pools (8 workers can't coordinate TP=2)
+
+critic:
+  output_layer_index: 20
+  ppo_micro_batch_size_per_gpu: 2
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+    trust_remote_code: true
+    truncate_at_layer: null
+    enable_gradient_checkpointing: true
+    fsdp_config:
+      model_dtype: bf16
+      param_offload: true
+      optimizer_offload: true
+  optim:
+    lr: 1e-9
+    weight_decay: 0.001
+    lr_warmup_steps: 50
+
+trainer:
+  n_gpus_per_node: 8  # Use 8 GPUs on this node
+  nnodes: 1  # Single node
+  total_training_steps: 10000
+  ppo_mini_batch_size: 64  # Must match actor.ppo_mini_batch_size
+  ppo_epochs: 1
+  steps_per_update: 1
+  project_name: nla-rl-q7b
+  experiment_name: qwen-7b-multigpu
+  logger: ["console", "wandb"]
+  resume_mode: disable
+  log_val_generations: 100  # Number of validation samples to log to wandb
+  test_freq: 10
+  rollout_data_dir: ./rollout_outputs
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 32
+    num_gpus: 8
+  # NO resource_pool specified - use verl default behavior:
+  # Both actor_rollout and critic use all 8 GPUs sequentially
+
+algorithm:
+  adv_estimator: grpo
+
+nla:
+  injection:
+    mode: replace
+    layer_indices: [0]
+    projection_dim: null
+    injection_token: null
+
+engine_kwargs:
+  sglang:
+    # attention_chunk_size: 0
+
+data:
+  train_batch_size: 16  # Number of prompts per training step
+  val_batch_size: 16
+  batch_size: 16  # Kept for compatibility
+  train_files:
+    - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet
+  val_files:
+    - /workspace/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_7b_layer20.parquet

@@ -451,6 +451,15 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _extract_immediate_prefixes(self, data: DataProto) -> list[str]:
+        """Extract last 100 chars of immediate_prefix from each sample's extra_info."""
+        prefixes = []
+        for item in data:
+            extra_info = item.non_tensor_batch.get("extra_info", {})
+            immediate_prefix = extra_info.get("immediate_prefix", "")
+            prefixes.append(immediate_prefix[-100:] if immediate_prefix else "")
+        return prefixes
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -462,7 +471,7 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         # Dump on steps 0, 1, and then every 5 steps
-        if self.global_steps not in [0, 1] and self.global_steps % 5 != 0:
+        if self.global_steps not in [0, 1] and self.global_steps % 50 != 0:
             return
 
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -510,13 +519,8 @@ class RayPPOTrainer:
             if "values" in batch.batch:
                 reward_extra_infos_to_dump["values"] = batch.batch["values"][:, 0].cpu().tolist()
 
-            # Extract formatted_source (last 100 chars) from extra_info
-            immediate_prefixes = []
-            for item in batch:
-                extra_info = item.non_tensor_batch.get("extra_info", {})
-                immediate_prefix = extra_info.get("immediate_prefix", "")
-                # Take last 100 chars
-                immediate_prefixes.append(immediate_prefix[-100:] if immediate_prefix else "")
+            # Extract immediate prefixes from extra_info
+            immediate_prefixes = self._extract_immediate_prefixes(batch)
             reward_extra_infos_to_dump["immediate_prefix"] = immediate_prefixes
 
             self._dump_generations(
@@ -528,7 +532,7 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, immediate_prefixes):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -539,7 +543,7 @@ class RayPPOTrainer:
         import numpy as np
 
         # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples = list(zip(inputs, outputs, scores, immediate_prefixes, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
@@ -580,6 +584,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_immediate_prefixes = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -610,6 +615,9 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
+            # Collect immediate prefixes matching the repeated validation batch
+            sample_immediate_prefixes.extend(self._extract_immediate_prefixes(test_batch))
+
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -621,20 +629,15 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            # Enable auto_padding to allow uneven batch chunking across workers
+            # This is the proper way to handle validation batches that aren't divisible by worker count
+            from verl.protocol import DataProtoConfig
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_gen_batch.meta_info[DataProtoConfig.auto_padding_key] = True
+            if not self.async_rollout_mode:
+                test_output_gen_batch = self.actor_rollout_wg.generate_sequences(test_gen_batch)
+            else:
+                test_output_gen_batch = self.async_rollout_manager.generate_sequences(test_gen_batch)
 
             print("validation generation end")
 
@@ -645,6 +648,8 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            # Ensure auto_padding is enabled for critic dispatch (may not propagate from generation)
+            test_batch.meta_info[DataProtoConfig.auto_padding_key] = True
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -667,11 +672,13 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, immediate_prefixes=sample_immediate_prefixes)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            # Include immediate prefixes in validation dump as extra info
+            reward_extra_infos_dict["immediate_prefix"] = sample_immediate_prefixes
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -1218,15 +1225,13 @@ class RayPPOTrainer:
                     redundant_time=self.config.trainer.esi_redundant_time,
                 )
                 # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                ):
+                # Save checkpoint if any of these conditions are met:
+                # 1. It's the last training step (always saves, even if save_freq=-1).
+                # 2. save_freq > 0 AND current step is a multiple of save_freq.
+                # 3. save_freq > 0 AND ESI(Elastic Server Instance) expiration approaching.
+                if is_last_step or (self.config.trainer.save_freq > 0 and (
+                    self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                )):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
@@ -1284,7 +1289,8 @@ class RayPPOTrainer:
                 # Check for stop signal from tracking backends (e.g., wandb)
                 if logger.should_stop():
                     print("Received stop signal from tracking backend. Saving checkpoint and stopping training...")
-                    if self.config.trainer.save_freq > 0:
+                    # BUGFIX: Always save checkpoint when stopping early (if >= 100 steps)
+                    if self.global_steps >= 100:
                         with marked_timer("save_checkpoint", timing_raw, color="green"):
                             self._save_checkpoint()
                     pprint(f"Training stopped at step {self.global_steps}. Final validation metrics: {last_val_metrics}")

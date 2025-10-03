@@ -13,9 +13,10 @@ trainer:
   experiment_name: "grpo_training"
   worker_module: "verl.nla.workers"
   use_tensorboard: false
-  default_local_dir: "./local_output"
+  default_local_dir: "./checkpoints/${trainer.experiment_name}"
+  save_freq: 100
   checkpoint:
-    save_freq: 1000
+    save_freq: ${trainer.save_freq}
     load_path: null
   total_epochs: 1
   total_training_steps: 10
@@ -41,9 +42,15 @@ actor_rollout_ref:
     trust_remote_code: true
     enable_gradient_checkpointing: false
   actor:
+    # Token Length Configuration for NLA:
+    # Actor processes: prompt (~70 tokens typical) + response (50 tokens) per sample
+    # ppo_max_token_len_per_gpu = (typical_prompt + response) * micro_batch_size
+    #                           = (70 + 50) * 32 = 3,840 tokens
+    # Rounded to 4500 for safety margin (allows prompts up to ~90 tokens)
     strategy: fsdp2  # fsdp2 fixes pidfd_getfd crash with SGLang weight updates
     ppo_mini_batch_size: 32
     ppo_micro_batch_size_per_gpu: 32
+    ppo_max_token_len_per_gpu: 4500
     use_kl_loss: false
     optim:
       lr: 1e-5
@@ -54,6 +61,7 @@ actor_rollout_ref:
     mode: "sync"
     n: 4  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
     log_prob_micro_batch_size_per_gpu: 32
+    log_prob_max_token_len_per_gpu: 4500  # Match actor's ppo_max_token_len_per_gpu
     tensor_model_parallel_size: 1
     disable_radix_cache: true
     gpu_memory_utilization: 0.4
@@ -66,9 +74,16 @@ actor_rollout_ref:
     enable: false
 
 critic:
+  # Token Length Configuration for NLA:
+  # Critic processes: response (50 tokens) + optional short prefix (~20 tokens) per sample
+  # ppo_max_token_len_per_gpu = (response + prefix) * micro_batch_size
+  #                           = (50 + 20) * 32 = 2,240 tokens
+  # Rounded to 3000 for safety margin (roughly equivalent to actor, maybe slightly less)
   enable: true
   strategy: fsdp2  # fsdp2 fixes pidfd_getfd crash with SGLang weight updates
   ppo_micro_batch_size_per_gpu: 32
+  ppo_max_token_len_per_gpu: 3000
+  forward_max_token_len_per_gpu: 3000
   model:
     path: "yujiepan/gemma-2-tiny-random"
     trust_remote_code: true
@@ -91,7 +106,8 @@ data:
   micro_batch_size_per_gpu: 32
   val_batch_size: 32
   batch_size: 32
-  max_prompt_length: 128
+  max_prompt_length: 128  # Hard limit for truncation; typical prompts ~70 tokens
+  max_response_length: 50  # Must match actor_rollout_ref.rollout.response_length
   shuffle: true
   train_files: ["data/testing/test_nla_dataset_tiny.parquet"]
   val_files: ["data/testing/test_nla_dataset.parquet"]

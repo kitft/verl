@@ -621,52 +621,90 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
     def save_checkpoint(self, step):
         """Override save_checkpoint to include NLA metadata."""
         import time
+        import os
+        from pathlib import Path
         from verl.utils.checkpoint.nla_metadata import create_sft_metadata_from_config, save_metadata
 
-        # Call parent's save_checkpoint first
-        super().save_checkpoint(step)
+        # Calculate training time and create metadata BEFORE calling parent
+        # so we can save it before HDFS copy
+        training_time_hours = None
+        if self.training_start_time is not None:
+            training_time_hours = (time.time() - self.training_start_time) / 3600.0
 
-        # Only save metadata on rank 0
+        # Get WandB info if available
+        wandb_run_id = None
+        wandb_run_url = None
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb_run_id = wandb.run.id
+                wandb_run_url = wandb.run.get_url()
+        except Exception:
+            pass  # WandB not initialized or not available
+
+        # Prepare metadata (but don't save yet - directory may not exist)
+        metadata = create_sft_metadata_from_config(
+            config=self.config,
+            global_step=step,
+            final_train_loss=self.final_train_loss,
+            final_val_loss=self.final_val_loss,
+            best_val_loss=self.best_val_loss if self.best_val_loss != float("inf") else None,
+            training_time_hours=training_time_hours,
+            model_config=self.model_config if hasattr(self, "model_config") else None,
+            wandb_run_id=wandb_run_id,
+            wandb_run_url=wandb_run_url,
+        )
+
+        # Call parent's save_checkpoint (creates directory, saves model, but doesn't copy to HDFS yet)
+        # We need to intercept BEFORE the HDFS copy happens
+        # Strategy: Save metadata after checkpoint manager but before HDFS copy
+
+        # We'll need to partially duplicate parent logic to insert metadata save at the right point
+        from verl.utils.fs import local_mkdir_safe
+
+        checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
+
         if self.device_mesh.get_rank() == 0:
-            import os
-            from pathlib import Path
+            print(f"Saving checkpoint to: {checkpoint_dir}")
 
-            checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
+        # Get max checkpoints to keep
+        max_ckpt_to_keep = getattr(self.config.trainer, "max_ckpt_to_keep", None)
 
-            # Calculate training time
-            training_time_hours = None
-            if self.training_start_time is not None:
-                training_time_hours = (time.time() - self.training_start_time) / 3600.0
+        # Use checkpoint manager to save (this creates the directory and saves model weights)
+        self.checkpoint_manager.save_checkpoint(
+            local_path=checkpoint_dir, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep
+        )
 
-            # Get WandB info if available
-            wandb_run_id = None
-            wandb_run_url = None
-            try:
-                import wandb
+        # Save dataloader state (rank 0 only)
+        if self.device_mesh.get_rank() == 0:
+            local_mkdir_safe(checkpoint_dir)
+            dataloader_local_path = os.path.join(checkpoint_dir, "data.pt")
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            import torch
+            torch.save(dataloader_state_dict, dataloader_local_path)
+            print(f"Saved dataloader state to: {dataloader_local_path}")
 
-                if wandb.run is not None:
-                    wandb_run_id = wandb.run.id
-                    wandb_run_url = wandb.run.get_url()
-            except Exception:
-                pass  # WandB not initialized or not available
+            # Update latest checkpoint tracker (atomic write)
+            from verl.utils.checkpoint.utils import get_checkpoint_tracker_filename
+            tracker_file = get_checkpoint_tracker_filename(self.config.trainer.default_local_dir)
+            temp_tracker_file = tracker_file + ".tmp"
+            with open(temp_tracker_file, "w") as f:
+                f.write(str(step))
+            os.rename(temp_tracker_file, tracker_file)
+            print(f"Updated checkpoint tracker: {tracker_file}")
 
-            # Create metadata
-            metadata = create_sft_metadata_from_config(
-                config=self.config,
-                global_step=step,
-                final_train_loss=self.final_train_loss,
-                final_val_loss=self.final_val_loss,
-                best_val_loss=self.best_val_loss if self.best_val_loss != float("inf") else None,
-                training_time_hours=training_time_hours,
-                model_config=self.model_config if hasattr(self, "model_config") else None,
-                wandb_run_id=wandb_run_id,
-                wandb_run_url=wandb_run_url,
-            )
-
-            # Save metadata
+            # CRITICAL: Save metadata BEFORE HDFS copy
             save_metadata(checkpoint_dir, metadata)
-
             print(f"Saved NLA metadata for step {step}")
+
+        # Copy to HDFS if configured (now includes metadata!)
+        if self.device_mesh.get_rank() == 0 and getattr(self.config.trainer, "default_hdfs_dir", None):
+            from verl.utils.hdfs import hdfs_io
+            hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
+            hdfs_io.copy(src=checkpoint_dir, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+            print(f"Copied checkpoint (with metadata) to HDFS: {self.config.trainer.default_hdfs_dir}")
+
+        torch.distributed.barrier()
 
     def _update_metrics(self, train_loss: float = None, val_loss: float = None):
         """Update tracked metrics."""
