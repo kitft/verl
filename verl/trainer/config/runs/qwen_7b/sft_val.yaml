@@ -7,9 +7,9 @@ defaults:
 mode: sft
 
 model:
-  name: Qwen/Qwen2.5-0.5B-Instruct
+  name: Qwen/Qwen2.5-7B-Instruct
   trust_remote_code: true
-  layer_index: 10
+  layer_index: 20
   model_dtype: bf16
 
 seed: 43
@@ -36,7 +36,7 @@ sampling:
   parallel_batch_size: null  # Auto-detect based on available GPUs
 
 output:
-  path_prefix: data/small/sft/val_nla_sft_dataset_fineweb
+  path_prefix: data/q7b/sft/val_nla_sft_dataset_fineweb
   overwrite: true
   include_layer_suffix: true
   injection_token: null
