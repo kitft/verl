@@ -24,11 +24,11 @@ dataset:
   system_prompt: null
   add_generation_prompt: false
   expect_chat: false
-  slice_start: 101000
-  slice_length: 500
+  slice_start: 501000
+  slice_length: 2048
 
 sampling:
-  total_activations: 500
+  total_activations: 2048
   activations_per_sample: 1
   max_length: 1024
   parallel_batch_size: null  # Auto-detect based on available GPUs

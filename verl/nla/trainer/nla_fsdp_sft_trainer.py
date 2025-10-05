@@ -553,6 +553,12 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 val_losses.append(val_loss)
 
             metric = None
+            # in run_validation() before torch.stack(val_losses)
+            if not val_losses:
+                if rank == 0:
+                    print("Validation skipped: no batches in val_dataloader. Increase val set or reduce batch size.")
+                torch.distributed.barrier()
+                return None
             if rank == 0:
                 val_loss = torch.mean(torch.stack(val_losses))
                 metric = {"val/loss": val_loss.detach().item()}
