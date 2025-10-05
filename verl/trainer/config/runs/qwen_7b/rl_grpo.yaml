@@ -19,8 +19,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     use_shm: false
   actor:
-    ppo_micro_batch_size_per_gpu: 2
-    ppo_mini_batch_size: 64  # 16 prompts × 4 responses (rollout.n) = 64 for one gradient update
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_mini_batch_size:  512 # 16 prompts × 4 responses (rollout.n) = 64 for one gradient update
     optim:
       lr: 1e-5
       weight_decay: 0.001
@@ -32,10 +32,11 @@ actor_rollout_ref:
   rollout:
     gpu_memory_utilization: 0.5
     tensor_model_parallel_size: 1  # MUST be 1 without resource pools (8 workers can't coordinate TP=2)
+    n: 8  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
 
 critic:
   output_layer_index: 20
-  ppo_micro_batch_size_per_gpu: 2
+  ppo_micro_batch_size_per_gpu: 8
   model:
     path: Qwen/Qwen2.5-7B-Instruct
     trust_remote_code: true
@@ -54,7 +55,7 @@ trainer:
   n_gpus_per_node: 8  # Use 8 GPUs on this node
   nnodes: 1  # Single node
   total_training_steps: 10000
-  ppo_mini_batch_size: 64  # Must match actor.ppo_mini_batch_size
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # Must match actor.ppo_mini_batch_size
   ppo_epochs: 1
   steps_per_update: 1
   project_name: nla-rl-q7b
@@ -87,9 +88,9 @@ engine_kwargs:
     # attention_chunk_size: 0
 
 data:
-  train_batch_size: 16  # Number of prompts per training step
-  val_batch_size: 16
-  batch_size: 16  # Kept for compatibility
+  train_batch_size: 64  # Number of prompts per training step
+  val_batch_size: 64
+  batch_size: 64  # Kept for compatibility
   train_files:
     - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet
   val_files:
