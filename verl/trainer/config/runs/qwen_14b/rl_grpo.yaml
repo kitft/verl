@@ -88,7 +88,7 @@ engine_kwargs:
 
 data:
   train_batch_size: 8  # Number of prompts per training step
-  val_batch_size: 8
+  val_batch_size: 512 # train * grpo_n?
   batch_size: 8  # Kept for compatibility
   train_files:
     - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_14b_layer24.parquet

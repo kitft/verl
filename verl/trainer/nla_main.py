@@ -45,45 +45,6 @@ def _slugify(value: Optional[str], fallback: Optional[str] = None) -> Optional[s
     return None
 
 
-def _convert_fsdp_to_hf_if_needed(model_path: str) -> str:
-    """
-    Auto-convert FSDP checkpoint to HuggingFace format if needed.
-
-    Args:
-        model_path: Path to model (can be HF format or FSDP checkpoint)
-
-    Returns:
-        Path to HuggingFace format model (either existing or newly converted)
-    """
-    path = Path(model_path)
-
-    # If it's already pointing to huggingface subdirectory, use as-is
-    if path.name == "huggingface" or (path / "huggingface").exists():
-        if path.name == "huggingface":
-            return str(path)
-        else:
-            return str(path / "huggingface")
-
-    # Check if this is an FSDP checkpoint directory
-    # FSDP checkpoints have model_world_size_*_rank_*.pt files and fsdp_config.json
-    if path.is_dir():
-        has_fsdp_shards = any(path.glob("model_world_size_*_rank_*.pt"))
-        has_fsdp_config = (path / "fsdp_config.json").exists()
-        has_hf_subdir = (path / "huggingface").exists()
-
-        if has_fsdp_shards and has_fsdp_config:
-            # This is an FSDP checkpoint
-            if has_hf_subdir:
-                print(f"Found existing HuggingFace checkpoint at {path / 'huggingface'}")
-                return str(path / "huggingface")
-            else:
-                print(f"WARNING: FSDP checkpoint at {path} does not contain huggingface/ subdirectory.")
-                print("Please re-train with checkpoint.save_contents including 'hf_model', or manually convert.")
-                print("For now, attempting to use FSDP checkpoint directly (may fail)...")
-                return str(path)
-
-    # Otherwise assume it's a HuggingFace model path (could be local or HF Hub)
-    return str(path)
 
 
 def _detect_model_init_type(model_path: str) -> Optional[str]:
@@ -236,22 +197,6 @@ def run_nla_grpo(config) -> None:
         config.trainer.launch_command = launch_cmd
         config.trainer.launch_cwd = os.getcwd()
 
-    # Auto-convert FSDP checkpoints to HuggingFace format if needed
-    print("Checking model paths for FSDP→HF conversion...")
-    actor_path = config.actor_rollout_ref.model.path
-    critic_path = config.critic.model.path
-
-    converted_actor_path = _convert_fsdp_to_hf_if_needed(actor_path)
-    converted_critic_path = _convert_fsdp_to_hf_if_needed(critic_path)
-
-    if converted_actor_path != actor_path:
-        print(f"Actor model path converted: {actor_path} → {converted_actor_path}")
-        config.actor_rollout_ref.model.path = converted_actor_path
-
-    if converted_critic_path != critic_path:
-        print(f"Critic model path converted: {critic_path} → {converted_critic_path}")
-        config.critic.model.path = converted_critic_path
-
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Get default runtime env and merge with config
@@ -329,18 +274,10 @@ class NLATaskRunner:
         # Check if split resource pools are configured in YAML
         # Note: resource_pool must exist, be non-empty, and have pools with GPUs
         resource_pool_config = None
-        print(f"[NLA DEBUG] hasattr(config, 'ray_kwargs'): {hasattr(config, 'ray_kwargs')}")
-        if hasattr(config, 'ray_kwargs'):
-            print(f"[NLA DEBUG] hasattr(config.ray_kwargs, 'resource_pool'): {hasattr(config.ray_kwargs, 'resource_pool')}")
-            if hasattr(config.ray_kwargs, 'resource_pool'):
-                print(f"[NLA DEBUG] config.ray_kwargs.resource_pool: {config.ray_kwargs.resource_pool}")
-                print(f"[NLA DEBUG] bool(config.ray_kwargs.resource_pool): {bool(config.ray_kwargs.resource_pool)}")
-
         if (hasattr(config, 'ray_kwargs') and
             hasattr(config.ray_kwargs, 'resource_pool') and
             config.ray_kwargs.resource_pool):
             resource_pool_config = config.ray_kwargs.resource_pool
-            print(f"[NLA DEBUG] resource_pool_config set to: {resource_pool_config}")
 
         # Try to build resource_pool_spec from YAML config
         resource_pool_spec = {}

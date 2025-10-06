@@ -627,42 +627,67 @@ def patch_valuehead_model(model) -> None:
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
 
-def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code, from_config_only=False):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
-    try:
-        model = AutoModelForTokenClassification.from_pretrained(
+    if from_config_only:
+        # Initialize empty model from config (for loading FSDP checkpoints)
+        try:
+            model = AutoModelForTokenClassification.from_config(config=model_config)
+            return model
+        except BaseException as e:
+            if not is_trl_available():
+                raise RuntimeError(
+                    f"model config is not a value head model, please install trl to make it valid"
+                ) from e
+
+        assert is_trl_available()
+
+        from trl import AutoModelForCausalLMWithValueHead
+
+        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            module_class = AutoModelForVision2Seq
+        else:
+            module_class = AutoModelForCausalLM
+        ori_model = module_class.from_config(config=model_config)
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
+        patch_valuehead_model(model)
+        return model
+    else:
+        # Standard initialization from pretrained model
+        try:
+            model = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=model_config,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            )
+            return model
+        except BaseException as e:
+            if not is_trl_available():
+                raise RuntimeError(
+                    f"model({local_path}) is not a value head model, please install trl to make it valid"
+                ) from e
+
+        assert is_trl_available()
+
+        from trl import AutoModelForCausalLMWithValueHead
+
+        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            module_class = AutoModelForVision2Seq
+        else:
+            module_class = AutoModelForCausalLM
+        ori_model = module_class.from_pretrained(
             pretrained_model_name_or_path=local_path,
             torch_dtype=torch_dtype,
             config=model_config,
             attn_implementation="flash_attention_2",
             trust_remote_code=trust_remote_code,
         )
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
+        patch_valuehead_model(model)
         return model
-    except BaseException as e:
-        if not is_trl_available():
-            raise RuntimeError(
-                f"model({local_path}) is not a value head model, please install trl to make it valid"
-            ) from e
-
-    assert is_trl_available()
-
-    from trl import AutoModelForCausalLMWithValueHead
-
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-        module_class = AutoModelForVision2Seq
-    else:
-        module_class = AutoModelForCausalLM
-    ori_model = module_class.from_pretrained(
-        pretrained_model_name_or_path=local_path,
-        torch_dtype=torch_dtype,
-        config=model_config,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=trust_remote_code,
-    )
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
-    patch_valuehead_model(model)
-    return model
 
 
 _architecture_to_auto_class = {

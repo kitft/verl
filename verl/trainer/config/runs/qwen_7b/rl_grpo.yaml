@@ -63,7 +63,7 @@ trainer:
   logger: ["console", "wandb"]
   resume_mode: disable
   log_val_generations: 100  # Number of validation samples to log to wandb
-  test_freq: 10
+  test_freq: 100
   rollout_data_dir: ./rollout_outputs
 
 ray_kwargs:
@@ -89,7 +89,7 @@ engine_kwargs:
 
 data:
   train_batch_size: 64  # Number of prompts per training step
-  val_batch_size: 64
+  val_batch_size: 512
   batch_size: 64  # Kept for compatibility
   train_files:
     - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet

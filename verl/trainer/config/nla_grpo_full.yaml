@@ -15,6 +15,8 @@ trainer:
   use_tensorboard: false
   default_local_dir: "/scratch/nla_checkpoints/${trainer.experiment_name}"
   save_freq: 100
+  max_actor_ckpt_to_keep: null  # Disable worker cleanup - use custom policy
+  max_critic_ckpt_to_keep: null  # Disable worker cleanup - use custom policy
   checkpoint:
     save_freq: ${trainer.save_freq}
     load_path: null

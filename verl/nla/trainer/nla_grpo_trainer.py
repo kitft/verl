@@ -252,9 +252,29 @@ class NLAGRPOTrainer(RayPPOTrainer):
     def fit(self):
         """Override fit to track training time and metrics."""
         import time
+        import signal
+        import sys
         import verl.utils.tracking
 
         self.training_start_time = time.time()
+
+        # Setup signal handler for Ctrl-C to save checkpoint before exiting
+        def signal_handler(sig, frame):
+            print("\n[SIGINT] Ctrl-C detected. Checking if checkpoint should be saved...")
+            if self.global_steps >= 100:
+                print(f"[SIGINT] Training has progressed to step {self.global_steps}. Saving checkpoint...")
+                try:
+                    self._save_checkpoint()
+                    print("[SIGINT] Checkpoint saved successfully.")
+                except Exception as e:
+                    print(f"[SIGINT] Failed to save checkpoint: {e}")
+            else:
+                print(f"[SIGINT] Only {self.global_steps} steps completed (< 100). Skipping checkpoint save.")
+            print("[SIGINT] Exiting...")
+            sys.exit(0)
+
+        # Register signal handler
+        signal.signal(signal.SIGINT, signal_handler)
 
         # Monkey-patch Tracking.log to capture metrics
         # This is necessary because parent creates its own logger internally
@@ -395,3 +415,78 @@ class NLAGRPOTrainer(RayPPOTrainer):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+        # Cleanup old checkpoints based on retention policy
+        self._cleanup_old_checkpoints()
+
+    def _cleanup_old_checkpoints(self):
+        """
+        Cleanup old checkpoints to save disk space.
+
+        Retention policy:
+        - Keep the last 3 checkpoints (rolling window)
+        - Keep every 10th checkpoint permanently (milestones)
+
+        Example with save_freq=100:
+        - Milestones: steps 1000, 2000, 3000, ... (kept permanently)
+        - Rolling: last 3 checkpoints regardless of step
+        """
+        import glob
+        import re
+        import shutil
+        from pathlib import Path
+
+        save_freq = self.config.trainer.save_freq
+        if save_freq <= 0:
+            return  # No cleanup if checkpointing is disabled
+
+        checkpoint_base_dir = Path(self.config.trainer.default_local_dir)
+        if not checkpoint_base_dir.exists():
+            return
+
+        # Find all checkpoint directories
+        checkpoint_pattern = str(checkpoint_base_dir / "global_step_*")
+        checkpoint_dirs = glob.glob(checkpoint_pattern)
+
+        if len(checkpoint_dirs) <= 3:
+            return  # Keep all if we have 3 or fewer
+
+        # Extract step numbers and sort
+        checkpoint_steps = []
+        for dir_path in checkpoint_dirs:
+            match = re.search(r"global_step_(\d+)", dir_path)
+            if match:
+                step = int(match.group(1))
+                checkpoint_steps.append((step, dir_path))
+
+        checkpoint_steps.sort()
+
+        # Determine which checkpoints to keep
+        milestone_interval = 10 * save_freq
+        keep_steps = set()
+
+        # Keep milestones (every 10x save_freq)
+        for step, _ in checkpoint_steps:
+            if step % milestone_interval == 0:
+                keep_steps.add(step)
+
+        # Keep last 3 checkpoints
+        for step, _ in checkpoint_steps[-3:]:
+            keep_steps.add(step)
+
+        # Delete checkpoints not in keep set
+        deleted_count = 0
+        for step, dir_path in checkpoint_steps:
+            if step not in keep_steps:
+                try:
+                    shutil.rmtree(dir_path)
+                    print(f"[Checkpoint Cleanup] Deleted old checkpoint: {dir_path}")
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"[Checkpoint Cleanup] Failed to delete {dir_path}: {e}")
+
+        if deleted_count > 0:
+            print(
+                f"[Checkpoint Cleanup] Deleted {deleted_count} old checkpoint(s). "
+                f"Kept {len(keep_steps)} checkpoints (last 3 + milestones every {milestone_interval} steps)"
+            )

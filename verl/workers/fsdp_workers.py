@@ -281,6 +281,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         role="actor",
         enable_activation_offload=False,
     ):
+        from pathlib import Path
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
@@ -293,10 +294,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
 
+        # Auto-detect FSDP checkpoint and extract paths for config vs weights
+        fsdp_checkpoint_path = None
+        config_path = local_path
+
+        path_obj = Path(local_path)
+        if path_obj.is_dir():
+            # Check for FSDP checkpoint indicators
+            has_fsdp_shards = any(path_obj.glob("model_world_size_*_rank_*.pt"))
+            has_fsdp_config = (path_obj / "fsdp_config.json").exists()
+            has_hf_subdir = (path_obj / "huggingface").exists()
+
+            if has_fsdp_shards and has_fsdp_config:
+                # This is an FSDP checkpoint root
+                fsdp_checkpoint_path = str(path_obj)
+                if has_hf_subdir:
+                    # Use huggingface/ subdirectory for config and tokenizer
+                    config_path = str(path_obj / "huggingface")
+                    if self.rank == 0:
+                        logger.info(f"[{role}] Detected FSDP checkpoint at {fsdp_checkpoint_path}")
+                        logger.info(f"[{role}] Will initialize from config at {config_path}, then load sharded weights")
+                else:
+                    raise ValueError(
+                        f"FSDP checkpoint at {local_path} is missing huggingface/ subdirectory. "
+                        "This directory should contain config.json and tokenizer files. "
+                        "Please ensure your SFT training saves these files."
+                    )
+
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        # Load tokenizer/processor from config_path (either original path or huggingface/ subdir)
+        self.tokenizer = hf_tokenizer(config_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(config_path, trust_remote_code=trust_remote_code)
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -312,7 +341,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            config_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -324,7 +353,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
             actor_model_config.text_config.topk_method = "greedy"
 
-        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config = get_generation_config(config_path, trust_remote_code=trust_remote_code)
 
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
@@ -365,12 +394,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     actor_module_class = AutoModel
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                trust_remote_code=trust_remote_code,
-            )
+            # Initialize model: use from_config for FSDP checkpoints, from_pretrained otherwise
+            if fsdp_checkpoint_path is not None:
+                # Create empty model from config - weights will be loaded from sharded checkpoint later
+                if self.rank == 0:
+                    logger.info(f"[{role}] Initializing empty model from config (weights will load from FSDP checkpoint)")
+                actor_module = actor_module_class.from_config(
+                    config=actor_model_config,
+                )
+                # Store checkpoint path for loading after FSDP wrapping
+                self._pending_fsdp_checkpoint_load = fsdp_checkpoint_path
+            else:
+                # Standard initialization from HuggingFace pretrained model
+                actor_module = actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=config_path,
+                    torch_dtype=torch_dtype,
+                    config=actor_model_config,
+                    trust_remote_code=trust_remote_code,
+                )
+                self._pending_fsdp_checkpoint_load = None
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -507,6 +549,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
 
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
+
+        # Load sharded FSDP checkpoint if we initialized from config
+        if hasattr(self, '_pending_fsdp_checkpoint_load') and self._pending_fsdp_checkpoint_load is not None:
+            checkpoint_path = self._pending_fsdp_checkpoint_load
+            if self.rank == 0:
+                logger.info(f"[{role}] Loading sharded weights from FSDP checkpoint: {checkpoint_path}")
+
+            # Load only model weights (not optimizer or extra state)
+            state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+            with get_fsdp_state_ctx(actor_module_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, None):
+                model_shard_path = os.path.join(checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+
+                # Use copy_to_local in case checkpoint is on remote storage
+                local_shard_path = copy_to_local(model_shard_path)
+                model_state_dict = torch.load(local_shard_path, weights_only=False)
+                actor_module_fsdp.load_state_dict(model_state_dict)
+
+                if self.rank == 0:
+                    logger.info(f"[{role}] Successfully loaded sharded weights from {checkpoint_path}")
+
+            # Clear the pending flag
+            self._pending_fsdp_checkpoint_load = None
+
+            log_gpu_memory_usage(f"After {role} checkpoint load", logger=logger)
 
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
@@ -1184,6 +1250,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
+        from pathlib import Path
         from torch import optim
         from torch.distributed.fsdp import MixedPrecision
 
@@ -1192,6 +1259,34 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         use_shm = config.model.get("use_shm", False)
         local_path = copy_to_local(config.model.path, use_shm=use_shm)
+
+        # Auto-detect FSDP checkpoint and extract paths for config vs weights
+        fsdp_checkpoint_path = None
+        config_path = local_path
+
+        path_obj = Path(local_path)
+        if path_obj.is_dir():
+            # Check for FSDP checkpoint indicators
+            has_fsdp_shards = any(path_obj.glob("model_world_size_*_rank_*.pt"))
+            has_fsdp_config = (path_obj / "fsdp_config.json").exists()
+            has_hf_subdir = (path_obj / "huggingface").exists()
+
+            if has_fsdp_shards and has_fsdp_config:
+                # This is an FSDP checkpoint root
+                fsdp_checkpoint_path = str(path_obj)
+                if has_hf_subdir:
+                    # Use huggingface/ subdirectory for config and tokenizer
+                    config_path = str(path_obj / "huggingface")
+                    if self.rank == 0:
+                        logger.info(f"[critic] Detected FSDP checkpoint at {fsdp_checkpoint_path}")
+                        logger.info(f"[critic] Will initialize from config at {config_path}, then load sharded weights")
+                else:
+                    raise ValueError(
+                        f"FSDP checkpoint at {local_path} is missing huggingface/ subdirectory. "
+                        "This directory should contain config.json and tokenizer files. "
+                        "Please ensure your SFT training saves these files."
+                    )
+
         # note that the tokenizer between actor and critic may be different. So override tokenizer info with actor info
         # using random initialized model from any architecture. May not be the same as Actor.
 
@@ -1220,7 +1315,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         from transformers import AutoConfig
 
         critic_model_config = AutoConfig.from_pretrained(
-            local_path,
+            config_path,
             attn_implementation="flash_attention_2",
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
@@ -1245,12 +1340,29 @@ class CriticWorker(Worker, DistProfilerExtension):
             critic_model_config.hidden_dropout = "0"
             critic_model_config.summary_dropout_prob = 0.0
 
-            critic_module = load_valuehead_model(
-                local_path,
-                torch_dtype,
-                critic_model_config,
-                config.model.get("trust_remote_code", False),
-            )
+            # Initialize model: use from_config for FSDP checkpoints, from_pretrained otherwise
+            if fsdp_checkpoint_path is not None:
+                # Create empty model from config - weights will be loaded from sharded checkpoint later
+                if self.rank == 0:
+                    logger.info(f"[critic] Initializing empty model from config (weights will load from FSDP checkpoint)")
+                critic_module = load_valuehead_model(
+                    config_path,
+                    torch_dtype,
+                    critic_model_config,
+                    config.model.get("trust_remote_code", False),
+                    from_config_only=True,  # New parameter to use from_config instead of from_pretrained
+                )
+                # Store checkpoint path for loading after FSDP wrapping
+                self._pending_critic_fsdp_checkpoint_load = fsdp_checkpoint_path
+            else:
+                # Standard initialization from HuggingFace pretrained model
+                critic_module = load_valuehead_model(
+                    config_path,
+                    torch_dtype,
+                    critic_model_config,
+                    config.model.get("trust_remote_code", False),
+                )
+                self._pending_critic_fsdp_checkpoint_load = None
 
             # Optionally truncate critic at specified layer (for NLA training efficiency)
             # NOTE: truncate_at_layer corresponds to hidden_states index from dataset generation
@@ -1402,6 +1514,30 @@ class CriticWorker(Worker, DistProfilerExtension):
             enable_activation_offloading(critic_module, config.strategy, enable_gradient_checkpointing)
 
         log_gpu_memory_usage("After critic FSDP", logger=None)
+
+        # Load sharded FSDP checkpoint if we initialized from config
+        if hasattr(self, '_pending_critic_fsdp_checkpoint_load') and self._pending_critic_fsdp_checkpoint_load is not None:
+            checkpoint_path = self._pending_critic_fsdp_checkpoint_load
+            if self.rank == 0:
+                logger.info(f"[critic] Loading sharded weights from FSDP checkpoint: {checkpoint_path}")
+
+            # Load only model weights (not optimizer or extra state)
+            state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+            with get_fsdp_state_ctx(critic_module, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, None):
+                model_shard_path = os.path.join(checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+
+                # Use copy_to_local in case checkpoint is on remote storage
+                local_shard_path = copy_to_local(model_shard_path)
+                model_state_dict = torch.load(local_shard_path, weights_only=False)
+                critic_module.load_state_dict(model_state_dict)
+
+                if self.rank == 0:
+                    logger.info(f"[critic] Successfully loaded sharded weights from {checkpoint_path}")
+
+            # Clear the pending flag
+            self._pending_critic_fsdp_checkpoint_load = None
+
+            log_gpu_memory_usage("After critic checkpoint load", logger=None)
 
         critic_optimizer = optim.AdamW(
             critic_module.parameters(),
