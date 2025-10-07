@@ -1,16 +1,16 @@
 """NLA SFT Dataset with activation vector support."""
 
-import torch
-import pandas as pd
+from typing import Any
+
 import numpy as np
-from typing import Dict, Optional, Any, List, Union
+import pandas as pd
+import torch
 from omegaconf import DictConfig
 from omegaconf.listconfig import ListConfig
 from transformers import PreTrainedTokenizer
 
-from verl.utils.dataset.sft_dataset import SFTDataset
 from verl.nla.utils.injection_manager import InjectionTokenManager
-from verl.utils.model import compute_position_id_with_mask
+from verl.utils.dataset.sft_dataset import SFTDataset
 
 
 class NLASFTDataset(SFTDataset):
@@ -30,8 +30,8 @@ class NLASFTDataset(SFTDataset):
 
     def __init__(
         self,
-        parquet_files: Union[str, ListConfig],
-        tokenizer: Union[str, PreTrainedTokenizer],
+        parquet_files: str | ListConfig,
+        tokenizer: str | PreTrainedTokenizer,
         config: DictConfig,
         mode: str = "actor",  # "actor", "critic", or "both"
     ):
@@ -85,11 +85,13 @@ class NLASFTDataset(SFTDataset):
 
             # Ensure correct dimension
             if vec.shape[-1] != self.activation_dim:
-                raise ValueError(f"Activation vector dimension mismatch: expected {self.activation_dim}, got {vec.shape[-1]}")
+                raise ValueError(
+                    f"Activation vector dimension mismatch: expected {self.activation_dim}, got {vec.shape[-1]}"
+                )
 
             self.activation_vectors.append(vec)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """
         Get a training sample.
 
@@ -109,10 +111,12 @@ class NLASFTDataset(SFTDataset):
 
             # Merge samples, with critic fields prefixed
             combined_sample = actor_sample.copy()
-            combined_sample.update({
-                "response_ids": critic_sample["response_ids"],
-                "response_attention_mask": critic_sample["response_attention_mask"],
-            })
+            combined_sample.update(
+                {
+                    "response_ids": critic_sample["response_ids"],
+                    "response_attention_mask": critic_sample["response_attention_mask"],
+                }
+            )
             return combined_sample
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
@@ -127,7 +131,7 @@ class NLASFTDataset(SFTDataset):
         prompt_data = self.prompts[idx]
 
         # Handle numpy array or list
-        if hasattr(prompt_data, 'tolist'):
+        if hasattr(prompt_data, "tolist"):
             prompt_data = prompt_data.tolist()
         elif isinstance(prompt_data, str):
             # Already a string, return as-is
@@ -135,12 +139,12 @@ class NLASFTDataset(SFTDataset):
 
         # Extract user message content
         for msg in prompt_data:
-            if isinstance(msg, dict) and msg.get('role') == 'user':
-                return msg.get('content', '').strip()
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return msg.get("content", "").strip()
 
         raise ValueError(f"No user message found in prompt at index {idx}")
 
-    def _prepare_actor_sample(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _prepare_actor_sample(self, idx: int) -> dict[str, torch.Tensor]:
         """
         Prepare sample for actor training with activation injection.
 
@@ -175,23 +179,24 @@ class NLASFTDataset(SFTDataset):
 
         return sample
 
-    def _prepare_critic_sample(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _prepare_critic_sample(self, idx: int) -> dict[str, torch.Tensor]:
         """
         Prepare sample for critic training.
 
         The critic only needs the response text to predict activation vectors.
+        Note: We do NOT add eos_token to match RL behavior where special tokens are masked out.
         """
         response = self.responses[idx]
 
-        # Tokenize response only
-        response_with_eos = response + self.tokenizer.eos_token
+        # Tokenize response only (no eos_token to match RL behavior)
+        # response_with_eos = response + self.tokenizer.eos_token
         response_output = self.tokenizer(
-            response_with_eos,
+            response,
             return_tensors="pt",
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
-            add_special_tokens=False
+            add_special_tokens=False,
         )
 
         sample = {
@@ -202,7 +207,7 @@ class NLASFTDataset(SFTDataset):
 
         return sample
 
-    def _attach_metadata(self, idx: int, sample: Dict[str, Any]) -> Dict[str, Any]:
+    def _attach_metadata(self, idx: int, sample: dict[str, Any]) -> dict[str, Any]:
         row = self.dataframe.iloc[idx]
 
         metadata_keys = [
@@ -242,7 +247,7 @@ class NLASFTCollator:
     def __init__(self, pad_token_id: int = 0):
         self.pad_token_id = pad_token_id
 
-    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         """
         Collate batch of samples, handling activation vectors properly.
         """

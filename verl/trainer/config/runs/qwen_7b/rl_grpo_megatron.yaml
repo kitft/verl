@@ -1,0 +1,178 @@
+# @package _global_
+
+defaults:
+  - rl_grpo  # Inherit from FSDP base config
+  - _self_
+
+# Megatron-LM configuration for Qwen2.5-7B-Instruct (8 GPUs)
+#
+# Key differences from FSDP version:
+# - Uses Megatron strategy with tensor parallelism (TP=4)
+# - Pipeline parallelism MUST be 1 (PP=1) for NLA critic
+# - Different batch size handling for Megatron
+# - No FSDP offloading (Megatron uses TP sharding instead)
+#
+# GRPO Batch Size Configuration:
+# With rollout.n=8, each prompt generates 8 responses.
+# Total experiences = data.batch_size × rollout.n = 64 × 8 = 512
+# For ONE gradient update per batch: ppo_mini_batch_size = 512
+
+actor_rollout_ref:
+  actor:
+    strategy: megatron  # Use Megatron instead of FSDP
+    ppo_micro_batch_size_per_gpu: 4  # Smaller for Megatron (4 GPUs handle TP=4)
+    ppo_mini_batch_size: 512  # 64 prompts × 8 responses (rollout.n)
+
+    # Megatron-specific settings
+    megatron:
+      tensor_model_parallel_size: 4  # TP=4 across 4 GPUs
+      pipeline_model_parallel_size: 1  # MUST be 1 for NLA
+      sequence_parallel: false  # Optional: enable for long sequences
+
+      # Model configuration
+      override_model_config:
+        model_config:
+          use_cache: false
+
+      override_transformer_config:
+        bf16: true
+        params_dtype: bfloat16
+        pipeline_dtype: bfloat16
+
+        # Activation checkpointing for memory efficiency
+        recompute_granularity: "selective"  # or "full"
+        recompute_method: "block"
+        recompute_num_layers: 1  # Recompute every layer for max memory savings
+
+        # Distributed optimizer settings
+        use_distributed_optimizer: true
+        overlap_grad_reduce: false
+        overlap_param_gather: false
+
+    # Remove FSDP config
+    fsdp_config: null
+
+    optim:
+      lr: 1e-5
+      weight_decay: 0.001
+      lr_warmup_steps: 50
+
+  rollout:
+    gpu_memory_utilization: 0.5
+    tensor_model_parallel_size: 1  # SGLang uses single TP (actor TP is separate)
+    n: 8  # Generate N responses per prompt for GRPO
+
+critic:
+  strategy: megatron  # Use Megatron instead of FSDP
+  output_layer_index: 20  # Extract from layer 20 (Qwen 7B has 28 layers, so -8 from end)
+  ppo_micro_batch_size_per_gpu: 4  # Smaller for Megatron
+
+  # Megatron-specific settings
+  megatron:
+    tensor_model_parallel_size: 4  # TP=4 across 4 GPUs
+    pipeline_model_parallel_size: 1  # MUST be 1 for NLA (intermediate layer extraction)
+    sequence_parallel: false
+
+    # Model configuration
+    override_model_config:
+      model_config:
+        use_cache: false
+
+    override_transformer_config:
+      bf16: true
+      params_dtype: bfloat16
+      pipeline_dtype: bfloat16
+
+      # Activation checkpointing
+      recompute_granularity: "selective"
+      recompute_method: "block"
+      recompute_num_layers: 1
+
+      # Distributed optimizer
+      use_distributed_optimizer: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+  # Remove FSDP config
+  model:
+    fsdp_config: null
+
+  optim:
+    lr: 1e-9
+    weight_decay: 0.001
+    lr_warmup_steps: 50
+
+trainer:
+  n_gpus_per_node: 8  # Use 8 GPUs on this node
+  nnodes: 1  # Single node
+  total_training_steps: 10000
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # Must match actor
+  ppo_epochs: 1
+  steps_per_update: 1
+  project_name: nla-rl-q7b-megatron
+  experiment_name: qwen-7b-megatron-tp4
+  logger: ["console", "wandb"]
+  resume_mode: disable
+  log_val_generations: 100
+  test_freq: 100
+  rollout_data_dir: ./rollout_outputs
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 32
+    num_gpus: 8
+  # Resource pool configuration for Megatron
+  # Actor uses 4 GPUs for TP=4, Critic uses 4 GPUs for TP=4
+  resource_pool:
+    actor_rollout:
+      num_gpus: 4  # 4 GPUs for actor TP=4
+    critic:
+      num_gpus: 4  # 4 GPUs for critic TP=4
+
+algorithm:
+  adv_estimator: grpo
+
+nla:
+  injection:
+    mode: replace
+    layer_indices: [0]
+    projection_dim: null
+    injection_token: null
+
+engine_kwargs:
+  sglang: {}
+
+data:
+  train_batch_size: 64  # Number of prompts per training step
+  val_batch_size: 512
+  batch_size: 64  # Kept for compatibility
+  train_files:
+    - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet
+  val_files:
+    - /workspace/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_7b_layer20.parquet
+
+# Megatron-specific notes:
+#
+# 1. Pipeline Parallelism (PP):
+#    - MUST be 1 for NLA critic (intermediate layer extraction)
+#    - Actor embedding extraction only works on first PP stage (handled automatically)
+#
+# 2. Tensor Parallelism (TP):
+#    - TP=4 recommended for 7B model on 8 GPUs (4 GPUs for actor, 4 for critic)
+#    - Can increase to TP=8 if using resource pools differently
+#    - TP handles embedding all-reduce internally (no special handling needed)
+#
+# 3. Resource Allocation:
+#    - 4 GPUs: actor_rollout with TP=4
+#    - 4 GPUs: critic with TP=4
+#    - SGLang rollout uses 1 GPU (separate from actor TP)
+#
+# 4. Batch Sizes:
+#    - Megatron uses smaller micro_batch_size_per_gpu (4 vs 8 for FSDP)
+#    - Total experiences = 64 prompts × 8 responses = 512
+#    - ppo_mini_batch_size = 512 for one gradient update
+#
+# 5. Memory Optimization:
+#    - Activation checkpointing enabled (recompute_num_layers=1)
+#    - Distributed optimizer enabled
+#    - No offloading (Megatron keeps params on GPU with TP sharding)

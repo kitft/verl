@@ -1,0 +1,17 @@
+# NLA SFT configuration - 7B Qwen model with TRUNCATED CRITIC ONLY
+# Actor remains full size, critic is truncated for efficiency
+# Inherits from nla_sft_7b_8gpu
+
+defaults:
+  - nla_sft_7b_8gpu
+  - _self_
+
+# Override: Ensure actor is NOT truncated
+model:
+  truncate_layers: null  # Actor stays full size (28 layers for Qwen 7B)
+
+# Override: Truncate ONLY the critic
+nla:
+  critic:
+    truncate_layers: 10  # Critic truncated to 10 layers (from 28)
+    # This reduces critic memory/computation while keeping actor at full capacity

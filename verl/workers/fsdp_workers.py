@@ -37,6 +37,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 
+from verl.utils.fsdp_utils import fsdp_version, get_fsdp_state_ctx
+
 try:
     # for torch 2.5+
     from torch.distributed.tensor import DTensor
@@ -69,7 +71,6 @@ from verl.utils.fsdp_utils import (
     apply_fsdp2,
     collect_lora_params,
     fsdp2_load_full_state_dict,
-    fsdp_version,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     get_shard_placement_fn,
@@ -282,6 +283,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         enable_activation_offload=False,
     ):
         from pathlib import Path
+
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
@@ -398,7 +400,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if fsdp_checkpoint_path is not None:
                 # Create empty model from config - weights will be loaded from sharded checkpoint later
                 if self.rank == 0:
-                    logger.info(f"[{role}] Initializing empty model from config (weights will load from FSDP checkpoint)")
+                    logger.info(
+                        f"[{role}] Initializing empty model from config (weights will load from FSDP checkpoint)"
+                    )
                 actor_module = actor_module_class.from_config(
                     config=actor_model_config,
                 )
@@ -551,7 +555,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
         # Load sharded FSDP checkpoint if we initialized from config
-        if hasattr(self, '_pending_fsdp_checkpoint_load') and self._pending_fsdp_checkpoint_load is not None:
+        if hasattr(self, "_pending_fsdp_checkpoint_load") and self._pending_fsdp_checkpoint_load is not None:
             checkpoint_path = self._pending_fsdp_checkpoint_load
             if self.rank == 0:
                 logger.info(f"[{role}] Loading sharded weights from FSDP checkpoint: {checkpoint_path}")
@@ -559,7 +563,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # Load only model weights (not optimizer or extra state)
             state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
             with get_fsdp_state_ctx(actor_module_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, None):
-                model_shard_path = os.path.join(checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                model_shard_path = os.path.join(
+                    checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
+                )
 
                 # Use copy_to_local in case checkpoint is on remote storage
                 local_shard_path = copy_to_local(model_shard_path)
@@ -1251,6 +1257,7 @@ class CriticWorker(Worker, DistProfilerExtension):
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
         from pathlib import Path
+
         from torch import optim
         from torch.distributed.fsdp import MixedPrecision
 
@@ -1344,7 +1351,9 @@ class CriticWorker(Worker, DistProfilerExtension):
             if fsdp_checkpoint_path is not None:
                 # Create empty model from config - weights will be loaded from sharded checkpoint later
                 if self.rank == 0:
-                    logger.info(f"[critic] Initializing empty model from config (weights will load from FSDP checkpoint)")
+                    logger.info(
+                        "[critic] Initializing empty model from config (weights will load from FSDP checkpoint)"
+                    )
                 critic_module = load_valuehead_model(
                     config_path,
                     torch_dtype,
@@ -1393,13 +1402,19 @@ class CriticWorker(Worker, DistProfilerExtension):
                             critic_module.config.num_hidden_layers = num_layers_to_keep
 
                         if self.rank == 0:
-                            print(f"Truncated critic from {original_num_layers} to {num_layers_to_keep} layers "
-                                  f"(to match hidden_states[{truncate_at_layer}] from dataset generation)")
+                            print(
+                                f"Truncated critic from {original_num_layers} to {num_layers_to_keep} layers "
+                                f"(to match hidden_states[{truncate_at_layer}] from dataset generation)"
+                            )
                     elif self.rank == 0:
-                        print(f"Warning: truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation")
-                        raise ValueError(f"truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation")
+                        print(
+                            f"Warning: truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation"
+                        )
+                        raise ValueError(
+                            f"truncate_at_layer={truncate_at_layer} >= num_layers={original_num_layers}, no truncation"
+                        )
                 elif self.rank == 0:
-                    print(f"Warning: Could not find 'layers' attribute for truncation")
+                    print("Warning: Could not find 'layers' attribute for truncation")
                     raise ValueError("Could not find 'layers' attribute for truncation")
 
             use_remove_padding = config.model.get("use_remove_padding", False)
@@ -1516,7 +1531,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
         # Load sharded FSDP checkpoint if we initialized from config
-        if hasattr(self, '_pending_critic_fsdp_checkpoint_load') and self._pending_critic_fsdp_checkpoint_load is not None:
+        if (
+            hasattr(self, "_pending_critic_fsdp_checkpoint_load")
+            and self._pending_critic_fsdp_checkpoint_load is not None
+        ):
             checkpoint_path = self._pending_critic_fsdp_checkpoint_load
             if self.rank == 0:
                 logger.info(f"[critic] Loading sharded weights from FSDP checkpoint: {checkpoint_path}")
@@ -1524,7 +1542,9 @@ class CriticWorker(Worker, DistProfilerExtension):
             # Load only model weights (not optimizer or extra state)
             state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
             with get_fsdp_state_ctx(critic_module, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, None):
-                model_shard_path = os.path.join(checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                model_shard_path = os.path.join(
+                    checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
+                )
 
                 # Use copy_to_local in case checkpoint is on remote storage
                 local_shard_path = copy_to_local(model_shard_path)

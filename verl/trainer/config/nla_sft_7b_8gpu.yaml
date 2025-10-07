@@ -93,6 +93,8 @@ nla:
     pooling: last
     dropout: 0.1
     projection_layers: 2
+    # Optional: Truncate critic model independently (null or <=0 to disable)
+    truncate_layers: null  # e.g., set to 8 for smaller critic
 
   # Training settings
   critic_lr: 2e-5

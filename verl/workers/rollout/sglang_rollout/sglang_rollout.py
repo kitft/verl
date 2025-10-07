@@ -280,14 +280,14 @@ def _normalize_input_embeds(value: Any):
     if value is None:
         return None
     if isinstance(value, torch.Tensor):
-        print(f"DEBUG _normalize_input_embeds: Converting tensor with shape {value.shape} to list...")
+        # print(f"DEBUG _normalize_input_embeds: Converting tensor with shape {value.shape} to list...")
         result = value.detach().cpu().tolist()
-        print(f"DEBUG _normalize_input_embeds: Tensor conversion complete")
+        # print(f"DEBUG _normalize_input_embeds: Tensor conversion complete")
         return result
     if isinstance(value, np.ndarray):
-        print(f"DEBUG _normalize_input_embeds: Converting ndarray with shape {value.shape} to list...")
+        # print(f"DEBUG _normalize_input_embeds: Converting ndarray with shape {value.shape} to list...")
         result = value.tolist()
-        print(f"DEBUG _normalize_input_embeds: Ndarray conversion complete")
+        # print(f"DEBUG _normalize_input_embeds: Ndarray conversion complete")
         return result
     if isinstance(value, (float, int, np.floating, np.integer)):
         return float(value)

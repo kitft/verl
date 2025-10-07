@@ -53,11 +53,24 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
     Compatible with VERL's critic infrastructure.
     """
 
-    def __init__(self, pretrained_model_name_or_path: str, dropout: float = 0.1, **model_kwargs):
+    def __init__(
+        self,
+        pretrained_model_name_or_path: str = None,
+        *,
+        pretrained_model: nn.Module = None,
+        dropout: float = 0.1,
+        **model_kwargs,
+    ):
         super().__init__()
 
-        # Load the base model (same as actor)
-        self.pretrained_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
+        if pretrained_model is not None:
+            # Use pre-loaded model (allows truncation before wrapping)
+            self.pretrained_model = pretrained_model
+        elif pretrained_model_name_or_path is not None:
+            # Load the base model (same as actor)
+            self.pretrained_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
+        else:
+            raise ValueError("Either pretrained_model_name_or_path or pretrained_model must be provided.")
 
         # Get hidden size from model config
         self.config = self.pretrained_model.config
@@ -108,40 +121,56 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
         )
 
         # Get the last hidden states from the final layer
-        
-        hidden_states = outputs.hidden_states[-1]  # (batch, seq_len, hidden_size)
 
-        # Extract last token for each sequence (where we'll get the activation vector)
-        if attention_mask is not None:
-            # Find the last valid token position for each sequence
-            seq_lengths = attention_mask.sum(dim=1) - 1  # (batch,)
-            batch_size = hidden_states.shape[0]
-            last_hidden = hidden_states[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
+        # hidden_states = outputs.hidden_states[-1]  # (batch, seq_len, hidden_size)
+
+        # # Extract last token for each sequence (where we'll get the activation vector)
+        # if attention_mask is not None:
+        #     # Find the last valid token position for each sequence
+        #     seq_lengths = attention_mask.sum(dim=1) - 1  # (batch,)
+        #     batch_size = hidden_states.shape[0]
+        #     last_hidden = hidden_states[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
+        # else:
+        #     raise ValueError("Attention mask is required for last pooling")
+        #     # If no mask, just take the last position
+        #     last_hidden = hidden_states[:, -1, :]  # (batch, hidden_size)
+        seq_lengths = attention_mask.sum(dim=1) - 1
+        seq_lengths = seq_lengths.clamp(min=0)
+
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            last_hidden_state = outputs.last_hidden_state  # (batch, seq_len, hidden_size)
+        elif hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            last_hidden_state = outputs.hidden_states[-1]
         else:
-            raise ValueError("Attention mask is required for last pooling")
-            # If no mask, just take the last position
-            last_hidden = hidden_states[:, -1, :]  # (batch, hidden_size)
+            print(f"type of model = {self.pretrained_model}")
+            print(f"type of model = {type(self.pretrained_model)}")
+            print(f"attrs of model = {dir(self.pretrained_model)}")
+            import inspect
+
+            print(f"args and kwargs accepted by __call__ = {inspect.signature(self.pretrained_model.__call__)}")
+            raise ValueError(
+                f"Last hidden state or hidden states are not available in the critic output: available keys are {outputs.keys()} and which are none? {[key is None for key in outputs.keys()]}"
+            )
+        indices = torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device)
+        last_hidden = last_hidden_state[indices, seq_lengths]  # (batch, hidden_size) (batch, hidden_size)
 
         # Directly use the last hidden state as activation vector (with optional dropout)
-        #activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
+        # activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
         # no dropout
         activation_vector = last_hidden
         # Return activation vector as (batch, hidden_size)
         values = activation_vector
-        #print("shape of values inside the forward pass:", values.shape)
-        #raise ValueError("Stop here - not properly implemented")
+        # print("shape of values inside the forward pass:", values.shape)
+        # raise ValueError("Stop here - not properly implemented")
 
         if not return_dict:
             return (None, None, values)
 
-        print(f"""#########################################################################
-            Should never occur in training
-            ################################################################################""")
         return CausalLMOutputWithValue(
             loss=None,
             logits=None,
             value=values,
-            hidden_states=[values],
+            hidden_states=outputs.hidden_states,  # Return full tuple from base model
             attentions=None,
         )
 

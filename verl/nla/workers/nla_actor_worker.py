@@ -527,10 +527,13 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         hidden_dim = input_embeds.shape[-1]
 
+        # Validate activation vector dimensions match model hidden size
         if activation_vectors.shape[-1] != hidden_dim:
-            log.debug(f"NLA Actor: Projecting activation vectors from {activation_vectors.shape[-1]} to {hidden_dim}")
-            projection = torch.nn.Linear(activation_vectors.shape[-1], hidden_dim, bias=False).to(activation_vectors.device)
-            activation_vectors = projection(activation_vectors)
+            raise ValueError(
+                f"Activation vector dimension mismatch: activation_vectors have shape {activation_vectors.shape} "
+                f"(dimension {activation_vectors.shape[-1]}), but model hidden_dim is {hidden_dim}. "
+                f"activation_dim must equal model hidden_size. Check your config and dataset."
+            )
 
         from collections import defaultdict
 

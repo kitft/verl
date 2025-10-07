@@ -230,15 +230,18 @@ class NLATaskRunner:
         """Add actor rollout worker."""
         from verl.single_controller.ray import RayWorkerGroup
 
-        # NLA only supports FSDP strategy currently
+        # NLA supports FSDP and Megatron strategies
         strategy = config.actor_rollout_ref.actor.strategy
-        if strategy not in {"fsdp", "fsdp2"}:
-            raise NotImplementedError(f"NLA only supports FSDP strategy, got '{strategy}'")
-
-        # Use NLA actor worker for activation injection
-        from verl.nla.workers.nla_actor_worker import NLAActorRolloutRefWorker
-
-        actor_rollout_cls = NLAActorRolloutRefWorker
+        if strategy in {"fsdp", "fsdp2"}:
+            # Use NLA FSDP actor worker for activation injection
+            from verl.nla.workers.nla_actor_worker import NLAActorRolloutRefWorker
+            actor_rollout_cls = NLAActorRolloutRefWorker
+        elif strategy == "megatron":
+            # Use NLA Megatron actor worker for activation injection
+            from verl.nla.workers.nla_megatron_worker import NLAMegatronActorRolloutRefWorker
+            actor_rollout_cls = NLAMegatronActorRolloutRefWorker
+        else:
+            raise NotImplementedError(f"NLA does not support strategy '{strategy}'. Supported: fsdp, fsdp2, megatron")
 
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
         return actor_rollout_cls, RayWorkerGroup
@@ -246,17 +249,14 @@ class NLATaskRunner:
     def add_critic_worker(self, config):
         """Add critic worker."""
         # NLA GRPO uses our custom critic worker with vector value head
-        # we have actually disabled the value head linear map for now
         if config.critic.strategy in {"fsdp", "fsdp2"}:
             from verl.nla.workers.nla_critic_worker import NLACriticWorker
-
             critic_cls = NLACriticWorker
         elif config.critic.strategy == "megatron":
-            from verl.nla.workers.nla_critic_worker import NLACriticWorker
-
-            critic_cls = NLACriticWorker
+            from verl.nla.workers.nla_megatron_worker import NLAMegatronCriticWorker
+            critic_cls = NLAMegatronCriticWorker
         else:
-            raise NotImplementedError(f"Strategy {config.critic.strategy} not supported")
+            raise NotImplementedError(f"NLA does not support strategy '{config.critic.strategy}'. Supported: fsdp, fsdp2, megatron")
 
         self.role_worker_mapping[Role.Critic] = ray.remote(critic_cls)
 

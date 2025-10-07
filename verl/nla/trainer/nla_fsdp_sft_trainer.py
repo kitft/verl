@@ -80,12 +80,147 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             val_dataset=val_dataset,
         )
 
+    def _truncate_transformer(self, model: nn.Module, num_layers_to_keep: int) -> nn.Module:
+        """Truncate a HuggingFace transformer model to keep only the first N layers.
+
+        This method:
+        1. Identifies the layer attribute path (works for Llama, Gemma, Mistral, GPT-2, etc.)
+        2. Slices the nn.ModuleList to keep only first K layers
+        3. Updates model config to reflect new layer count
+
+        Args:
+            model: The model to truncate
+            num_layers_to_keep: Number of layers to keep (from the start)
+
+        Returns:
+            The truncated model (modified in-place, but returned for convenience)
+        """
+        import functools
+
+        def rgetattr(obj, attr, *args):
+            """Recursive getattr for nested attributes like 'model.layers'"""
+
+            def _getattr(obj, attr):
+                return getattr(obj, attr, *args)
+
+            return functools.reduce(_getattr, [obj] + attr.split("."))
+
+        def rsetattr(obj, attr, val):
+            """Recursive setattr for nested attributes"""
+            pre, _, post = attr.rpartition(".")
+            return setattr(rgetattr(obj, pre) if pre else obj, post, val)
+
+        # Common layer paths for different model architectures
+        layer_paths = [
+            "model.layers",  # Llama, Gemma, Mistral, Qwen
+            "transformer.h",  # GPT-2
+            "transformer.blocks",  # GPT-NeoX
+            "encoder.layer",  # BERT-like
+            "layers",  # Some other models
+        ]
+
+        layers_attribute = None
+        path_found = ""
+        for path in layer_paths:
+            try:
+                layers_attribute = rgetattr(model, path)
+                path_found = path
+                break
+            except AttributeError:
+                continue
+
+        if layers_attribute is None:
+            print(f"Warning: Could not find transformer layers to truncate for {model.__class__.__name__}.")
+            print(f"Attempted paths: {layer_paths}")
+            return model
+
+        if not isinstance(layers_attribute, nn.ModuleList):
+            print(f"Warning: Found attribute at '{path_found}' but it is not an nn.ModuleList. Truncation skipped.")
+            return model
+
+        original_layers = len(layers_attribute)
+        if num_layers_to_keep <= 0:
+            print(f"Truncation skipped: num_layers_to_keep must be > 0, got {num_layers_to_keep}")
+            return model
+        if num_layers_to_keep >= original_layers:
+            print(
+                f"Truncation skipped: requested {num_layers_to_keep} layers but model only has {original_layers} layers."
+            )
+            return model
+
+        # Slice the ModuleList to keep only first K layers
+        # This preserves layer ordering and ensures correct behavior
+        rsetattr(model, path_found, layers_attribute[:num_layers_to_keep])
+
+        # Update config to reflect new layer count
+        # This is CRITICAL - many parts of the model rely on this value
+        if hasattr(model.config, "num_hidden_layers"):
+            model.config.num_hidden_layers = num_layers_to_keep
+        if hasattr(model.config, "n_layer"):  # For GPT-2 style models
+            model.config.n_layer = num_layers_to_keep
+
+        model_name = getattr(model.config, "name_or_path", model.__class__.__name__)
+        print(f"✓ Truncated model '{model_name}' from {original_layers} to {num_layers_to_keep} layers")
+        print(f"  Layer path: {path_found}")
+        print(f"  Updated config.num_hidden_layers: {num_layers_to_keep}")
+
+        return model
+
+    def _truncate_model_config(self, config, num_layers_to_keep: int):
+        """Truncate model config to specify only K layers (SAFER method for FSDP).
+
+        This modifies the config BEFORE loading the model, which is safer for FSDP:
+        - Model is instantiated with K layers from the start
+        - Only weights for K layers are loaded from checkpoint
+        - No post-hoc surgery on model structure
+        - All ranks build identical structure deterministically
+
+        Args:
+            config: AutoConfig to modify
+            num_layers_to_keep: Number of layers to keep
+
+        Returns:
+            Modified config
+        """
+        # Get original layer count
+        original_layers = None
+        if hasattr(config, "num_hidden_layers"):
+            original_layers = config.num_hidden_layers
+        elif hasattr(config, "n_layer"):  # GPT-2 style
+            original_layers = config.n_layer
+        else:
+            print("Warning: Could not find layer count in config. Truncation skipped.")
+            return config
+
+        # Validate
+        if num_layers_to_keep <= 0:
+            print(f"Truncation skipped: num_layers_to_keep must be > 0, got {num_layers_to_keep}")
+            return config
+        if num_layers_to_keep >= original_layers:
+            print(f"Truncation skipped: requested {num_layers_to_keep} but model has {original_layers} layers.")
+            return config
+
+        # Modify config (this is the SAFE approach for FSDP)
+        if hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = num_layers_to_keep
+        if hasattr(config, "n_layer"):
+            config.n_layer = num_layers_to_keep
+
+        model_name = getattr(config, "name_or_path", "model")
+        print(f"✓ Config truncated: {model_name} will use {num_layers_to_keep}/{original_layers} layers")
+        print("  Method: Config modification (FSDP-safe)")
+        print("  Model will be built with truncated structure from the start")
+
+        return config
+
     def _build_model_optimizer(self):
         """Build either actor or critic model based on train_mode."""
         if self.train_mode == "actor":
+            print("Building NLA-wrapped actor model and optimizer")
             # Build NLA-wrapped actor model
             self._build_nla_actor_model_optimizer()
         else:  # critic mode
+            print("Building critic model and optimizer")
             # Build critic model and set it as the main model
             self._build_critic_model_optimizer()
 
@@ -112,6 +247,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             self.model_config.max_position_embeddings = max(
                 self.model_config.max_position_embeddings, self.config.data.max_length
             )
+
+        # NOTE: Actor truncation removed - only critic supports truncation
+        # Actor must remain full-size for proper generation capabilities
 
         # Initialize model with meta tensors if needed
         init_context = get_init_weight_context_manager(
@@ -147,6 +285,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 else:
                     raise
 
+            # NOTE: Truncation already applied via config modification above
+            # No need for post-hoc model surgery
+
             # Configure NLA injection
             injection_config = InjectionConfig(
                 mode=self.nla_config.get("injection", {}).get("mode", "replace"),
@@ -179,7 +320,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         self._apply_fsdp_wrapping(
             model_to_wrap=self.model,
             model_for_policy=self.model.base_model,
-            inner_model_for_fsdp2=self.model.base_model
+            inner_model_for_fsdp2=self.model.base_model,
         )
 
         # Create optimizer and scheduler
@@ -193,13 +334,33 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         if self.device_mesh.get_rank() == 0:
             print(f"Building NLA critic model from: {critic_model_path}")
 
-        # Create critic with vector value head
-        # Set as self.model for unified handling
-        self.model = AutoModelForCausalLMWithVectorValueHead(
-            pretrained_model_name_or_path=critic_model_path,
-            dropout=critic_config.get("dropout", 0.1),
+        # Load config first for FSDP-safe truncation
+        from transformers import AutoConfig
+
+        local_model_path = copy_to_local(src=critic_model_path, verbose=True)
+        critic_model_config = AutoConfig.from_pretrained(
+            local_model_path, trust_remote_code=self.config.model.trust_remote_code
+        )
+
+        # TRUNCATION LOGIC FOR CRITIC (CONFIG-BASED - FSDP SAFE)
+        # Modify config BEFORE loading model - safer for distributed training
+        num_layers_to_keep = critic_config.get("truncate_layers")
+        if num_layers_to_keep and num_layers_to_keep > 0:
+            critic_model_config = self._truncate_model_config(critic_model_config, num_layers_to_keep)
+
+        # Load the base model with modified config
+        critic_base_model = AutoModelForCausalLM.from_pretrained(
+            local_model_path,
+            config=critic_model_config,  # Use modified config with truncation
             trust_remote_code=self.config.model.trust_remote_code,
             attn_implementation="flash_attention_2" if self.config.model.get("enable_flashattn", False) else "eager",
+        )
+
+        # Create critic with the (potentially truncated) base model
+        # Pass the pre-loaded model instead of model path
+        self.model = AutoModelForCausalLMWithVectorValueHead(
+            pretrained_model=critic_base_model,
+            dropout=critic_config.get("dropout", 0.1),
         )
 
         # Apply FSDP wrapping
@@ -207,7 +368,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         self._apply_fsdp_wrapping(
             model_to_wrap=self.model,
             model_for_policy=self.model.pretrained_model,
-            inner_model_for_fsdp2=self.model.pretrained_model
+            inner_model_for_fsdp2=self.model.pretrained_model,
         )
 
         # Create optimizer and scheduler
@@ -225,17 +386,14 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
 
         if fsdp_strategy == "fsdp":
             # Setup FSDP1 with consistent configuration for both actor and critic
-            from torch.distributed.fsdp import CPUOffload, ShardingStrategy
+            from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import MixedPrecision
 
             # Setup mixed precision if configured
             mixed_precision = None
             if self.config.model.fsdp_config.get("mixed_precision", False):
                 mixed_precision = MixedPrecision(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
-                    buffer_dtype=torch.float32
+                    param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
                 )
 
             # Setup auto wrap policy
@@ -270,9 +428,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             from verl.utils.fsdp_utils import CPUOffloadPolicy
 
             mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                cast_forward_inputs=True
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
             )
 
             # Setup CPU offload if configured
@@ -326,116 +482,127 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 
         self.lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=self.total_steps
+            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
         )
 
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Compute loss with activation injection for actor training."""
-        if self.train_mode != "actor":
-            return super()._compute_loss_and_backward(batch, do_backward, n_micro_batches)
+        """Compute loss and backward pass for actor or critic training.
 
-        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-
-        activation_vectors = batch.get("activation_vectors")
-        if activation_vectors is not None:
-            activation_vectors = activation_vectors.to(self.device_name)
-
-        if activation_vectors is not None and use_sp:
-            raise NotImplementedError(
-                "Activation injection is not implemented when use_remove_padding/sequence parallelism is enabled."
-            )
-
-        input_ids = batch["input_ids"].to(self.device_name)
-        attention_mask = batch["attention_mask"].to(self.device_name)
-        position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
-        loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-        # For FSDP2, self.fsdp_model points to inner base_model but we need to call
-        # self.model (the NLAModelWrapper) to get activation injection
-        forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
-
-        context = self.sharding_manager if use_sp else nullcontext()
-        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                labels = input_ids[:, 1:].contiguous()
-                output = forward_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    use_cache=False,
-                    activation_vectors=activation_vectors,
-                )
-                logits = output.logits
-
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels.contiguous()
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
-            else:
-                batch_size, seqlen = input_ids.shape
-                input_ids_rmpad, indices, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
-
-                position_ids_rmpad = index_first_axis(
-                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
-                ).transpose(0, 1)
-
-                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad,
-                    position_ids_rmpad,
-                    sp_size=get_ulysses_sequence_parallel_world_size(),
-                )
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad_rolled,
-                    None,
-                    get_ulysses_sequence_parallel_world_size(),
-                )
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
-
-                output = forward_model(
-                    input_ids=input_ids_rmpad_sliced,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad_padded,
-                    use_cache=False,
-                    activation_vectors=activation_vectors,
-                )
-
-                logits_rmpad = output.logits.squeeze(0)
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-
-                full_loss = pad_input(
-                    hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-                )
-                full_loss = full_loss.squeeze(-1)[:, :-1]
-                full_loss = full_loss.reshape(-1)
-                loss_mask = loss_mask.to(full_loss.device)
-                loss = full_loss * loss_mask
-
-            valid_token_this_rank = torch.sum(loss_mask)
-
-            if self.config.data.balance_dp_token:
-                torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
-            else:
-                dp_size = 1
-
-            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+        For actor: CrossEntropy loss with activation injection
+        For critic: MSE loss for activation prediction
+        """
+        if self.train_mode == "critic":
+            # Critic training: predict activation vectors from responses
+            loss = self._compute_critic_loss(batch)
             loss = loss / n_micro_batches
 
             if do_backward:
                 loss.backward()
             return loss
+
+        elif self.train_mode == "actor":
+            # Actor training: generate with activation injection
+            use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+
+            activation_vectors = batch.get("activation_vectors")
+            if activation_vectors is not None:
+                activation_vectors = activation_vectors.to(self.device_name)
+
+            if activation_vectors is not None and use_sp:
+                raise NotImplementedError(
+                    "Activation injection is not implemented when use_remove_padding/sequence parallelism is enabled."
+                )
+
+            input_ids = batch["input_ids"].to(self.device_name)
+            attention_mask = batch["attention_mask"].to(self.device_name)
+            position_ids = batch["position_ids"].to(self.device_name)
+            loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+            loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+            # For FSDP2, self.fsdp_model points to inner base_model but we need to call
+            # self.model (the NLAModelWrapper) to get activation injection
+            forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
+
+            context = self.sharding_manager if use_sp else nullcontext()
+            with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                if not use_sp:
+                    labels = input_ids[:, 1:].contiguous()
+                    output = forward_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        activation_vectors=activation_vectors,
+                    )
+                    logits = output.logits
+
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels.contiguous()
+                    shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                    shift_labels = shift_labels.view(-1)
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    loss = loss_fct(shift_logits, shift_labels)
+                    loss = loss * loss_mask.to(loss.device)
+                else:
+                    batch_size, seqlen = input_ids.shape
+                    input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+
+                    input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=get_ulysses_sequence_parallel_world_size(),
+                    )
+                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled,
+                        None,
+                        get_ulysses_sequence_parallel_world_size(),
+                    )
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
+
+                    output = forward_model(
+                        input_ids=input_ids_rmpad_sliced,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad_padded,
+                        use_cache=False,
+                        activation_vectors=activation_vectors,
+                    )
+
+                    logits_rmpad = output.logits.squeeze(0)
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
+                    loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+                    loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+
+                    full_loss = pad_input(
+                        hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+                    )
+                    full_loss = full_loss.squeeze(-1)[:, :-1]
+                    full_loss = full_loss.reshape(-1)
+                    loss_mask = loss_mask.to(full_loss.device)
+                    loss = full_loss * loss_mask
+
+                valid_token_this_rank = torch.sum(loss_mask)
+
+                if self.config.data.balance_dp_token:
+                    torch.distributed.all_reduce(valid_token_this_rank)
+                    dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+                else:
+                    dp_size = 1
+
+                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+                loss = loss / n_micro_batches
+
+                if do_backward:
+                    loss.backward()
+                return loss
+
+        else:
+            raise ValueError(f"Unknown train_mode: {self.train_mode}")
 
     def _compute_critic_loss(self, batch):
         """Compute MSE loss for critic training."""
@@ -446,65 +613,42 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         target_activations = batch["activation_vectors"].to(self.device_name)
 
         # Forward pass through critic
+        # For FSDP2, self.fsdp_model points to inner pretrained_model but we need to call
+        # self.model (the wrapper) to ensure output_hidden_states=True is set
+        forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            critic_output = self.fsdp_model(
+            critic_output = forward_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True,
             )
             # Extract the last position's activation vector
-            values = critic_output.value  # (batch, seq_len, hidden_size)
-            # Get the last non-padding position for each sequence
-            seq_lengths = attention_mask.sum(dim=-1) - 1
-            batch_size = input_ids.shape[0]
-            predicted_activations = values[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
+            # values = critic_output.hidden_states  # (batch, seq_len, hidden_size)
+            # # Get the last non-padding position for each sequence
+            # seq_lengths = attention_mask.sum(dim=-1) - 1
+            # batch_size = input_ids.shape[0]
+            # predicted_activations = values[torch.arange(batch_size), seq_lengths]  # (batch, hidden_size)
+            seq_lengths = attention_mask.sum(dim=1) - 1
+            seq_lengths = seq_lengths.clamp(min=0)
+
+            if hasattr(critic_output, "value") and critic_output.value is not None:
+                predicted_activations = critic_output.value
+            else:
+                if hasattr(critic_output, "last_hidden_state") and critic_output.last_hidden_state is not None:
+                    last_hidden_state = critic_output.last_hidden_state  # (batch, seq_len, hidden_size)
+                elif hasattr(critic_output, "hidden_states") and critic_output.hidden_states is not None:
+                    last_hidden_state = critic_output.hidden_states[-1]
+                else:
+                    raise ValueError(
+                        f"Last hidden state or hidden states are not available in the critic output: available keys are {critic_output.keys()} and which are none? {[key is None for key in critic_output.keys()]}"
+                    )
+                indices = torch.arange(target_activations.shape[0], device=target_activations.device)
+                predicted_activations = last_hidden_state[indices, seq_lengths]  # (batch, hidden_size)
 
             # Compute MSE loss
             loss = nn.functional.mse_loss(predicted_activations, target_activations)
 
         return loss
-
-    def training_step(self, batch):
-        """Training step for either actor or critic."""
-        if self.train_mode == "actor":
-            # Use parent's training_step for actor
-            return super().training_step(batch)
-        else:
-            # Critic training
-            import time
-            start_time = time.time()
-
-            self.fsdp_model.train()
-            self.optimizer.zero_grad()
-
-            # Compute critic loss
-            critic_loss = self._compute_critic_loss(batch)
-            critic_loss.backward()
-
-            # Clip gradients
-            if self.config.model.strategy == "fsdp2":
-                from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
-                grad_norm = fsdp2_clip_grad_norm_(
-                    self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad
-                )
-            else:
-                grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
-
-            # Step optimizer
-            if torch.isfinite(grad_norm):
-                self.optimizer.step()
-                self.lr_scheduler.step()
-            else:
-                self.optimizer.zero_grad()
-
-            # Return metrics
-            end_time = time.time()
-            return {
-                "train/loss": critic_loss.item(),
-                "train/grad_norm": grad_norm.item() if torch.isfinite(grad_norm) else float("inf"),
-                "train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
-                "train/time(s)": end_time - start_time,
-            }
 
     def validation_step(self, batch):
         """Validation step for either actor or critic."""
@@ -521,10 +665,12 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
     def fit(self):
         """Override fit to track training time and metrics."""
         import time
+
         import torch
         from omegaconf import OmegaConf
         from tensordict import TensorDict
         from tqdm import tqdm
+
         from verl.utils.tracking import Tracking
 
         self.training_start_time = time.time()
@@ -626,9 +772,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
 
     def save_checkpoint(self, step):
         """Override save_checkpoint to include NLA metadata."""
-        import time
         import os
-        from pathlib import Path
+        import time
+
         from verl.utils.checkpoint.nla_metadata import create_sft_metadata_from_config, save_metadata
 
         # Calculate training time and create metadata BEFORE calling parent
@@ -642,6 +788,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         wandb_run_url = None
         try:
             import wandb
+
             if wandb.run is not None:
                 wandb_run_id = wandb.run.id
                 wandb_run_url = wandb.run.get_url()
@@ -687,11 +834,13 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             dataloader_local_path = os.path.join(checkpoint_dir, "data.pt")
             dataloader_state_dict = self.train_dataloader.state_dict()
             import torch
+
             torch.save(dataloader_state_dict, dataloader_local_path)
             print(f"Saved dataloader state to: {dataloader_local_path}")
 
             # Update latest checkpoint tracker (atomic write)
             from verl.utils.checkpoint.utils import get_checkpoint_tracker_filename
+
             tracker_file = get_checkpoint_tracker_filename(self.config.trainer.default_local_dir)
             temp_tracker_file = tracker_file + ".tmp"
             with open(temp_tracker_file, "w") as f:
@@ -706,9 +855,12 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         # Copy to HDFS if configured (now includes metadata!)
         if self.device_mesh.get_rank() == 0 and getattr(self.config.trainer, "default_hdfs_dir", None):
             from verl.utils.hdfs import hdfs_io
+
             hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
             hdfs_io.copy(src=checkpoint_dir, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
             print(f"Copied checkpoint (with metadata) to HDFS: {self.config.trainer.default_hdfs_dir}")
+
+        import torch
 
         torch.distributed.barrier()
 

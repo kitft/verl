@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - rl_grpo_megatron  # Inherit from Megatron base config
+  - _self_
+
+# Megatron-LM configuration with TP=2 for easier testing
+# Uses only 2 GPUs total (TP=2 for both actor and critic)
+
+actor_rollout_ref:
+  actor:
+    megatron:
+      tensor_model_parallel_size: 2  # TP=2 across 2 GPUs
+      pipeline_model_parallel_size: 1  # MUST be 1 for NLA
+
+    ppo_micro_batch_size_per_gpu: 8  # Can use larger batches with TP=2
+
+critic:
+  megatron:
+    tensor_model_parallel_size: 2  # TP=2 across 2 GPUs
+    pipeline_model_parallel_size: 1  # MUST be 1 for NLA
+
+  ppo_micro_batch_size_per_gpu: 8
+
+trainer:
+  n_gpus_per_node: 2  # Use only 2 GPUs
+  experiment_name: qwen-7b-megatron-tp2
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 16
+    num_gpus: 2
+  # Simpler resource pool: both actor and critic share 2 GPUs
+  resource_pool:
+    actor_rollout:
+      num_gpus: 2  # 2 GPUs for actor TP=2
+    critic:
+      num_gpus: 2  # 2 GPUs for critic TP=2
+
+# This config is useful for:
+# - Testing Megatron support on smaller hardware
+# - Debugging TP behavior with fewer ranks
+# - Development iteration with faster startup

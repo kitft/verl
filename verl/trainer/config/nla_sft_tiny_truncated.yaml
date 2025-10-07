@@ -1,0 +1,15 @@
+# NLA SFT configuration - Tiny model with layer truncation for testing
+# Inherits from nla_sft_tiny and adds truncation
+
+defaults:
+  - nla_sft_tiny
+  - _self_
+
+# Override model config to add truncation
+model:
+  truncate_layers: 12  # Qwen 0.5B has 24 layers, keep only first 12
+
+# Override NLA config to add critic truncation
+nla:
+  critic:
+    truncate_layers: 8  # Keep even fewer layers for critic
