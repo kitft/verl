@@ -1,0 +1,159 @@
+# NLA SFT Training with Megatron Backend (Qwen 30B)
+# Uses NLA Megatron worker for activation injection
+
+# Model configuration
+model:
+  path: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  enable_gradient_checkpointing: true
+  use_liger: false
+  fsdp_config: null
+  external_lib: null
+
+# Actor configuration (matches RL setup)
+actor:
+  _target_: verl.workers.config.McoreActorConfig
+  strategy: megatron
+  load_weight: true
+  ppo_micro_batch_size_per_gpu: 2  # Small batch for MoE model memory
+  ppo_mini_batch_size: 32  # Global batch size for SFT
+  ppo_epochs: 1  # Single pass for SFT (used in MFU calculation)
+
+  # Megatron parallelism (MoE model with Expert Parallelism)
+  megatron:
+    _target_: verl.workers.config.McoreEngineConfig
+    # Use Expert Parallelism for MoE models
+    tensor_model_parallel_size: 1  # TP=1 (no tensor parallelism)
+    expert_model_parallel_size: 8  # EP=8 (expert parallelism across 8 GPUs)
+    expert_tensor_parallel_size: 1  # ETP=1 (experts not sharded)
+    pipeline_model_parallel_size: 1  # MUST be 1 for NLA
+    context_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    sequence_parallel: false  # Disabled when TP=1
+    seed: 1234
+
+    # Offloading for memory efficiency (critical for 30B MoE)
+    param_offload: true
+    grad_offload: true
+    optimizer_offload: true
+
+    # Distributed optimizer
+    use_distributed_optimizer: true
+    use_dist_checkpointing: false
+
+    # MBridge for MoE models
+    use_mbridge: true
+
+    # Model configuration
+    override_mcore_model_config:
+      use_cache: false
+
+    # Transformer config
+    override_transformer_config:
+      # Activation checkpointing (selective doesn't use recompute_num_layers)
+      recompute_granularity: selective
+      recompute_method: null
+
+      # MoE-specific fusion optimizations
+      apply_rope_fusion: true
+      masked_softmax_fusion: true
+      bias_activation_fusion: true
+      bias_dropout_fusion: true
+      gradient_accumulation_fusion: true
+      deallocate_pipeline_outputs: true
+      persist_layer_norm: true
+      moe_grouped_gemm: true
+      moe_permute_fusion: true
+      moe_token_dispatcher_type: flex
+      moe_router_dtype: fp32
+      moe_enable_deepep: true
+
+  # Optimizer configuration
+  optim:
+    optimizer: adam
+    lr: 1e-5
+    min_lr: 1e-6
+    lr_warmup_init: 0.0
+    weight_decay: 0.001
+    betas: [0.9, 0.999]
+    lr_warmup_steps: 50
+    lr_decay_style: constant
+    lr_decay_steps: 10000  # Set to total training steps
+    weight_decay_incr_style: constant
+    lr_wsd_decay_style: null
+    lr_scheduler: cosine
+    clip_grad: 1.0
+    total_training_steps: 10000  # Match lr_decay_steps
+    use_checkpoint_opt_param_scheduler: false
+    override_optimizer_config:
+      optimizer_offload_fraction: 1.0
+      overlap_cpu_optimizer_d2h_h2d: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: true
+
+  # Checkpoint configuration
+  checkpoint:
+    save_type: huggingface
+
+# Data configuration
+data:
+  train_files:
+    - data/q30b/sft/train_nla_sft_dataset_fineweb_layer32.parquet
+  val_files:
+    - data/q30b/sft/val_nla_sft_dataset_fineweb_layer32.parquet
+
+  prompt_key: prompt
+  response_key: response
+  activation_vector_key: activation_vector
+
+  train_batch_size: 32  # Global batch size
+  micro_batch_size_per_gpu: 4  # Per-GPU micro batch size
+
+  max_prompt_length: 512
+  max_response_length: 512
+  truncation: error
+
+  trust_remote_code: false
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 4096
+
+# Trainer configuration
+trainer:
+  total_epochs: 3
+  total_training_steps: null
+
+  save_freq: 100
+  test_freq: 50
+
+  default_local_dir: ./checkpoints/nla_sft_megatron_30b
+  max_ckpt_to_keep: 3
+
+  project_name: nla-sft-megatron
+  experiment_name: qwen-30b-megatron-ep8-sft
+  logger: [console, wandb]
+
+  n_gpus_per_node: 8  # 8 GPUs for EP=8 (Expert Parallelism)
+  nnodes: 1
+
+# PPO config (disable clipping for SFT via policy gradient)
+algorithm:
+  ppo_mini_batch_size: ${actor.ppo_mini_batch_size}
+  ppo_micro_batch_size: ${actor.ppo_micro_batch_size_per_gpu}
+  ppo_epochs: 1  # Single pass for SFT
+  clip_ratio: 1000.0  # Effectively disable clipping for SFT
+  discount: 1.0
+  gae_lambda: 1.0
+
+# NLA-specific configuration (optional, for future use)
+nla:
+  injection:
+    mode: replace
+    layer_indices: [0]
+    position: manual
+
+# Notes:
+# 1. This uses the Engine abstraction which handles Megatron automatically
+# 2. No Ray workers needed - just distributed training via torch.distributed
+# 3. Pipeline parallelism MUST be 1 for NLA (intermediate layer access)
+# 4. Tensor parallelism handles weight sharding across GPUs
+# 5. Total batch size = train_batch_size / n_gpus = 32 / 4 = 8 per GPU

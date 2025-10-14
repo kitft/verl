@@ -2,10 +2,10 @@
 
 import torch
 
-from verl.workers.fsdp_workers import CriticWorker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+from verl.workers.fsdp_workers import CriticWorker
 
 
 class NLACriticWorker(CriticWorker):
@@ -26,7 +26,13 @@ class NLACriticWorker(CriticWorker):
         )
 
     def compute_activation_predictions(self, response_ids, attention_mask):
-        """Predict activation vectors for the final response token."""
+        """Predict activation vectors for the final response token.
+
+        Delegates to the critic's forward logic to ensure consistency with training,
+        including critic prompt prepending if configured.
+        """
+        from verl import DataProto
+
         device = get_device_id()
         response_ids = response_ids.to(device)
         if attention_mask is not None:
@@ -39,21 +45,25 @@ class NLACriticWorker(CriticWorker):
             was_training = self.critic_module.training
             try:
                 self.critic_module.eval()
+
+                # Create minimal DataProto for forward pass
+                batch_dict = {
+                    "responses": response_ids,
+                    "input_ids": response_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": torch.zeros_like(attention_mask, dtype=torch.long),
+                }
+                data = DataProto(batch=batch_dict)
+
+                # Use critic's forward logic (handles prompt prepending, etc.)
                 with torch.no_grad():
-                    outputs = self.critic_module(
-                        input_ids=response_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False,
-                        output_hidden_states=True,
+                    full_activations = self.critic._compute_values_internal(data, enable_grads=False)
+
+                    # Extract last token using critic's pooling logic
+                    response_mask = attention_mask
+                    activations = self.critic.extract_predicted_activations(
+                        full_activations, response_mask, pooling="last"
                     )
-                    hidden_states = outputs.hidden_states[-1]
-                    if attention_mask is not None:
-                        seq_lengths = attention_mask.sum(dim=1) - 1
-                        seq_lengths = seq_lengths.clamp(min=0)
-                        indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-                        activations = hidden_states[indices, seq_lengths]
-                    else:
-                        activations = hidden_states[:, -1, :]
             finally:
                 if was_training:
                     self.critic_module.train(True)

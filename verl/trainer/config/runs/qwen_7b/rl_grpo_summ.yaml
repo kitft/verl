@@ -25,6 +25,7 @@ actor_rollout_ref:
       lr: 1e-5
       weight_decay: 0.001
       lr_warmup_steps: 50
+    ppo_max_token_len_per_gpu: 6400
     fsdp_config:
       model_dtype: bf16
       param_offload: true
@@ -33,6 +34,8 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.5
     tensor_model_parallel_size: 1  # MUST be 1 without resource pools (8 workers can't coordinate TP=2)
     n: 8  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
+    log_prob_max_token_len_per_gpu: 6400 
+    response_length: 128  
 
 critic:
   output_layer_index: 20
@@ -46,6 +49,9 @@ critic:
       model_dtype: bf16
       param_offload: true
       optimizer_offload: true
+  ppo_max_token_len_per_gpu: 6400
+  forward_max_token_len_per_gpu: 6400
+
   optim:
     lr: 1e-9
     weight_decay: 0.001
@@ -91,6 +97,7 @@ data:
   train_batch_size: 64  # Number of prompts per training step
   val_batch_size: 512
   batch_size: 64  # Kept for compatibility
+  max_response_length: 128
   train_files:
     - data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet
   val_files:
@@ -114,7 +121,7 @@ nla_eval:
   
   freq: 100  # Evaluate every 100 steps
   max_samples: null  # Max samples per dataset (null = use all)
-  max_new_tokens: 50
+  max_new_tokens: 128
   temperature: 0.7
   do_sample: true
   num_generations_per_prompt: 4

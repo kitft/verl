@@ -1,12 +1,16 @@
 """Custom actor worker for NLA that handles activation injection."""
 
 import logging
+import os
+from typing import Optional
+
 import torch
-from typing import Dict, Optional, Any
+
 from verl.protocol import DataProto
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.workers.fsdp_workers import ActorRolloutRefWorker as FSDPActorRolloutRefWorker
-from verl.single_controller.base.decorator import register, Dispatch, make_nd_compute_dataproto_dispatch_fn
-from ..models.nla_wrapper import NLAModelWrapper, InjectionConfig
+
+from ..models.nla_wrapper import InjectionConfig, NLAModelWrapper
 from ..utils.injection_manager import InjectionTokenManager
 
 log = logging.getLogger(__name__)
@@ -32,18 +36,18 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         log.debug(f"NLA ACTOR: After super().init_model(), has rollout: {hasattr(self, 'rollout')}")
         log.debug(f"NLA ACTOR: Config has nla: {hasattr(self.config, 'nla')}")
-        if hasattr(self.config, 'nla'):
+        if hasattr(self.config, "nla"):
             log.debug(f"NLA ACTOR: Config.nla = {self.config.nla}")
 
         # Store reference to the embedding layer for later use
         self._store_embedding_layer()
 
         # Now wrap the rollout model with NLA capabilities (if not using SGLang)
-        if hasattr(self, 'rollout') and hasattr(self.config, 'nla'):
+        if hasattr(self, "rollout") and hasattr(self.config, "nla"):
             log.debug("NLA ACTOR: Setting up NLA injection configuration")
             # Extract NLA configuration
-            nla_config = self.config.get('nla', {})
-            injection_config = nla_config.get('injection', {})
+            nla_config = self.config.get("nla", {})
+            injection_config = nla_config.get("injection", {})
             log.debug(f"NLA ACTOR: injection_config = {injection_config}")
 
             # Configure injection settings
@@ -54,25 +58,24 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                 injection_token=injection_config.get("injection_token", None),
             )
 
-
             # For SGLang rollout (nla_sglang), we use embedding-based injection
             # The rollout itself doesn't need wrapping - we prepare input_embeds before calling it
-            rollout_name = self.config.rollout.name if hasattr(self.config, 'rollout') else 'unknown'
+            rollout_name = self.config.rollout.name if hasattr(self.config, "rollout") else "unknown"
             log.debug(f"NLA ACTOR: Rollout type: {rollout_name}")
 
-            if rollout_name == 'nla_sglang':
+            if rollout_name == "nla_sglang":
                 log.debug("NLA ACTOR: Using SGLang with embedding-based injection (no rollout wrapping needed)")
                 # Store injection config for use in generate_sequences
-                self.nla_injection_mode = 'embedding'
-            elif hasattr(self.rollout, 'module'):
+                self.nla_injection_mode = "embedding"
+            elif hasattr(self.rollout, "module"):
                 # For other rollouts that have a module attribute (e.g., HF rollout)
                 log.debug("NLA ACTOR: Wrapping rollout module with NLA capabilities")
                 base_model = self.rollout.module
-                hidden_dim = base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else None
+                hidden_dim = base_model.config.hidden_size if hasattr(base_model.config, "hidden_size") else None
                 activation_dim = nla_config.get("activation_dim", hidden_dim or 768)
 
                 # Get tokenizer from model config
-                tokenizer = self.model_config.tokenizer if hasattr(self, 'model_config') else None
+                tokenizer = self.model_config.tokenizer if hasattr(self, "model_config") else None
 
                 # Wrap rollout's module with NLA wrapper
                 self.nla_wrapper = NLAModelWrapper(
@@ -85,16 +88,19 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
                 # Replace the rollout's module with the wrapped version
                 self.rollout.module = self.nla_wrapper
-                self.nla_injection_mode = 'wrapper'
+                self.nla_injection_mode = "wrapper"
 
-                log.debug(f"Wrapped rollout model with NLAModelWrapper")
-                log.debug(f"Injection token: '{self.nla_wrapper.injection_config.injection_character}' (ID: {self.nla_wrapper.injection_config.injection_token_id})")
+                log.debug("Wrapped rollout model with NLAModelWrapper")
+                log.debug(
+                    f"Injection token: '{self.nla_wrapper.injection_config.injection_character}' (ID: {self.nla_wrapper.injection_config.injection_token_id})"
+                )
             else:
-                log.debug(f"WARNING: Rollout type '{rollout_name}' doesn't have a module attribute and isn't nla_sglang")
-                self.nla_injection_mode = 'unknown'
+                log.debug(
+                    f"WARNING: Rollout type '{rollout_name}' doesn't have a module attribute and isn't nla_sglang"
+                )
+                self.nla_injection_mode = "unknown"
 
-            
-            tokenizer = self.model_config.tokenizer if hasattr(self, 'model_config') else None
+            tokenizer = self.model_config.tokenizer if hasattr(self, "model_config") else None
             if tokenizer is not None:
                 # Use InjectionTokenManager for consistent token selection
                 injection_manager = InjectionTokenManager(tokenizer, self.injection_cfg.injection_token)
@@ -109,50 +115,48 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                 raise ValueError(
                     "Either provide a tokenizer for auto-selection or specify injection_token_id in config. "
                     "The tokenizer ensures consistency with the dataset's injection token."
-            )
+                )
 
             # Set up actor model for activation injection at embedding layer
-            if hasattr(self, 'actor_module_fsdp') and self.embed_layer is not None:
+            if hasattr(self, "actor_module_fsdp") and self.embed_layer is not None:
                 log.debug("NLA ACTOR: Setting up activation injection for actor model")
 
                 # Determine dimensions for projection layer if needed
-                hidden_dim = self.base_model.config.hidden_size if hasattr(self, 'base_model') and hasattr(self.base_model, 'config') else None
-                if hidden_dim is None and hasattr(self, 'actor_module_fsdp'):
-                    if hasattr(self.actor_module_fsdp.config, 'hidden_size'):
+                hidden_dim = (
+                    self.base_model.config.hidden_size
+                    if hasattr(self, "base_model") and hasattr(self.base_model, "config")
+                    else None
+                )
+                if hidden_dim is None and hasattr(self, "actor_module_fsdp"):
+                    if hasattr(self.actor_module_fsdp.config, "hidden_size"):
                         hidden_dim = self.actor_module_fsdp.config.hidden_size
 
-                activation_dim = nla_config.get('activation_dim', hidden_dim)
+                activation_dim = nla_config.get("activation_dim", hidden_dim)
 
                 # Pre-create projection layer if dimensions mismatch
                 if activation_dim is not None and hidden_dim is not None and activation_dim != hidden_dim:
                     log.debug(f"NLA ACTOR: Creating projection layer: {activation_dim} -> {hidden_dim}")
-                    self._activation_projection = torch.nn.Linear(
-                        activation_dim,
-                        hidden_dim,
-                        bias=False
-                    )
+                    self._activation_projection = torch.nn.Linear(activation_dim, hidden_dim, bias=False)
                     # Move to same device as embedding layer
-                    device = self.embed_layer.weight.device if hasattr(self.embed_layer, 'weight') else None
+                    device = self.embed_layer.weight.device if hasattr(self.embed_layer, "weight") else None
                     if device is not None:
                         self._activation_projection = self._activation_projection.to(device)
                     log.debug(f"NLA ACTOR: Projection layer created and moved to device: {device}")
                 else:
                     self._activation_projection = None
                     if activation_dim != hidden_dim:
-                        log.debug(f"WARNING: Could not determine dimensions for projection layer")
+                        log.debug("WARNING: Could not determine dimensions for projection layer")
 
                 log.debug("NLA ACTOR: Registering embedding injection hook on actor model")
                 # Register forward hook on embedding layer for automatic injection
                 # This works with FSDP since we're only hooking the embedding layer
-                self._injection_hook_handle = self.embed_layer.register_forward_hook(
-                    self._embedding_injection_hook
-                )
+                self._injection_hook_handle = self.embed_layer.register_forward_hook(self._embedding_injection_hook)
                 log.debug("NLA ACTOR: Embedding injection hook registered successfully")
 
                 # Wrap the actor's methods to manage injection
-                if hasattr(self, 'actor'):
+                if hasattr(self, "actor"):
                     # Wrap _forward_micro_batch for injection state management
-                    if hasattr(self.actor, '_forward_micro_batch'):
+                    if hasattr(self.actor, "_forward_micro_batch"):
                         log.debug("NLA ACTOR: Wrapping actor's _forward_micro_batch for injection state management")
                         log.debug(f"NLA ACTOR: self.actor type: {type(self.actor)}")
                         log.debug(f"NLA ACTOR: self.actor class: {self.actor.__class__.__name__}")
@@ -160,24 +164,24 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                         log.debug("NLA ACTOR: ✓ Actor _forward_micro_batch wrapped successfully")
 
                     # Wrap compute_log_prob to add activation_vectors to select_keys
-                    if hasattr(self.actor, 'compute_log_prob'):
+                    if hasattr(self.actor, "compute_log_prob"):
                         log.debug("NLA ACTOR: Wrapping actor's compute_log_prob to preserve activation_vectors")
                         self._wrap_actor_compute_log_prob_method()
                         log.debug("NLA ACTOR: ✓ Actor compute_log_prob wrapped successfully")
 
                     # Wrap update_policy to add activation_vectors to select_keys
-                    if hasattr(self.actor, 'update_policy'):
+                    if hasattr(self.actor, "update_policy"):
                         log.debug("NLA ACTOR: Wrapping actor's update_policy to preserve activation_vectors")
                         self._wrap_actor_update_policy_method()
                         log.debug("NLA ACTOR: ✓ Actor update_policy wrapped successfully")
 
                     # Initialize telemetry counters
                     self._injection_telemetry = {
-                        'forward_micro_batch_calls': 0,
-                        'forward_with_activations': 0,
-                        'forward_without_activations': 0,
-                        'hook_calls': 0,
-                        'actual_injections': 0,
+                        "forward_micro_batch_calls": 0,
+                        "forward_with_activations": 0,
+                        "forward_without_activations": 0,
+                        "hook_calls": 0,
+                        "actual_injections": 0,
                     }
                 else:
                     log.debug("NLA ACTOR: WARNING - Actor not found, cannot wrap methods")
@@ -187,23 +191,23 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         self.embed_layer = None
 
         # Try to get embedding layer from actor model
-        if hasattr(self, 'actor_module_fsdp'):
+        if hasattr(self, "actor_module_fsdp"):
             model = self.actor_module_fsdp
 
             # Try different access patterns for different model architectures
-            if hasattr(model, 'get_input_embeddings'):
+            if hasattr(model, "get_input_embeddings"):
                 self.embed_layer = model.get_input_embeddings()
-            elif hasattr(model, 'embed_tokens'):
+            elif hasattr(model, "embed_tokens"):
                 self.embed_layer = model.embed_tokens
-            elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+            elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
                 self.embed_layer = model.model.embed_tokens
-            elif hasattr(model, 'transformer') and hasattr(model.transformer, 'wte'):
+            elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
                 self.embed_layer = model.transformer.wte  # GPT-style
-            elif hasattr(model, 'bert') and hasattr(model.bert, 'embeddings'):
+            elif hasattr(model, "bert") and hasattr(model.bert, "embeddings"):
                 self.embed_layer = model.bert.embeddings.word_embeddings  # BERT-style
 
             if self.embed_layer is not None:
-                log.debug(f"Successfully stored embedding layer from actor model")
+                log.debug("Successfully stored embedding layer from actor model")
             else:
                 log.debug("WARNING: Could not find embedding layer in actor model")
 
@@ -214,16 +218,18 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         activation vectors when they are available in the injection state.
         """
         # Track hook calls
-        if hasattr(self, '_injection_telemetry'):
-            self._injection_telemetry['hook_calls'] += 1
+        if hasattr(self, "_injection_telemetry"):
+            self._injection_telemetry["hook_calls"] += 1
 
-        if not hasattr(self, '_current_activation_vectors') or self._current_activation_vectors is None:
+        if not hasattr(self, "_current_activation_vectors") or self._current_activation_vectors is None:
             return output
 
         activation_vectors = self._current_activation_vectors
         injection_positions = self._current_injection_positions
 
-        log.debug(f"🔥 NLA HOOK FIRING: Injecting activations - batch_size={output.shape[0]}, activation_vectors.shape={activation_vectors.shape}")
+        log.debug(
+            f"🔥 NLA HOOK FIRING: Injecting activations - batch_size={output.shape[0]}, activation_vectors.shape={activation_vectors.shape}"
+        )
 
         # Clone output to avoid in-place modification issues with autograd
         output = output.clone()
@@ -246,7 +252,9 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                     continue
                 # If multiple positions, only use first one and warn
                 if pos.numel() > 1:
-                    log.debug(f"WARNING: Multiple injection positions found for batch {batch_idx}: {pos.tolist()}. Using first position only.")
+                    log.debug(
+                        f"WARNING: Multiple injection positions found for batch {batch_idx}: {pos.tolist()}. Using first position only."
+                    )
                 pos = pos[0].item()
 
             # Inject activation at position
@@ -255,7 +263,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
                 # Handle dimension mismatch with pre-created projection layer
                 if activation.shape[-1] != output.shape[-1]:
-                    if hasattr(self, '_activation_projection') and self._activation_projection is not None:
+                    if hasattr(self, "_activation_projection") and self._activation_projection is not None:
                         activation = self._activation_projection(activation)
                     else:
                         raise RuntimeError(
@@ -267,11 +275,13 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                 output[batch_idx, pos] = activation.to(device=output.device, dtype=output.dtype)
                 injections_performed += 1
 
-        log.debug(f"✓ NLA HOOK: Performed {injections_performed}/{batch_size} injections at positions {[p.item() if isinstance(p, torch.Tensor) else p for p in injection_positions[:batch_size]]}")
+        # Safe logging of injection positions
+        formatted_positions = self._format_injection_positions_for_logging(injection_positions[:batch_size])
+        log.debug(f"✓ NLA HOOK: Performed {injections_performed}/{batch_size} injections at positions {formatted_positions}")
 
         # Track actual injections
-        if hasattr(self, '_injection_telemetry'):
-            self._injection_telemetry['actual_injections'] += injections_performed
+        if hasattr(self, "_injection_telemetry"):
+            self._injection_telemetry["actual_injections"] += injections_performed
 
         return output
 
@@ -301,6 +311,85 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         return positions
 
+    def _format_injection_positions_for_logging(
+        self, injection_positions: list[Optional[torch.Tensor]]
+    ) -> list[int | list[int] | None]:
+        """Format injection positions for safe logging without tensor conversion errors."""
+        formatted_positions = []
+        for pos in injection_positions:
+            if pos is None:
+                formatted_positions.append(None)
+            elif isinstance(pos, torch.Tensor):
+                if pos.numel() == 0:
+                    formatted_positions.append(None)
+                elif pos.numel() == 1:
+                    formatted_positions.append(pos.item())
+                else:
+                    # Multiple positions - convert to list
+                    formatted_positions.append(pos.tolist())
+            else:
+                formatted_positions.append(pos)
+        return formatted_positions
+
+    def _log_multiple_injection_tokens_to_wandb(
+        self, input_ids: torch.Tensor, injection_positions: list[Optional[torch.Tensor]], step: Optional[int] = None
+    ):
+        """Log sequences with multiple injection tokens to wandb for debugging."""
+        try:
+            # Check if wandb is available and we're on rank 0
+            if os.environ.get("RANK", "0") != "0":
+                return
+
+            import wandb
+
+            # Find sequences with multiple injection tokens
+            sequences_to_log = []
+            for i, pos in enumerate(injection_positions):
+                if pos is not None and isinstance(pos, torch.Tensor) and pos.numel() > 1:
+                    # Decode the sequence if tokenizer is available
+                    sequence_text = None
+                    if hasattr(self, "tokenizer") and self.tokenizer is not None:
+                        try:
+                            sequence_text = self.tokenizer.decode(input_ids[i], skip_special_tokens=False)
+                        except Exception as e:
+                            log.warning(f"Failed to decode sequence for wandb logging: {e}")
+
+                    sequences_to_log.append(
+                        {
+                            "batch_idx": i,
+                            "positions": pos.tolist(),
+                            "sequence_text": sequence_text,
+                            "input_ids": input_ids[i].tolist(),
+                        }
+                    )
+
+            # Log to wandb if we found multiple injection tokens
+            if sequences_to_log:
+                wandb.log(
+                    {
+                        "debug/multiple_injection_tokens": wandb.Table(
+                            columns=["batch_idx", "positions", "sequence_text", "input_ids"],
+                            data=[
+                                (
+                                    seq["batch_idx"],
+                                    str(seq["positions"]),
+                                    seq["sequence_text"] or "N/A",
+                                    str(seq["input_ids"]),
+                                )
+                                for seq in sequences_to_log
+                            ],
+                        )
+                    },
+                    step=step,
+                )
+
+                log.warning(f"Found {len(sequences_to_log)} sequences with multiple injection tokens. Logged to wandb.")
+
+        except ImportError:
+            log.debug("wandb not available for logging multiple injection tokens")
+        except Exception as e:
+            log.warning(f"Failed to log multiple injection tokens to wandb: {e}")
+
     def _wrap_actor_compute_log_prob_method(self):
         """Wrap actor's compute_log_prob to add activation_vectors to select_keys."""
         original_compute_log_prob = self.actor.compute_log_prob
@@ -308,10 +397,10 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         def compute_log_prob_with_activation_vectors(data: DataProto, calculate_entropy=False):
             """Wrapped version that adds activation_vectors to select_keys."""
             # Check if activation_vectors present
-            has_activations = 'activation_vectors' in data.batch.keys()
+            has_activations = "activation_vectors" in data.batch.keys()
 
             if has_activations:
-                log.debug(f"🔧 Wrapped compute_log_prob: Found activation_vectors in batch")
+                log.debug("🔧 Wrapped compute_log_prob: Found activation_vectors in batch")
                 # The actor's compute_log_prob will do data.select() with hardcoded keys
                 # We need to intercept and add activation_vectors BEFORE that happens
                 # Unfortunately we can't easily intercept the select() call inside the method
@@ -321,9 +410,9 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
                 def select_with_activation_vectors(batch_keys=None, non_tensor_batch_keys=None):
                     """Modified select that preserves activation_vectors."""
-                    if batch_keys is not None and 'activation_vectors' not in batch_keys:
-                        batch_keys = list(batch_keys) + ['activation_vectors']
-                        log.debug(f"✓ Added 'activation_vectors' to select_keys in compute_log_prob")
+                    if batch_keys is not None and "activation_vectors" not in batch_keys:
+                        batch_keys = list(batch_keys) + ["activation_vectors"]
+                        log.debug("✓ Added 'activation_vectors' to select_keys in compute_log_prob")
                     return original_select(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
 
                 # Temporarily replace select method
@@ -345,18 +434,18 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         def update_policy_with_activation_vectors(data: DataProto):
             """Wrapped version that adds activation_vectors to select_keys."""
-            has_activations = 'activation_vectors' in data.batch.keys()
+            has_activations = "activation_vectors" in data.batch.keys()
 
             if has_activations:
-                log.debug(f"🔧 Wrapped update_policy: Found activation_vectors in batch")
+                log.debug("🔧 Wrapped update_policy: Found activation_vectors in batch")
 
                 original_select = data.select
 
                 def select_with_activation_vectors(batch_keys=None, non_tensor_batch_keys=None):
                     """Modified select that preserves activation_vectors."""
-                    if batch_keys is not None and 'activation_vectors' not in batch_keys:
-                        batch_keys = list(batch_keys) + ['activation_vectors']
-                        log.debug(f"✓ Added 'activation_vectors' to select_keys in update_policy")
+                    if batch_keys is not None and "activation_vectors" not in batch_keys:
+                        batch_keys = list(batch_keys) + ["activation_vectors"]
+                        log.debug("✓ Added 'activation_vectors' to select_keys in update_policy")
                     return original_select(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
 
                 data.select = select_with_activation_vectors
@@ -384,69 +473,76 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         def _forward_micro_batch_with_injection(micro_batch, temperature, calculate_entropy=False):
             """Wrapped version that handles activation injection."""
             # Track all calls
-            if hasattr(self, '_injection_telemetry'):
-                self._injection_telemetry['forward_micro_batch_calls'] += 1
+            if hasattr(self, "_injection_telemetry"):
+                self._injection_telemetry["forward_micro_batch_calls"] += 1
 
             # Check if this micro-batch has activation vectors
-            has_activations = 'activation_vectors' in micro_batch
+            has_activations = "activation_vectors" in micro_batch
 
             # Determine which code path we're in by inspecting the stack
             import traceback
+
             stack = traceback.extract_stack()
             calling_function = None
             for frame in reversed(stack):
-                if 'compute_log_prob' in frame.name:
-                    calling_function = 'compute_log_prob'
+                if "compute_log_prob" in frame.name:
+                    calling_function = "compute_log_prob"
                     break
-                elif 'update_policy' in frame.name:
-                    calling_function = 'update_policy'
+                elif "update_policy" in frame.name:
+                    calling_function = "update_policy"
                     break
 
-            log.debug(f"\n{'='*80}")
-            log.debug(f"📊 WRAPPED _forward_micro_batch CALLED")
+            log.debug(f"\n{'=' * 80}")
+            log.debug("📊 WRAPPED _forward_micro_batch CALLED")
             log.debug(f"   Called from: {calling_function or 'UNKNOWN'}")
             log.debug(f"   Has activation_vectors: {has_activations}")
             log.debug(f"   calculate_entropy: {calculate_entropy}")
             log.debug(f"   Temperature: {temperature}")
             if has_activations:
-                activation_vectors = micro_batch['activation_vectors']
+                activation_vectors = micro_batch["activation_vectors"]
                 log.debug(f"   Activation vectors shape: {activation_vectors.shape}")
                 log.debug(f"   Input IDs shape: {micro_batch['input_ids'].shape}")
-            log.debug(f"{'='*80}\n")
+            log.debug(f"{'=' * 80}\n")
 
             if has_activations:
-                if hasattr(self, '_injection_telemetry'):
-                    self._injection_telemetry['forward_with_activations'] += 1
+                if hasattr(self, "_injection_telemetry"):
+                    self._injection_telemetry["forward_with_activations"] += 1
 
-                activation_vectors = micro_batch['activation_vectors']
-                input_ids = micro_batch['input_ids']
+                activation_vectors = micro_batch["activation_vectors"]
+                input_ids = micro_batch["input_ids"]
 
                 # Find injection positions in this micro-batch
                 injection_positions = self._find_injection_positions_from_ids(input_ids)
-                log.debug(f"🎯 Found injection positions: {[(p.item() if isinstance(p, torch.Tensor) and p.numel() > 0 else p) for p in injection_positions]}")
+
+                # Log multiple injection tokens to wandb for debugging
+                self._log_multiple_injection_tokens_to_wandb(input_ids, injection_positions)
+
+                # Safe logging of injection positions
+                formatted_positions = self._format_injection_positions_for_logging(injection_positions)
+                log.debug(f"🎯 Found injection positions: {formatted_positions}")
 
                 # Set injection state for the hook
                 self._set_injection_state(activation_vectors, injection_positions)
-                log.debug(f"✓ Injection state set - hook will fire during embedding forward pass")
+                log.debug("✓ Injection state set - hook will fire during embedding forward pass")
 
                 # Remove activation_vectors from micro_batch to avoid passing to model
                 # (the hook will handle injection)
-                micro_batch = {k: v for k, v in micro_batch.items() if k != 'activation_vectors'}
+                micro_batch = {k: v for k, v in micro_batch.items() if k != "activation_vectors"}
             else:
-                if hasattr(self, '_injection_telemetry'):
-                    self._injection_telemetry['forward_without_activations'] += 1
-                log.debug(f"⚠️  No activation vectors in this micro-batch")
+                if hasattr(self, "_injection_telemetry"):
+                    self._injection_telemetry["forward_without_activations"] += 1
+                log.debug("⚠️  No activation vectors in this micro-batch")
 
             try:
                 # Call original method - the hook will inject during forward pass
                 result = original_forward_micro_batch(micro_batch, temperature, calculate_entropy)
-                log.debug(f"✓ Original _forward_micro_batch completed")
+                log.debug("✓ Original _forward_micro_batch completed")
                 return result
             finally:
                 # Always clear injection state
                 if has_activations:
                     self._clear_injection_state()
-                    log.debug(f"✓ Injection state cleared\n")
+                    log.debug("✓ Injection state cleared\n")
 
         # Replace the actor's method with our wrapped version
         self.actor._forward_micro_batch = _forward_micro_batch_with_injection
@@ -473,20 +569,21 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
     def _extract_activation_vectors(self, data: DataProto):
         activation_vectors = None
         if data.batch is not None:
-            batch_keys = getattr(data.batch, 'keys', lambda: [])()
-            if 'activation_vectors' in batch_keys:
-                activation_vectors = data.batch['activation_vectors']
+            batch_keys = getattr(data.batch, "keys", lambda: [])()
+            if "activation_vectors" in batch_keys:
+                activation_vectors = data.batch["activation_vectors"]
 
-        if activation_vectors is None and data.meta_info and data.meta_info.get('activation_vectors') is not None:
+        if activation_vectors is None and data.meta_info and data.meta_info.get("activation_vectors") is not None:
             raise ValueError("Activation vectors must be provided via batch['activation_vectors']")
 
         return activation_vectors
 
-    def _prepare_input_embeddings(self, data: DataProto, input_ids: torch.Tensor, activation_vectors: torch.Tensor) -> torch.Tensor:
+    def _prepare_input_embeddings(
+        self, data: DataProto, input_ids: torch.Tensor, activation_vectors: torch.Tensor
+    ) -> torch.Tensor:
         if self.embed_layer is None:
             raise RuntimeError("Embedding layer not available. Cannot compute input embeddings.")
 
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed._tensor import DTensor
 
         target_device = self.embed_layer.weight.device if hasattr(self.embed_layer, "weight") else None
@@ -500,9 +597,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
                 full_weight = self.embed_layer.weight.full_tensor()
                 # Manually do embedding lookup with gathered weights
                 input_embeds = torch.nn.functional.embedding(
-                    input_ids,
-                    full_weight,
-                    padding_idx=getattr(self.embed_layer, 'padding_idx', None)
+                    input_ids, full_weight, padding_idx=getattr(self.embed_layer, "padding_idx", None)
                 )
             else:
                 # Regular embedding layer (not sharded)
@@ -514,13 +609,13 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         # Check for injection token in the config
         injection_token_id = None
-        if hasattr(self, 'injection_cfg') and self.injection_cfg.injection_token_id is not None:
+        if hasattr(self, "injection_cfg") and self.injection_cfg.injection_token_id is not None:
             injection_token_id = self.injection_cfg.injection_token_id
-        elif hasattr(self, 'nla_wrapper') and self.nla_wrapper.injection_config.injection_token_id is not None:
+        elif hasattr(self, "nla_wrapper") and self.nla_wrapper.injection_config.injection_token_id is not None:
             injection_token_id = self.nla_wrapper.injection_config.injection_token_id
 
         if injection_token_id is not None:
-            injection_mask = (input_ids == injection_token_id)
+            injection_mask = input_ids == injection_token_id
             if injection_mask.any():
                 injection_positions = injection_mask.float().argmax(dim=1)
                 log.debug(f"NLA Actor: Found injection tokens at positions: {injection_positions}")
@@ -548,9 +643,11 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         if len(pos_token_counts) > 1:
             for (pos, token), idxs in pos_token_counts.items():
-                log.debug(f"NLA Actor: Injected activation at position {pos} for {len(idxs)} sequence(s) at token # input_ids[{idxs}, {pos}] = {token}, counting left-padding.")
+                log.debug(
+                    f"NLA Actor: Injected activation at position {pos} for {len(idxs)} sequence(s) at token # input_ids[{idxs}, {pos}] = {token}, counting left-padding."
+                )
 
-        attention_mask = data.batch['attention_mask']
+        attention_mask = data.batch["attention_mask"]
 
         if attention_mask is None:
             raise ValueError("Attention mask is required to remove padding vectors.")
@@ -580,10 +677,14 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         log.debug("=" * 80)
         log.debug(f"NLA ACTOR: data.batch type: {type(data.batch)}")
         log.debug(f"NLA ACTOR: data.batch keys: {list(data.batch.keys()) if data.batch is not None else 'None'}")
-        log.debug(f"NLA ACTOR: data.meta_info keys: {list(data.meta_info.keys()) if data.meta_info is not None else 'None'}")
+        log.debug(
+            f"NLA ACTOR: data.meta_info keys: {list(data.meta_info.keys()) if data.meta_info is not None else 'None'}"
+        )
 
         activation_vectors = self._extract_activation_vectors(data)
-        log.debug(f"NLA ACTOR: Extracted activation_vectors: {activation_vectors.shape if activation_vectors is not None else None}")
+        log.debug(
+            f"NLA ACTOR: Extracted activation_vectors: {activation_vectors.shape if activation_vectors is not None else None}"
+        )
 
         # FAIL FAST: Ensure activation vectors are present
         if activation_vectors is None:
@@ -602,10 +703,12 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
             )
 
         # Prepare for SGLang embedding-based injection
-        input_ids = data.batch['input_ids']
+        input_ids = data.batch["input_ids"]
         input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
         data.non_tensor_batch.update({"input_embeds": input_embeds})
-        log.debug(f"NLA Actor: Prepared input_embeds for SGLang with shape: {input_embeds[0].shape}, second item shape: {input_embeds[1].shape if len(input_embeds) > 1 else 'None'}")
+        log.debug(
+            f"NLA Actor: Prepared input_embeds for SGLang with shape: {input_embeds[0].shape}, second item shape: {input_embeds[1].shape if len(input_embeds) > 1 else 'None'}"
+        )
 
         return super().generate_sequences(data)
 
@@ -616,7 +719,7 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         if activation_vectors is None:
             return data
 
-        input_ids = data.batch['input_ids']
+        input_ids = data.batch["input_ids"]
         input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
         data.non_tensor_batch.update({"input_embeds": input_embeds})
         return data
@@ -628,25 +731,27 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         Ensures activation vectors are in batch, then delegates to parent.
         Parent calls self.actor.compute_log_prob (which we wrapped!).
         """
-        log.debug(f"\n{'#'*80}")
-        log.debug(f"🎯 NLA ACTOR WORKER: compute_log_prob() CALLED")
-        log.debug(f"{'#'*80}")
+        log.debug(f"\n{'#' * 80}")
+        log.debug("🎯 NLA ACTOR WORKER: compute_log_prob() CALLED")
+        log.debug(f"{'#' * 80}")
 
         # Extract activation vectors and ensure they're in batch
         activation_vectors = self._extract_activation_vectors(data)
 
         if activation_vectors is not None:
-            if 'activation_vectors' not in data.batch.keys():
-                data.batch['activation_vectors'] = activation_vectors
-            log.debug(f"✓ NLA ACTOR WORKER: compute_log_prob with activation vectors of shape: {activation_vectors.shape}")
+            if "activation_vectors" not in data.batch.keys():
+                data.batch["activation_vectors"] = activation_vectors
+            log.debug(
+                f"✓ NLA ACTOR WORKER: compute_log_prob with activation vectors of shape: {activation_vectors.shape}"
+            )
             self._print_injection_telemetry("BEFORE compute_log_prob")
         else:
-            log.debug(f"⚠️  NLA ACTOR WORKER: No activation vectors found in data")
+            log.debug("⚠️  NLA ACTOR WORKER: No activation vectors found in data")
 
         # Call parent - it will delegate to self.actor.compute_log_prob (which is wrapped!)
         # The wrapped actor.compute_log_prob will add activation_vectors to select_keys
-        log.debug(f"→ Delegating to parent compute_log_prob (will call wrapped actor.compute_log_prob)")
-        log.debug(f"{'#'*80}\n")
+        log.debug("→ Delegating to parent compute_log_prob (will call wrapped actor.compute_log_prob)")
+        log.debug(f"{'#' * 80}\n")
 
         result = super().compute_log_prob(data)
 
@@ -662,25 +767,25 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         Ensures activation vectors are in batch, then delegates to parent.
         Parent calls self.actor.update_policy (which we wrapped!).
         """
-        log.debug(f"\n{'#'*80}")
-        log.debug(f"🎯 NLA ACTOR WORKER: update_policy() CALLED")
-        log.debug(f"{'#'*80}")
+        log.debug(f"\n{'#' * 80}")
+        log.debug("🎯 NLA ACTOR WORKER: update_policy() CALLED")
+        log.debug(f"{'#' * 80}")
 
         # Extract activation vectors and ensure they're in batch
         activation_vectors = self._extract_activation_vectors(data)
 
         if activation_vectors is not None:
-            if 'activation_vectors' not in data.batch.keys():
-                data.batch['activation_vectors'] = activation_vectors
+            if "activation_vectors" not in data.batch.keys():
+                data.batch["activation_vectors"] = activation_vectors
             log.debug(f"✓ NLA ACTOR WORKER: update_policy with activation vectors of shape: {activation_vectors.shape}")
             self._print_injection_telemetry("BEFORE update_policy")
         else:
-            log.debug(f"⚠️  NLA ACTOR WORKER: No activation vectors found in data")
+            log.debug("⚠️  NLA ACTOR WORKER: No activation vectors found in data")
 
         # Call parent - it will delegate to self.actor.update_policy (which is wrapped!)
         # The wrapped actor.update_policy will add activation_vectors to select_keys
-        log.debug(f"→ Delegating to parent update_policy (will call wrapped actor.update_policy)")
-        log.debug(f"{'#'*80}\n")
+        log.debug("→ Delegating to parent update_policy (will call wrapped actor.update_policy)")
+        log.debug(f"{'#' * 80}\n")
 
         result = super().update_policy(data)
 
@@ -691,13 +796,13 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
     def _print_injection_telemetry(self, label: str = ""):
         """Print injection telemetry for debugging."""
-        if hasattr(self, '_injection_telemetry'):
-            log.debug(f"\n{'='*60}")
+        if hasattr(self, "_injection_telemetry"):
+            log.debug(f"\n{'=' * 60}")
             log.debug(f"📊 INJECTION TELEMETRY {label}")
-            log.debug(f"{'='*60}")
+            log.debug(f"{'=' * 60}")
             for key, value in self._injection_telemetry.items():
                 log.debug(f"  {key}: {value}")
-            log.debug(f"{'='*60}\n")
+            log.debug(f"{'=' * 60}\n")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def verify_injection_setup(self):
@@ -705,37 +810,37 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
 
         This method can be called after init to verify everything is set up correctly.
         """
-        log.debug(f"\n{'='*80}")
-        log.debug(f"🔍 NLA INJECTION SETUP VERIFICATION")
-        log.debug(f"{'='*80}")
+        log.debug(f"\n{'=' * 80}")
+        log.debug("🔍 NLA INJECTION SETUP VERIFICATION")
+        log.debug(f"{'=' * 80}")
 
         checks = []
 
         # Check 1: Embedding layer
-        if hasattr(self, 'embed_layer') and self.embed_layer is not None:
+        if hasattr(self, "embed_layer") and self.embed_layer is not None:
             checks.append(("✓", "Embedding layer found", str(type(self.embed_layer))))
         else:
             checks.append(("✗", "Embedding layer NOT found", "MISSING"))
 
         # Check 2: Injection hook
-        if hasattr(self, '_injection_hook_handle'):
+        if hasattr(self, "_injection_hook_handle"):
             checks.append(("✓", "Injection hook registered", "OK"))
         else:
             checks.append(("✗", "Injection hook NOT registered", "MISSING"))
 
         # Check 3: Actor exists
-        if hasattr(self, 'actor') and self.actor is not None:
+        if hasattr(self, "actor") and self.actor is not None:
             checks.append(("✓", "Actor exists", self.actor.__class__.__name__))
         else:
             checks.append(("✗", "Actor does NOT exist", "MISSING"))
 
         # Check 4: Actor has _forward_micro_batch
-        if hasattr(self, 'actor') and hasattr(self.actor, '_forward_micro_batch'):
+        if hasattr(self, "actor") and hasattr(self.actor, "_forward_micro_batch"):
             checks.append(("✓", "Actor has _forward_micro_batch", "OK"))
 
             # Check if it's wrapped (wrapped functions have __name__ = '_forward_micro_batch_with_injection')
             method_name = self.actor._forward_micro_batch.__name__
-            if 'injection' in method_name:
+            if "injection" in method_name:
                 checks.append(("✓", "Actor _forward_micro_batch is WRAPPED", method_name))
             else:
                 checks.append(("⚠️", "Actor _forward_micro_batch may NOT be wrapped", method_name))
@@ -743,20 +848,20 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
             checks.append(("✗", "Actor _forward_micro_batch NOT found", "MISSING"))
 
         # Check 5: Injection config
-        if hasattr(self, 'injection_cfg'):
+        if hasattr(self, "injection_cfg"):
             token_id = self.injection_cfg.injection_token_id
             checks.append(("✓", f"Injection config exists (token_id={token_id})", "OK"))
         else:
             checks.append(("✗", "Injection config NOT found", "MISSING"))
 
         # Check 6: Telemetry
-        if hasattr(self, '_injection_telemetry'):
+        if hasattr(self, "_injection_telemetry"):
             checks.append(("✓", "Telemetry initialized", "OK"))
         else:
             checks.append(("⚠️", "Telemetry NOT initialized", "WARN"))
 
         # Check 7: Projection layer
-        if hasattr(self, '_activation_projection'):
+        if hasattr(self, "_activation_projection"):
             if self._activation_projection is not None:
                 checks.append(("✓", "Projection layer created", str(self._activation_projection)))
             else:
@@ -776,12 +881,12 @@ class NLAActorRolloutRefWorker(FSDPActorRolloutRefWorker):
         log.debug(f"\n  Summary: {passed} passed, {warnings} warnings, {failed} failed")
 
         if failed > 0:
-            log.debug(f"  ❌ INJECTION SETUP INCOMPLETE - INJECTION WILL NOT WORK")
+            log.debug("  ❌ INJECTION SETUP INCOMPLETE - INJECTION WILL NOT WORK")
         elif warnings > 0:
-            log.debug(f"  ⚠️  INJECTION SETUP OK (with warnings)")
+            log.debug("  ⚠️  INJECTION SETUP OK (with warnings)")
         else:
-            log.debug(f"  ✅ INJECTION SETUP COMPLETE - READY TO INJECT")
+            log.debug("  ✅ INJECTION SETUP COMPLETE - READY TO INJECT")
 
-        log.debug(f"{'='*80}\n")
+        log.debug(f"{'=' * 80}\n")
 
         return {"passed": passed, "warnings": warnings, "failed": failed}

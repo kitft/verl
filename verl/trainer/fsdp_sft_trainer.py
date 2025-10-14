@@ -105,17 +105,17 @@ class FSDPSFTTrainer:
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.tokenizer = tokenizer
-        if self.config.data.chat_template is not None:
+        if self.config.data.get("chat_template", None) is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
         # normalize dp size
         self._normalize_config_bsz()
 
-        # Set sequence parallel size
-        self.config.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
+        # Set sequence parallel size (store as instance variables instead of modifying config in struct mode)
+        self.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
         self.use_remove_padding = getattr(self.config, "use_remove_padding", False)
         if self.device_mesh.get_rank() == 0:
-            print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
+            print(f"Using sequence parallel size: {self.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
 
         self._build_dataloader(train_dataset, val_dataset)
@@ -157,7 +157,7 @@ class FSDPSFTTrainer:
         # Use data parallel rank and size instead of global rank and world size
 
         # If doing SP, we need to use the local rank and size
-        if self.config.ulysses_sequence_parallel_size > 1:
+        if self.ulysses_sequence_parallel_size > 1:
             rank = self.ulysses_device_mesh.get_local_rank("dp")
             world_size = self.ulysses_device_mesh.size(0)
             if self.ulysses_device_mesh.get_rank() == 0:
@@ -222,7 +222,7 @@ class FSDPSFTTrainer:
             self.model_config.max_position_embeddings = max(
                 self.model_config.max_position_embeddings, self.config.data.max_length
             )
-        if self.config.ulysses_sequence_parallel_size > 1:
+        if self.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
         # This may be very large
@@ -239,10 +239,10 @@ class FSDPSFTTrainer:
                 trust_remote_code=trust_remote_code,
             )
 
-            if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
+            if self.use_remove_padding or self.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
 
-                apply_monkey_patch(model=self.model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
+                apply_monkey_patch(model=self.model, ulysses_sp_size=self.ulysses_sequence_parallel_size)
 
             # Apply Liger kernel if use_liger is enabled
             if self.config.model.get("use_liger", False):
@@ -354,7 +354,7 @@ class FSDPSFTTrainer:
 
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
         """Compute loss with optional sequence parallelism and remove padding features"""
-        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+        use_sp = self.use_remove_padding and self.ulysses_sequence_parallel_size > 1
 
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
@@ -679,17 +679,34 @@ class FSDPSFTTrainer:
             raise ValueError(f"Invalid resume_mode: {resume_mode}. Must be 'auto', 'disable', or 'resume_path'")
 
     def _find_latest_checkpoint(self):
-        """Find the latest checkpoint in the default local directory"""
+        """Find the latest checkpoint with pattern matching support"""
+        import re
+
+        from verl.utils.checkpoint.checkpoint_manager import find_latest_checkpoint_by_pattern
+
         checkpoint_dir = self.config.trainer.default_local_dir
+        rank = self.device_mesh.get_rank()
 
-        if not os.path.exists(checkpoint_dir):
-            return None
+        # Try exact path first (fast path for exact matches)
+        if os.path.exists(checkpoint_dir):
+            latest_checkpoint = find_latest_ckpt_path(checkpoint_dir)
+            if latest_checkpoint:
+                if rank == 0:
+                    step_num = extract_step(latest_checkpoint)
+                    print(f"Found latest checkpoint: {latest_checkpoint} (step {step_num})")
+                return latest_checkpoint
 
-        latest_checkpoint = find_latest_ckpt_path(checkpoint_dir)
+        # If exact path doesn't work, try pattern matching one level up
+        parent_dir = os.path.dirname(checkpoint_dir)
+        experiment_name = os.path.basename(checkpoint_dir)
 
-        if latest_checkpoint and self.device_mesh.get_rank() == 0:
-            step_num = extract_step(latest_checkpoint)
-            print(f"Found latest checkpoint: {latest_checkpoint} (step {step_num})")
+        # Strip timestamp if present (format: -MM-DD_HHMMSS)
+        experiment_prefix = re.sub(r"-\d{2}-\d{2}_\d{6}$", "", experiment_name)
+
+        if rank == 0:
+            print(f"[Resume] Exact path not found, searching with pattern: {experiment_prefix}")
+
+        latest_checkpoint = find_latest_checkpoint_by_pattern(parent_dir, experiment_prefix)
 
         return latest_checkpoint
 
@@ -726,6 +743,7 @@ class FSDPSFTTrainer:
                 tracking.log(data=metric, step=step)
             torch.distributed.barrier()
             return metric
+
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs

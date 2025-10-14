@@ -15,14 +15,16 @@ from verl.trainer.fsdp_sft_trainer import (
     FSDPSFTTrainer,
     gather_outputs_and_unpad,
     get_ulysses_sequence_parallel_world_size,
-    index_first_axis,
-    pad_input,
-    rearrange,
     ulysses_pad_and_slice_inputs,
-    unpad_input,
 )
-from verl.utils.device import get_device_id
+from verl.utils.device import get_device_id, is_cuda_available, is_npu_available
 from verl.utils.fs import copy_to_local
+
+# Import flash-attn padding utilities conditionally (same as base trainer)
+if is_cuda_available:
+    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+elif is_npu_available:
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.fsdp_utils import (
     MixedPrecisionPolicy,
     apply_fsdp2,
@@ -79,6 +81,76 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             train_dataset=train_dataset,
             val_dataset=val_dataset,
         )
+
+    def _build_dataloader(self, train_dataset, val_dataset):
+        """Override to use NLA collator that handles variable-length responses."""
+        # Store datasets
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+
+        # Import NLA collator
+        from verl.nla.data.nla_sft_dataset import NLASFTCollator
+
+        # Get pad_token_id from tokenizer
+        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, "pad_token_id") else 0
+
+        # Create collator
+        collate_fn = NLASFTCollator(pad_token_id=pad_token_id)
+
+        # Build dataloader with custom collator
+        from torch.utils.data import DistributedSampler
+
+        # Use StatefulDataLoader for checkpoint support (not regular DataLoader)
+        try:
+            from torchdata.stateful_dataloader import StatefulDataLoader
+        except ImportError:
+            # Fallback if StatefulDataLoader not available
+            from torch.utils.data import DataLoader as StatefulDataLoader
+
+        # Calculate per-GPU batch size using micro_batch_size_per_gpu from config
+        # This is what the training loop expects
+        per_gpu_batch_size = self.config.data.micro_batch_size_per_gpu
+
+        self.train_sampler = DistributedSampler(
+            self.train_dataset,
+            shuffle=True,
+            num_replicas=self.device_mesh.size(),
+            rank=self.device_mesh.get_rank(),
+            drop_last=True,
+        )
+
+        self.train_dataloader = StatefulDataLoader(
+            self.train_dataset,
+            batch_size=per_gpu_batch_size,
+            sampler=self.train_sampler,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_fn,  # Use NLA collator
+        )
+
+        self.val_sampler = DistributedSampler(
+            self.val_dataset,
+            shuffle=False,
+            num_replicas=self.device_mesh.size(),
+            rank=self.device_mesh.get_rank(),
+            drop_last=True,
+        )
+        self.val_dataloader = StatefulDataLoader(
+            self.val_dataset,
+            batch_size=per_gpu_batch_size,
+            sampler=self.val_sampler,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_fn,  # Use NLA collator
+        )
+
+        if self.device_mesh.get_rank() == 0:
+            print(f"NLA FSDP SFT: Using NLASFTCollator for DataLoader")
+            print(f"  Per-GPU batch size: {per_gpu_batch_size}")
+            print(f"  Global batch size: {self.config.data.train_batch_size}")
+            print(f"  World size: {self.device_mesh.size()}")
 
     def _truncate_transformer(self, model: nn.Module, num_layers_to_keep: int) -> nn.Module:
         """Truncate a HuggingFace transformer model to keep only the first N layers.
@@ -144,7 +216,8 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             return model
         if num_layers_to_keep >= original_layers:
             print(
-                f"Truncation skipped: requested {num_layers_to_keep} layers but model only has {original_layers} layers."
+                f"Truncation skipped: requested {num_layers_to_keep} layers but model only has "
+                f"{original_layers} layers."
             )
             return model
 
@@ -226,7 +299,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
 
     def _build_nla_actor_model_optimizer(self):
         """Build NLA-wrapped actor model and optimizer."""
-        local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
+        # Try partial_pretrain first (FSDP key), fall back to path (standard key)
+        model_path = self.config.model.get("partial_pretrain", None) or self.config.model.path
+        local_model_path = copy_to_local(src=model_path, verbose=True)
 
         if self.config.model.get("external_lib", None) is not None:
             import importlib
@@ -308,7 +383,8 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             if self.device_mesh.get_rank() == 0:
                 print("Wrapped actor model with NLAModelWrapper")
                 print(
-                    f"Injection token: '{injection_config.injection_token}' (ID: {self.model.injection_config.injection_token_id})"
+                    f"Injection token: '{injection_config.injection_token}' "
+                    f"(ID: {self.model.injection_config.injection_token_id})"
                 )
 
         # Apply gradient checkpointing if needed
@@ -329,7 +405,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
     def _build_critic_model_optimizer(self):
         """Build critic model that outputs activation vectors from last hidden states."""
         critic_config = self.nla_config.get("critic", {})
-        critic_model_path = critic_config.get("model_path", self.config.model.partial_pretrain)
+        # Try partial_pretrain first (FSDP key), fall back to path (standard key)
+        default_model_path = self.config.model.get("partial_pretrain", None) or self.config.model.path
+        critic_model_path = critic_config.get("model_path", default_model_path)
 
         if self.device_mesh.get_rank() == 0:
             print(f"Building NLA critic model from: {critic_model_path}")
@@ -361,6 +439,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         self.model = AutoModelForCausalLMWithVectorValueHead(
             pretrained_model=critic_base_model,
             dropout=critic_config.get("dropout", 0.1),
+            output_layer_index=critic_config.get("output_layer_index"),
         )
 
         # Apply FSDP wrapping
@@ -408,9 +487,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             if self.config.model.fsdp_config.cpu_offload:
                 cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
 
-            # Apply FSDP1
-            self.fsdp_model = FSDP(
-                model_to_wrap,
+            # Apply FSDP1 to the inner model (consistent with FSDP2)
+            inner_model_fsdp = FSDP(
+                inner_model_for_fsdp2,
                 cpu_offload=cpu_offload,
                 param_init_fn=init_fn,
                 use_orig_params=False,
@@ -422,6 +501,22 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
             )
+
+            # Update the outer wrapper to point to the FSDP-wrapped inner model
+            # This is crucial for FSDP1 since the wrapper stores a reference to the inner model
+            if hasattr(model_to_wrap, "base_model"):
+                # NLAModelWrapper case
+                model_to_wrap.base_model = inner_model_fsdp
+            elif hasattr(model_to_wrap, "pretrained_model"):
+                # AutoModelForCausalLMWithVectorValueHead case
+                model_to_wrap.pretrained_model = inner_model_fsdp
+
+            # For checkpoint saving/loading, point to the FSDP-wrapped inner model
+            # The outer wrapper (NLAModelWrapper or AutoModelForCausalLMWithVectorValueHead)
+            # contains the FSDP-wrapped model and handles forward passes correctly
+            self.fsdp_model = inner_model_fsdp
+            # Keep reference to the outer model for forward passes
+            self.model = model_to_wrap
 
         elif fsdp_strategy == "fsdp2":
             # Setup FSDP2 with consistent configuration for both actor and critic
@@ -519,9 +614,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
             loss_fct = nn.CrossEntropyLoss(reduction="none")
 
-            # For FSDP2, self.fsdp_model points to inner base_model but we need to call
-            # self.model (the NLAModelWrapper) to get activation injection
-            forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
+            # Both FSDP1 and FSDP2 now wrap the inner model, so we always use self.model
+            # (the outer wrapper) for forward passes to get activation injection
+            forward_model = self.model
 
             context = self.sharding_manager if use_sp else nullcontext()
             with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
@@ -613,9 +708,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
         target_activations = batch["activation_vectors"].to(self.device_name)
 
         # Forward pass through critic
-        # For FSDP2, self.fsdp_model points to inner pretrained_model but we need to call
-        # self.model (the wrapper) to ensure output_hidden_states=True is set
-        forward_model = self.model if self.config.model.strategy == "fsdp2" else self.fsdp_model
+        # Both FSDP1 and FSDP2 now wrap the inner model, so we always use self.model
+        # (the wrapper) to ensure output_hidden_states=True is set
+        forward_model = self.model
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             critic_output = forward_model(
                 input_ids=input_ids,
@@ -634,13 +729,16 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             if hasattr(critic_output, "value") and critic_output.value is not None:
                 predicted_activations = critic_output.value
             else:
+                raise ValueError("Value is not available in the critic output. this has been normed")
                 if hasattr(critic_output, "last_hidden_state") and critic_output.last_hidden_state is not None:
                     last_hidden_state = critic_output.last_hidden_state  # (batch, seq_len, hidden_size)
                 elif hasattr(critic_output, "hidden_states") and critic_output.hidden_states is not None:
                     last_hidden_state = critic_output.hidden_states[-1]
                 else:
                     raise ValueError(
-                        f"Last hidden state or hidden states are not available in the critic output: available keys are {critic_output.keys()} and which are none? {[key is None for key in critic_output.keys()]}"
+                        f"Last hidden state or hidden states are not available in the critic output: "
+                        f"available keys are {critic_output.keys()} and which are none? "
+                        f"{[key is None for key in critic_output.keys()]}"
                     )
                 indices = torch.arange(target_activations.shape[0], device=target_activations.device)
                 predicted_activations = last_hidden_state[indices, seq_lengths]  # (batch, hidden_size)
@@ -692,9 +790,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             """Execute validation loop and log metrics."""
             val_losses = []
             for val_data in self.val_dataloader:
-                val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
-                    self.device_name
-                )
+                # Use actual batch size from dataloader, not config value
+                actual_batch_size = val_data["input_ids"].shape[0]
+                val_data = TensorDict(val_data, batch_size=actual_batch_size).to(self.device_name)
                 val_loss = self.validation_step(val_data)
                 val_losses.append(val_loss)
 
@@ -729,6 +827,14 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 if rank == 0 and metric is not None:
                     last_valid_metric = metric
 
+        # Check if checkpointing is disabled and print warning
+        disable_checkpointing = getattr(self.config.trainer, "disable_checkpointing", False)
+        if rank == 0 and disable_checkpointing:
+            print("=" * 80)
+            print("WARNING: Checkpointing is DISABLED (disable_checkpointing=True)")
+            print("No checkpoints will be saved during or after training")
+            print("=" * 80)
+
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -743,7 +849,9 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                 )
             ):
                 global_step += 1
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                # Use actual batch size from dataloader, not global batch size
+                actual_batch_size = data["input_ids"].shape[0]
+                data = TensorDict(data, batch_size=actual_batch_size).to(self.device_name)
                 metric = self.training_step(data)
                 train_time += metric["train/time(s)"]
 
@@ -761,8 +869,11 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
                     if rank == 0 and metric is not None:
                         last_valid_metric = metric
 
-                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
-                    self.save_checkpoint(step=global_step)
+                # Check if checkpointing is disabled
+                disable_checkpointing = getattr(self.config.trainer, "disable_checkpointing", False)
+                if not disable_checkpointing:
+                    if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                        self.save_checkpoint(step=global_step)
 
                 if is_last_step:
                     if rank == 0:
@@ -839,7 +950,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
             print(f"Saved dataloader state to: {dataloader_local_path}")
 
             # Update latest checkpoint tracker (atomic write)
-            from verl.utils.checkpoint.utils import get_checkpoint_tracker_filename
+            from verl.utils.checkpoint.checkpoint_manager import get_checkpoint_tracker_filename
 
             tracker_file = get_checkpoint_tracker_filename(self.config.trainer.default_local_dir)
             temp_tracker_file = tracker_file + ".tmp"
@@ -854,7 +965,7 @@ class NLAFSDPSFTTrainer(FSDPSFTTrainer):
 
         # Copy to HDFS if configured (now includes metadata!)
         if self.device_mesh.get_rank() == 0 and getattr(self.config.trainer, "default_hdfs_dir", None):
-            from verl.utils.hdfs import hdfs_io
+            import verl.utils.hdfs_io as hdfs_io
 
             hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
             hdfs_io.copy(src=checkpoint_dir, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)

@@ -1,0 +1,215 @@
+# NLA SFT configuration - 30B Qwen MoE model on 8 GPUs using Megatron backend
+# Megatron version of nla_sft_30b_8gpu.yaml
+
+defaults:
+  - model@model: hf_model
+  - engine@engine: megatron
+  - optim@optim: megatron
+  - _self_
+
+# Data configuration - 8 GPU setup with Megatron parallelism
+data:
+  train_batch_size: 256  # Global batch size across all GPUs
+  micro_batch_size_per_gpu: 8  # Reduced for Megatron memory overhead
+  max_token_len_per_gpu: 8192
+  use_dynamic_bsz: True
+  train_files: data/q30b/sft/train_nla_sft_dataset_fineweb_layer32.parquet
+  val_files: data/q30b/sft/val_nla_sft_dataset_fineweb_layer32.parquet
+
+  # NLA Dataset keys
+  prompt_key: prompt  # Use 'prompt' (message array) not 'prompt_text' (pre-formatted string)
+  response_key: response
+
+  # Custom NLA dataset class
+  custom_cls:
+    path: verl.nla.data.nla_sft_dataset
+    name: NLASFTDataset
+
+  # Sequence length settings
+  max_length: 512
+  truncation: error
+  use_shm: False
+
+# Model configuration - 30B Qwen MoE model
+model:
+  path: Qwen/Qwen3-30B-A3B
+  tokenizer_path: null
+  use_shm: False
+  trust_remote_code: true
+  custom_chat_template: null
+  external_lib: null
+  override_config: {}
+  enable_gradient_checkpointing: true  # Critical for 30B
+  enable_activation_offload: false
+  use_remove_padding: false
+  lora_rank: 0
+  lora_alpha: 16
+  target_modules: all-linear
+  exclude_modules: null
+  use_liger: false
+  use_fused_kernels: false
+  fused_kernel_options:
+    impl_backend: torch
+
+# Engine configuration - Megatron parallelism
+engine:
+  _target_: verl.workers.config.McoreEngineConfig
+
+  # Memory management
+  param_offload: false
+  grad_offload: false
+  optimizer_offload: false
+
+  # Parallelism configuration for 8 GPUs
+  # For Qwen3-30B-A3B MoE model: use Expert Parallelism (matching GRPO example)
+  tensor_model_parallel_size: 1   # TP=1 (no tensor parallelism)
+  expert_model_parallel_size: 8   # EP=8 (all 8 GPUs for expert parallelism)
+  expert_tensor_parallel_size: 1  # ETP=1 (experts not sharded within TP)
+  pipeline_model_parallel_size: 1 # PP=1 (no pipeline parallelism)
+  virtual_pipeline_model_parallel_size: null
+  context_parallel_size: 1
+
+  # Sequence parallel (only works with TP > 1, so disabled)
+  sequence_parallel: false
+
+  # Distributed optimizer
+  use_distributed_optimizer: true
+  use_dist_checkpointing: false
+  dist_checkpointing_path: null
+
+  seed: 42
+
+  # DDP configuration
+  override_ddp_config: {}
+
+  # Transformer config - MoE optimizations from GRPO example
+  override_transformer_config:
+    # Activation checkpointing for memory efficiency
+    recompute_granularity: selective
+    recompute_modules: ["core_attn"]
+    recompute_method: null
+    recompute_num_layers: null
+    # MoE-specific optimizations
+    apply_rope_fusion: true
+    masked_softmax_fusion: true
+    bias_activation_fusion: true
+    bias_dropout_fusion: true
+    gradient_accumulation_fusion: true
+    deallocate_pipeline_outputs: true
+    persist_layer_norm: true
+    moe_grouped_gemm: true
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: "flex"
+    moe_router_dtype: fp32
+    moe_enable_deepep: true
+
+  override_mcore_model_config: {}
+  use_mbridge: true  # Required for MoE models like Qwen3-30B-A3B
+  forward_only: false
+
+# Optimizer configuration - Megatron optimizer for SFT trainer
+optim:
+  _target_: verl.workers.config.McoreOptimizerConfig
+
+  # Learning rate
+  lr: 3e-5  # Slightly lower LR for 30B stability
+
+  # LR warmup
+  lr_warmup_steps_ratio: 0.05
+  lr_warmup_steps: -1
+  lr_warmup_init: 0.0
+
+  # Total training steps (will be calculated)
+  total_training_steps: -1
+
+  # Weight decay
+  weight_decay: 0.01
+  weight_decay_incr_style: constant
+
+  # Betas for Adam optimizer
+  betas: [0.9, 0.999]
+
+  # Gradient clipping
+  clip_grad: 1.0
+
+  # Optimizer type
+  optimizer: adam
+
+  # LR decay (cosine schedule)
+  lr_decay_style: cosine
+  lr_decay_steps: null
+  min_lr: 3e-6
+
+  # WSD decay style
+  lr_wsd_decay_style: exponential
+  lr_wsd_decay_steps: null
+
+  # Checkpoint optimizer parameter scheduler
+  use_checkpoint_opt_param_scheduler: true
+
+  # Override optimizer config
+  override_optimizer_config: {}
+
+# Checkpoint configuration
+checkpoint:
+  _target_: verl.trainer.config.CheckpointConfig
+  # Include HF model for downstream RL training
+  save_contents: ["model", "optimizer", "extra", "hf_model"]
+  load_contents: ["model", "optimizer", "extra"]
+
+# Trainer configuration - 8 GPU setup
+trainer:
+  default_local_dir: checkpoints/nla_sft_qwen_30b_8gpu_megatron
+  default_hdfs_dir: null
+  project_name: null  # Auto-filled from model name + train_mode
+  experiment_name: null  # Auto-generated with scale/norm info
+
+  total_epochs: 1
+  total_training_steps: null
+
+  logger: ["console", "wandb"]
+  seed: 42
+
+  # Checkpointing
+  save_freq: -1  # Save only at end of epoch
+  test_freq: 10
+  max_ckpt_to_keep: null
+
+  # Resume configuration
+  resume_mode: disable
+  resume_from_path: null
+
+  # Hardware configuration
+  nnodes: 1
+  n_gpus_per_node: 8
+  device: cuda
+
+# NLA-specific configuration
+nla:
+  enabled: true
+  train_mode: actor  # "actor" or "critic"
+
+  # Activation vector transformations
+  activation_dim: 2048  # Qwen3-30B-A3B hidden_size
+  scale: null  # Optional: scale activation vectors (e.g., 0.1, 10.0)
+  norm: null   # Optional: normalize activation vectors ("l2", "mean_std")
+
+  # Injection configuration for actor mode
+  injection:
+    mode: replace  # "replace" or "add"
+    layer_indices: [0]  # Which layers to inject at (embedding layer)
+    projection_dim: null  # Set if activation_dim != hidden_dim
+    injection_token: null  # Auto-detect injection token from dataset
+
+  # Critic model configuration (for critic mode only)
+  critic:
+    model_path: Qwen/Qwen3-30B-A3B
+    pooling: last  # How to pool hidden states
+    dropout: 0.1
+    projection_layers: null
+    truncate_layers: null  # Set to 15-20 for faster critic training
+    output_layer_index: 32  # Which layer to extract activations from
+
+  # Critic-specific training settings (critic mode only)
+  critic_lr: 2e-5
+  critic_epochs: 3

@@ -158,6 +158,8 @@ class McoreCriticConfig(CriticConfig):
         megatron (Dict[str, Any]): Megatron-specific parallelism settings.
         load_weight (bool): Whether to load initial weights.
         data_loader_seed (Optional[int]): Seed for data loader.
+        output_layer_index (Optional[int]): Layer index for NLA intermediate activation extraction.
+        critic_prompt (Optional[str]): Optional prompt prefix for NLA critic input.
     """
 
     strategy: str = "megatron"
@@ -165,6 +167,8 @@ class McoreCriticConfig(CriticConfig):
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     load_weight: bool = True
     data_loader_seed: Optional[int] = None
+    output_layer_index: Optional[int] = None  # added for NLA
+    critic_prompt: Optional[str] = None  # added for NLA
 
     def validate(self, n_gpus: int, train_batch_size: int):
         """Validate Megatron critic configuration with runtime parameters."""

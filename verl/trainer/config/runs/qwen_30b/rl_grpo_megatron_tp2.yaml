@@ -1,0 +1,226 @@
+# @package _global_
+
+defaults:
+  - /nla_grpo_full  # Inherit from base NLA config
+  - override /actor@actor_rollout_ref.actor: megatron_actor  # Use Megatron actor
+  - override /critic@critic: megatron_critic  # Use Megatron critic
+  - _self_
+
+# Megatron-LM configuration for Qwen3-30B-A3B (2 GPUs)
+# Uses Expert Parallelism (EP=2) which is correct for MoE models
+# Based on verl/examples/grpo_trainer/run_qwen3moe-30b_megatron_96gb.sh
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-30B-A3B
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+
+  actor:
+    _target_: verl.workers.config.McoreActorConfig
+    strategy: megatron
+    ppo_micro_batch_size_per_gpu: 2  # Small batch for memory
+    ppo_mini_batch_size: 512  # 64 prompts × 8 responses
+
+    # Megatron-specific settings for MoE model
+    megatron:
+      # Parallelism: Use Expert Parallelism for MoE models
+      tensor_model_parallel_size: 1  # TP=1 (no tensor parallelism)
+      expert_model_parallel_size: 2  # EP=2 (expert parallelism across 2 GPUs)
+      expert_tensor_parallel_size: 1  # ETP=1 (experts not sharded)
+      pipeline_model_parallel_size: 1  # PP=1 (MUST be 1 for NLA)
+      context_parallel_size: 1
+      sequence_parallel: false  # Disabled when TP=1
+
+      # Offloading for memory efficiency (critical for 30B on 2 GPUs)
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+
+      # Distributed optimizer
+      use_distributed_optimizer: true
+      use_dist_checkpointing: false
+
+      # MBridge for MoE models
+      use_mbridge: true
+
+      # Model configuration
+      override_mcore_model_config:
+        use_cache: false
+
+      # Transformer config with MoE optimizations
+      override_transformer_config:
+        # Activation checkpointing
+        recompute_granularity: "selective"
+        recompute_method: null
+
+        # MoE-specific fusion optimizations
+        apply_rope_fusion: true
+        masked_softmax_fusion: true
+        bias_activation_fusion: true
+        bias_dropout_fusion: true
+        gradient_accumulation_fusion: true
+        deallocate_pipeline_outputs: true
+        persist_layer_norm: true
+        moe_grouped_gemm: true
+        moe_permute_fusion: true
+        moe_token_dispatcher_type: "flex"
+        moe_router_dtype: fp32
+        moe_enable_deepep: true
+
+    # Optimizer with CPU offloading
+    optim:
+      lr: 1e-5
+      weight_decay: 0.001
+      lr_warmup_steps: 50
+      override_optimizer_config:
+        optimizer_offload_fraction: 1.0
+        overlap_cpu_optimizer_d2h_h2d: true
+        use_precision_aware_optimizer: true
+        optimizer_cpu_offload: true
+
+  rollout:
+    gpu_memory_utilization: 0.7
+    tensor_model_parallel_size: 1  # SGLang TP (can be higher for inference)
+    n: 8
+
+critic:
+  _target_: verl.workers.config.McoreCriticConfig
+  strategy: megatron
+  output_layer_index: 32  # Extract from layer 32
+  ppo_micro_batch_size_per_gpu: 2  # Small batch for memory
+
+  # Megatron-specific settings for MoE model
+  megatron:
+    # Parallelism: Use Expert Parallelism
+    tensor_model_parallel_size: 1  # TP=1
+    expert_model_parallel_size: 2  # EP=2
+    expert_tensor_parallel_size: 1  # ETP=1
+    pipeline_model_parallel_size: 1  # PP=1 (MUST be 1 for NLA)
+    context_parallel_size: 1
+    sequence_parallel: false
+
+    # Offloading for memory efficiency
+    param_offload: true
+    grad_offload: true
+    optimizer_offload: true
+
+    # Distributed optimizer
+    use_distributed_optimizer: true
+    use_dist_checkpointing: false
+
+    # MBridge for MoE models
+    use_mbridge: true
+
+    # Model configuration
+    override_mcore_model_config:
+      use_cache: false
+
+    # Transformer config with MoE optimizations
+    override_transformer_config:
+      # Activation checkpointing
+      recompute_granularity: "selective"
+      recompute_method: null
+
+      # MoE-specific fusion optimizations
+      apply_rope_fusion: true
+      masked_softmax_fusion: true
+      bias_activation_fusion: true
+      bias_dropout_fusion: true
+      gradient_accumulation_fusion: true
+      deallocate_pipeline_outputs: true
+      persist_layer_norm: true
+      moe_grouped_gemm: true
+      moe_permute_fusion: true
+      moe_token_dispatcher_type: "flex"
+      moe_router_dtype: fp32
+      moe_enable_deepep: true
+
+  # Model config
+  model:
+    _target_: verl.workers.config.HFModelConfig
+    path: Qwen/Qwen3-30B-A3B
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+
+  # Optimizer with CPU offloading
+  optim:
+    lr: 1e-9
+    weight_decay: 0.001
+    lr_warmup_steps: 50
+    override_optimizer_config:
+      optimizer_offload_fraction: 1.0
+      overlap_cpu_optimizer_d2h_h2d: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: true
+
+trainer:
+  n_gpus_per_node: 2  # Use 2 GPUs
+  nnodes: 1
+  total_training_steps: 10000
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  ppo_epochs: 1
+  steps_per_update: 1
+  project_name: nla-rl-q30b-megatron
+  experiment_name: qwen-30b-megatron-ep2
+  logger: ["console", "wandb"]
+  resume_mode: disable
+  log_val_generations: 100
+  test_freq: 100
+  rollout_data_dir: ./rollout_outputs
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 16
+    num_gpus: 2
+  # Resource pool: both actor and critic use 2 GPUs with EP=2
+  resource_pool:
+    actor_rollout:
+      num_gpus: 2  # 2 GPUs for actor EP=2
+    critic:
+      num_gpus: 2  # 2 GPUs for critic EP=2
+
+algorithm:
+  adv_estimator: grpo
+
+nla:
+  injection:
+    mode: replace
+    layer_indices: [0]
+    projection_dim: null
+    injection_token: null
+
+engine_kwargs:
+  sglang: {}
+
+data:
+  train_batch_size: 64
+  val_batch_size: 512
+  batch_size: 64
+  train_files:
+    - data/generated/rl_train_fineweb10bt_qwen_30b_layer32.parquet
+  val_files:
+    - data/generated/rl_val_fineweb10bt_qwen_30b_layer32.parquet
+
+# Configuration notes:
+#
+# 1. Expert Parallelism (EP) vs Tensor Parallelism (TP):
+#    - For MoE models like Qwen3-30B-A3B, use EP instead of TP
+#    - EP=2 splits the expert layers across 2 GPUs
+#    - TP=1 means no tensor parallelism (standard for MoE)
+#
+# 2. Offloading:
+#    - param_offload, grad_offload, optimizer_offload all enabled
+#    - CPU optimizer offloading for additional memory savings
+#    - Critical for fitting 30B on 2 GPUs
+#
+# 3. MoE Optimizations:
+#    - use_mbridge: Required for MoE models
+#    - Multiple fusion optimizations for better performance
+#    - moe_enable_deepep: Enables DeepSpeed-style EP optimizations
+#
+# 4. Memory Management:
+#    - Small micro_batch_size_per_gpu (2) for memory
+#    - Selective gradient checkpointing
+#    - Distributed optimizer to shard optimizer states

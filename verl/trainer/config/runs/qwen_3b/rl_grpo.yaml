@@ -89,3 +89,14 @@ data:
     - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_3b_layer18.parquet
   val_files:
     - /workspace/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_3b_layer18.parquet
+
+# NLA evaluation configuration (string matching)
+nla_eval:
+  enabled: true
+  eval_file: data/eval/nla_eval_activations.parquet
+  freq: 100  # Evaluate every 100 steps
+  max_samples: null  # Use all eval samples
+  max_new_tokens: 50
+  temperature: 0.7
+  do_sample: true
+  num_generations_per_prompt: 1

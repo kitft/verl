@@ -1,0 +1,35 @@
+# NLA Evaluation Configuration
+# Periodic string-matching evaluations during RL training
+
+nla_eval:
+  # Enable/disable string-match evaluation
+  enabled: true
+
+  # Multiple evaluation datasets (dict mapping dataset names to file paths)
+  # Each dataset will be evaluated separately and logged to wandb with its own prefix
+  # CRITICAL: Files must be generated with same model/layer as training data!
+  eval_files:
+    QA: data/eval/nla_eval_activations_qwen25_7b_instruct_layerN_2hop.parquet
+    # code: data/eval/nla_eval_code_MODEL_layerN.parquet
+    # reasoning: data/eval/nla_eval_reasoning_MODEL_layerN.parquet
+    # creative: data/eval/nla_eval_creative_MODEL_layerN.parquet
+  
+  # For backwards compatibility, you can also use a single file:
+  # eval_file: data/eval/nla_eval_activations_MODEL_layerN.parquet
+
+  # Evaluation frequency (steps)
+  freq: 100
+
+  # Maximum number of eval samples per dataset (null = use all)
+  max_samples: null
+
+  # Generation parameters for evaluation
+  max_new_tokens: 50
+  temperature: 0.7
+  do_sample: true
+
+  # Number of generations per prompt (for majority vote)
+  # Set to 1 for faster evaluation, 3-5 for more robust metrics
+  num_generations_per_prompt: 1
+  template: |
+        {source_prompt} <concept>{injection_character}</concept>

@@ -189,16 +189,32 @@ class CheckpointHandler:
             raise ValueError(f"Invalid resume_mode: {resume_mode}. Must be 'auto', 'disable', or 'resume_path'")
 
     def _find_latest_checkpoint(self):
-        """Find the latest checkpoint in the default local directory"""
+        """Find the latest checkpoint with pattern matching support"""
+        import re
+
+        from verl.utils.checkpoint.checkpoint_manager import find_latest_checkpoint_by_pattern
+
         checkpoint_dir = self.default_local_dir
 
-        if not os.path.exists(checkpoint_dir):
-            return None
+        # Try exact path first (fast path for exact matches)
+        if os.path.exists(checkpoint_dir):
+            latest_checkpoint = find_latest_ckpt_path(checkpoint_dir)
+            if latest_checkpoint:
+                if self.rank == 0:
+                    step_num = extract_step(latest_checkpoint)
+                    print(f"Found latest checkpoint: {latest_checkpoint} (step {step_num})")
+                return latest_checkpoint
 
-        latest_checkpoint = find_latest_ckpt_path(checkpoint_dir)
+        # If exact path doesn't work, try pattern matching one level up
+        parent_dir = os.path.dirname(checkpoint_dir)
+        experiment_name = os.path.basename(checkpoint_dir)
 
-        if latest_checkpoint and self.rank == 0:
-            step_num = extract_step(latest_checkpoint)
-            print(f"Found latest checkpoint: {latest_checkpoint} (step {step_num})")
+        # Strip timestamp if present (format: -MM-DD_HHMMSS)
+        experiment_prefix = re.sub(r"-\d{2}-\d{2}_\d{6}$", "", experiment_name)
+
+        if self.rank == 0:
+            print(f"[Resume] Exact path not found, searching with pattern: {experiment_prefix}")
+
+        latest_checkpoint = find_latest_checkpoint_by_pattern(parent_dir, experiment_prefix)
 
         return latest_checkpoint

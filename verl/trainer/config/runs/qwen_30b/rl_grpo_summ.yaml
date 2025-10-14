@@ -4,41 +4,45 @@ defaults:
   - /nla_grpo_full
   - _self_
 
-# Multi-GPU configuration for Qwen2.5-7B-Instruct (8 GPUs)
+# Multi-GPU configuration for Qwen/Qwen3-30B-A3B (8 GPUs)
+# MoE model with ~30B total parameters, ~3B active per token
 #
 # GRPO Batch Size Configuration:
-# With rollout.n=4 (from nla_grpo_full), eaih prompt generates 4 responses.
+# With rollout.n=4 (from nla_grpo_full), each prompt generates 4 responses.
 # Total experiences = data.batch_size × rollout.n = 16 × 4 = 64
 # For ONE gradient update per batch: ppo_mini_batch_size MUST = data.batch_size × rollout.n = 64
 # If you change rollout.n, you MUST update ppo_mini_batch_size accordingly!
 
 actor_rollout_ref:
   model:
-    path: Qwen/Qwen2.5-7B-Instruct
+    path: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     enable_gradient_checkpointing: true
     use_shm: false
   actor:
-    ppo_micro_batch_size_per_gpu: 8
+    ppo_micro_batch_size_per_gpu: 4  # Reduced for larger MoE model
     ppo_mini_batch_size:  512 # 16 prompts × 4 responses (rollout.n) = 64 for one gradient update
     optim:
       lr: 1e-5
       weight_decay: 0.001
       lr_warmup_steps: 50
+    ppo_max_token_len_per_gpu: 6400
     fsdp_config:
       model_dtype: bf16
       param_offload: true
       optimizer_offload: true
   rollout:
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.45  # Slightly reduced for MoE model
     tensor_model_parallel_size: 1  # MUST be 1 without resource pools (8 workers can't coordinate TP=2)
     n: 8  # Generate N responses per prompt for GRPO (must match nla.grpo.num_trajectories_per_prompt)
+    log_prob_max_token_len_per_gpu: 6400
+    response_length: 128  
 
 critic:
-  output_layer_index: 20
-  ppo_micro_batch_size_per_gpu: 8
+  output_layer_index: 32  # Adjust if needed for MoE architecture
+  ppo_micro_batch_size_per_gpu: 4  # Reduced for larger MoE model
   model:
-    path: Qwen/Qwen2.5-7B-Instruct
+    path: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     truncate_at_layer: null
     enable_gradient_checkpointing: true
@@ -46,6 +50,9 @@ critic:
       model_dtype: bf16
       param_offload: true
       optimizer_offload: true
+  ppo_max_token_len_per_gpu: 6400
+  forward_max_token_len_per_gpu: 6400
+
   optim:
     lr: 1e-9
     weight_decay: 0.001
@@ -58,8 +65,8 @@ trainer:
   ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # Must match actor.ppo_mini_batch_size
   ppo_epochs: 1
   steps_per_update: 1
-  project_name: nla-rl-q7b
-  experiment_name: qwen-7b-multigpu
+  project_name: nla-rl-q30b
+  experiment_name: qwen-30b-moe-multigpu
   logger: ["console", "wandb"]
   resume_mode: disable
   log_val_generations: 100  # Number of validation samples to log to wandb
@@ -91,10 +98,11 @@ data:
   train_batch_size: 64  # Number of prompts per training step
   val_batch_size: 512
   batch_size: 64  # Kept for compatibility
+  max_response_length: 128
   train_files:
-    - data/generated/rl_train_fineweb10bt_qwen_7b_layer20.parquet
+    - /workspace/kitf/nla/data/generated/rl_train_fineweb10bt_qwen_30b_layer32.parquet
   val_files:
-    - data/generated/rl_val_fineweb10bt_qwen_7b_layer20.parquet
+    - /workspace/kitf/nla/data/generated/rl_val_fineweb10bt_qwen_30b_layer32.parquet
 
 # NLA evaluation configuration (string matching)
 # IMPORTANT: Eval files must match model and layer used in training!
@@ -103,18 +111,18 @@ nla_eval:
   # Multiple evaluation datasets - each logged separately to wandb
   # Files must be generated with same model/layer as training data
   eval_files:
-    QA: data/eval/nla_eval_activations_QA_qwen_7b_layer20.parquet
-    2hop: data/eval/nla_eval_activations_2hop_qwen_7b_layer20.parquet
+    QA: data/eval/nla_eval_activations_QA_qwen_30b_layer32.parquet
+    2hop: data/eval/nla_eval_activations_2hop_qwen_30b_layer32.parquet
 
-    # reasoning: data/eval/nla_eval_activations_qwen25_7b_instruct_layer20_reasoning.parquet
-    # creative: data/eval/nla_eval_creative_qwen_7b_layer20.parquet
-  
+    # reasoning: data/eval/nla_eval_activations_qwen_30b_layer32_reasoning.parquet
+    # creative: data/eval/nla_eval_creative_qwen_30b_layer32.parquet
+
   # Single file mode (backwards compatible):
-  # eval_file: data/eval/nla_eval_activations_qwen_7b_layer20.parquet
-  
+  # eval_file: data/eval/nla_eval_activations_qwen_30b_layer32.parquet
+
   freq: 100  # Evaluate every 100 steps
   max_samples: null  # Max samples per dataset (null = use all)
-  max_new_tokens: 50
+  max_new_tokens: 128
   temperature: 0.7
   do_sample: true
   num_generations_per_prompt: 4

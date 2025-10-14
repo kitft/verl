@@ -67,6 +67,17 @@ nla:
     projection_dim: null
     injection_token: null
 
+# NLA evaluation configuration (string matching)
+nla_eval:
+  enabled: true
+  eval_file: data/eval/nla_eval_activations.parquet
+  freq: 10  # Evaluate every 10 steps (matches test_freq for tiny config)
+  max_samples: null  # Use all eval samples
+  max_new_tokens: 50
+  temperature: 0.7
+  do_sample: true
+  num_generations_per_prompt: 1
+
 engine_kwargs:
   sglang:
     # attention_chunk_size: 0  # Uncomment to disable SWA if encountering NoneType errors with input_embeds

@@ -1,0 +1,50 @@
+defaults:
+  - /nla_activation_dataset
+  - _self_
+
+mode: rl
+
+model:
+  name: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  layer_index: 32  # Adjust if needed for MoE architecture
+  model_dtype: bf16
+
+seed: 43
+
+dataset:
+  name: HuggingFaceFW/fineweb
+  config_name: sample-10BT
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: text
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: false
+  expect_chat: false
+  slice_start: 501000
+  slice_length: 2048
+
+sampling:
+  total_activations: 2048
+  activations_per_sample: 1
+  max_length: 1024
+  # Single H100 80GB: 60GB model + activations
+  # Batch 32 = ~73GB (safe), batch 64+ will OOM
+  parallel_batch_size: 16
+
+output:
+  path_prefix: data/generated/rl_val_fineweb10bt_qwen_30b
+  overwrite: true
+  include_layer_suffix: true
+  injection_token: null
+  random_variant:
+    enabled: false
+    path: null
+    suffix: _random
+    seed: null
+    columns: null
+    source_field: sample_uuid
+    source_column: activation_vector_source_uuid

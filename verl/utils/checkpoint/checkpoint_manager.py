@@ -203,6 +203,72 @@ def get_checkpoint_tracker_filename(root_path: str):
     return os.path.join(root_path, "latest_checkpointed_iteration.txt")
 
 
+def find_latest_checkpoint_by_pattern(base_path: str, experiment_prefix: str, directory_format: str = "global_step_{}"):
+    """
+    Find the most recent checkpoint across all timestamped experiment directories.
+    
+    This function searches for checkpoints even when the experiment name has a timestamp suffix.
+    It strips timestamp patterns and finds all matching experiment runs, then returns the
+    checkpoint with the highest step number.
+    
+    Args:
+        base_path: Base checkpoint directory (e.g., "checkpoints/nla-rl/")
+        experiment_prefix: Experiment name without timestamp (e.g., "qwen-small-critic")
+        directory_format: Template for checkpoint subfolders (default "global_step_{}")
+    
+    Returns:
+        Path to the most recent global_step_* directory, or None if not found
+    """
+    import re
+    from pathlib import Path
+    
+    if not os.path.exists(base_path):
+        return None
+    
+    # Find all directories matching the prefix pattern
+    matching_dirs = []
+    for dir_path in Path(base_path).iterdir():
+        if not dir_path.is_dir():
+            continue
+        
+        dir_name = dir_path.name
+        # Strip timestamp suffix (format: -MM-DD_HHMMSS or similar date patterns)
+        base_name = re.sub(r'-\d{2}-\d{2}_\d{6}$', '', dir_name)
+        
+        # Match if exact or starts with prefix followed by dash
+        if base_name == experiment_prefix or (base_name.startswith(experiment_prefix) and dir_name[len(experiment_prefix):len(experiment_prefix)+1] in ['-', '_']):
+            matching_dirs.append(dir_path)
+    
+    if not matching_dirs:
+        return None
+    
+    # For each matching experiment dir, find its latest checkpoint
+    all_checkpoints = []
+    for exp_dir in matching_dirs:
+        # Look for global_step_* subdirectories
+        for ckpt_dir in exp_dir.iterdir():
+            if ckpt_dir.is_dir() and ckpt_dir.name.startswith('global_step_'):
+                # Extract step number
+                match = re.search(r'global_step_(\d+)', ckpt_dir.name)
+                if match:
+                    step_num = int(match.group(1))
+                    # Use modification time as tiebreaker
+                    mtime = ckpt_dir.stat().st_mtime
+                    all_checkpoints.append((step_num, mtime, str(ckpt_dir)))
+    
+    if not all_checkpoints:
+        return None
+    
+    # Sort by (step_num, mtime) descending - prefer higher step, then newer time
+    all_checkpoints.sort(reverse=True)
+    latest_checkpoint = all_checkpoints[0][2]
+    
+    print(f"[Pattern Resume] Found {len(all_checkpoints)} checkpoints across {len(matching_dirs)} experiment runs")
+    print(f"[Pattern Resume] Using latest: {latest_checkpoint} (step {all_checkpoints[0][0]})")
+    
+    return latest_checkpoint
+
+
 def should_save_ckpt_esi(max_steps_duration: float, save_ckpt_duration: float = 60, redundant_time: float = 0) -> bool:
     """
     Determine if checkpoint should be saved based on capacity esi expiration.

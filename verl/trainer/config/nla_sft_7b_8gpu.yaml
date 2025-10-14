@@ -61,6 +61,7 @@ trainer:
   logger: ["console", "wandb"]
   seed: 42
   save_freq: -1
+  disable_checkpointing: false  # Set to true to completely disable all checkpointing (including final checkpoint)
   test_freq: 10
   nnodes: 1
   n_gpus_per_node: 8
@@ -80,6 +81,10 @@ nla:
   # activation_dim now determined dynamically from model's hidden_size
   train_mode: actor  # "actor" or "critic"
 
+  # Activation vector transformations
+  scale: null  # Optional: Scale activation vectors by this factor
+  norm: null  # Optional: Normalize activation vectors ('unit' for unit norm, null for no normalization)
+
   # Injection configuration for actor
   injection:
     mode: replace
@@ -92,9 +97,10 @@ nla:
     model_path: Qwen/Qwen2.5-7B-Instruct
     pooling: last
     dropout: 0.1
-    projection_layers: 2
+    projection_layers: null
     # Optional: Truncate critic model independently (null or <=0 to disable)
     truncate_layers: null  # e.g., set to 8 for smaller critic
+    output_layer_index: 20
 
   # Training settings
   critic_lr: 2e-5

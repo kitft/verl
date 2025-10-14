@@ -32,8 +32,8 @@ class NLAVectorValueHead(nn.Module):
         self.hidden_size = hidden_size
         # No projection needed - we output hidden_size dimensional vectors
         # Just a linear layer for learning but same input/output dim
-        self.linear = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
+        # self.linear = nn.Linear(hidden_size, hidden_size)
+        # self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -42,9 +42,9 @@ class NLAVectorValueHead(nn.Module):
         Returns:
             values: (batch, seq_len, hidden_size) or (batch, hidden_size)
         """
-        hidden_states = self.dropout(hidden_states)
-        values = self.linear(hidden_states)
-        return values
+        # hidden_states = self.dropout(hidden_states)
+        # values = self.linear(hidden_states)
+        return hidden_states
 
 
 class AutoModelForCausalLMWithVectorValueHead(nn.Module):
@@ -59,6 +59,7 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
         *,
         pretrained_model: nn.Module = None,
         dropout: float = 0.1,
+        output_layer_index: int = 20,
         **model_kwargs,
     ):
         super().__init__()
@@ -75,10 +76,11 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
         # Get hidden size from model config
         self.config = self.pretrained_model.config
         self.hidden_size = self.config.hidden_size
+        self.output_layer_index = output_layer_index
 
         # No value head - we directly use the hidden states as activation vectors
         # This simplifies FSDP wrapping since we don't have extra modules
-        self.dropout = nn.Dropout(dropout)
+        # self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -137,22 +139,32 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
         seq_lengths = attention_mask.sum(dim=1) - 1
         seq_lengths = seq_lengths.clamp(min=0)
 
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            last_hidden_state = outputs.last_hidden_state  # (batch, seq_len, hidden_size)
-        elif hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            last_hidden_state = outputs.hidden_states[-1]
+        # if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        #    last_hidden_state = outputs.last_hidden_state  # (batch, seq_len, hidden_size)
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            last_hidden_state = outputs.hidden_states[self.output_layer_index]
         else:
-            print(f"type of model = {self.pretrained_model}")
-            print(f"type of model = {type(self.pretrained_model)}")
-            print(f"attrs of model = {dir(self.pretrained_model)}")
-            import inspect
-
-            print(f"args and kwargs accepted by __call__ = {inspect.signature(self.pretrained_model.__call__)}")
             raise ValueError(
                 f"Last hidden state or hidden states are not available in the critic output: available keys are {outputs.keys()} and which are none? {[key is None for key in outputs.keys()]}"
             )
+        # elif hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        #     raise ValueError("Last hidden state is not available in the critic output. this has been normed")
+        # else:
+        #     print(f"type of model = {self.pretrained_model}")
+        #     print(f"type of model = {type(self.pretrained_model)}")
+        #     print(f"attrs of model = {dir(self.pretrained_model)}")
+        #     import inspect
+
+        #     print(f"args and kwargs accepted by __call__ = {inspect.signature(self.pretrained_model.__call__)}")
+        #     raise ValueError(
+        #         f"Last hidden state or hidden states are not available in the critic output: available keys are {outputs.keys()} and which are none? {[key is None for key in outputs.keys()]}"
+        #     )
         indices = torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device)
         last_hidden = last_hidden_state[indices, seq_lengths]  # (batch, hidden_size) (batch, hidden_size)
+        # print(
+        #     f"extracting layer -1 of available {len(outputs.hidden_states)} hidden states, each of shape {outputs.hidden_states[0].shape}"
+        # )  #
+        # print(f"extracting at indices {indices} and seq_lengths {seq_lengths}")
 
         # Directly use the last hidden state as activation vector (with optional dropout)
         # activation_vector = self.dropout(last_hidden)  # (batch, hidden_size)
@@ -170,7 +182,7 @@ class AutoModelForCausalLMWithVectorValueHead(nn.Module):
             loss=None,
             logits=None,
             value=values,
-            hidden_states=outputs.hidden_states,  # Return full tuple from base model
+            hidden_states=outputs.hidden_states,  # outputs.hidden_states,  # Return full tuple from base model
             attentions=None,
         )
 

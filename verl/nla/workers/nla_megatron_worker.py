@@ -65,15 +65,15 @@ Before deploying with PP>1, verify:
 """
 
 import logging
+
 import torch
-from typing import Optional
 
 from verl.protocol import DataProto
-from verl.workers.megatron_workers import ActorRolloutRefWorker as MegatronActorRolloutRefWorker
-from verl.workers.megatron_workers import CriticWorker as MegatronCriticWorker
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.device import get_device_id
 from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
+from verl.workers.megatron_workers import ActorRolloutRefWorker as MegatronActorRolloutRefWorker
+from verl.workers.megatron_workers import CriticWorker as MegatronCriticWorker
 
 # Megatron parallel state utils
 try:
@@ -84,9 +84,11 @@ except ImportError:
         @staticmethod
         def is_pipeline_first_stage():
             return True
+
         @staticmethod
         def is_pipeline_last_stage():
             return True
+
     mpu = _MockMPU()
 
 from ..models.nla_wrapper import InjectionConfig
@@ -123,10 +125,10 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
         self._store_embedding_layer()
 
         # Setup NLA injection if configured
-        if hasattr(self.config, 'nla'):
+        if hasattr(self.config, "nla"):
             log.debug("NLA MEGATRON ACTOR: Setting up NLA injection configuration")
-            nla_config = self.config.get('nla', {})
-            injection_config = nla_config.get('injection', {})
+            nla_config = self.config.get("nla", {})
+            injection_config = nla_config.get("injection", {})
 
             # Configure injection settings
             self.injection_cfg = InjectionConfig(
@@ -137,13 +139,15 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
             )
 
             # Setup tokenizer and injection token manager
-            tokenizer = self.tokenizer if hasattr(self, 'tokenizer') else None
+            tokenizer = self.tokenizer if hasattr(self, "tokenizer") else None
             if tokenizer is not None:
                 injection_manager = InjectionTokenManager(tokenizer, self.injection_cfg.injection_token)
                 self.injection_cfg.injection_token_id = injection_manager.token_id
                 self.injection_cfg.injection_character = injection_manager.character
                 object.__setattr__(self, "injection_manager", injection_manager)
-                log.debug(f"NLA MEGATRON ACTOR: Injection token: '{injection_manager.character}' (ID: {injection_manager.token_id})")
+                log.debug(
+                    f"NLA MEGATRON ACTOR: Injection token: '{injection_manager.character}' (ID: {injection_manager.token_id})"
+                )
             elif self.injection_cfg.injection_token_id is not None and self.injection_cfg.injection_token_id >= 0:
                 object.__setattr__(self, "injection_manager", None)
             else:
@@ -152,17 +156,17 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
                 )
 
             # Setup embedding injection (only on first pipeline stage)
-            if mpu.is_pipeline_first_stage() and hasattr(self, 'actor_module') and self.embed_layer is not None:
+            if mpu.is_pipeline_first_stage() and hasattr(self, "actor_module") and self.embed_layer is not None:
                 log.debug("NLA MEGATRON ACTOR: Setting up activation injection on first pipeline stage")
 
                 # Determine dimensions for projection layer
                 hidden_dim = None
-                activation_dim = nla_config.get('activation_dim', None)
+                activation_dim = nla_config.get("activation_dim", None)
 
                 # Try to get hidden_dim from Megatron model
-                if hasattr(self, 'actor_module') and len(self.actor_module) > 0:
+                if hasattr(self, "actor_module") and len(self.actor_module) > 0:
                     model = self.actor_module[0]
-                    if hasattr(model, 'config') and hasattr(model.config, 'hidden_size'):
+                    if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
                         hidden_dim = model.config.hidden_size
 
                 if activation_dim is None:
@@ -171,13 +175,9 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
                 # Create projection layer if dimensions mismatch
                 if activation_dim is not None and hidden_dim is not None and activation_dim != hidden_dim:
                     log.debug(f"NLA MEGATRON ACTOR: Creating projection layer: {activation_dim} -> {hidden_dim}")
-                    self._activation_projection = torch.nn.Linear(
-                        activation_dim,
-                        hidden_dim,
-                        bias=False
-                    )
+                    self._activation_projection = torch.nn.Linear(activation_dim, hidden_dim, bias=False)
                     # Move to same device as embedding layer
-                    device = self.embed_layer.weight.device if hasattr(self.embed_layer, 'weight') else None
+                    device = self.embed_layer.weight.device if hasattr(self.embed_layer, "weight") else None
                     if device is not None:
                         self._activation_projection = self._activation_projection.to(device)
                 else:
@@ -185,21 +185,19 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
                 log.debug("NLA MEGATRON ACTOR: Registering embedding injection hook")
                 # Register forward hook on embedding layer
-                self._injection_hook_handle = self.embed_layer.register_forward_hook(
-                    self._embedding_injection_hook
-                )
+                self._injection_hook_handle = self.embed_layer.register_forward_hook(self._embedding_injection_hook)
 
                 # Wrap actor methods for state management
-                if hasattr(self, 'actor'):
+                if hasattr(self, "actor"):
                     log.debug("NLA MEGATRON ACTOR: Wrapping actor methods for injection state management")
                     self._wrap_actor_methods()
 
                     # Initialize telemetry
                     self._injection_telemetry = {
-                        'method_calls': 0,
-                        'calls_with_activations': 0,
-                        'hook_calls': 0,
-                        'actual_injections': 0,
+                        "method_calls": 0,
+                        "calls_with_activations": 0,
+                        "hook_calls": 0,
+                        "actual_injections": 0,
                     }
 
     def _store_embedding_layer(self):
@@ -208,28 +206,61 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
         # Only first pipeline stage has the embedding layer
         if not mpu.is_pipeline_first_stage():
-            log.debug("NLA MEGATRON ACTOR: Not on first pipeline stage, skipping embedding layer setup")
+            log.info("NLA MEGATRON ACTOR: Not on first pipeline stage, skipping embedding layer setup")
             return
 
         # Megatron models are stored in a list
-        if hasattr(self, 'actor_module') and len(self.actor_module) > 0:
+        if hasattr(self, "actor_module") and len(self.actor_module) > 0:
             model = self.actor_module[0]
 
+            # Debug: Print model structure
+            log.info(f"NLA MEGATRON ACTOR: Model type: {type(model)}")
+            log.info(f"NLA MEGATRON ACTOR: Model attributes: {dir(model)[:10]}...")  # First 10 attrs
+            log.info(f"NLA MEGATRON ACTOR: Has 'embedding': {hasattr(model, 'embedding')}")
+            log.info(f"NLA MEGATRON ACTOR: Has 'module': {hasattr(model, 'module')}")
+            log.info(f"NLA MEGATRON ACTOR: Has 'model': {hasattr(model, 'model')}")
+
             # Try Megatron-specific patterns first
-            if hasattr(model, 'embedding') and hasattr(model.embedding, 'word_embeddings'):
+            if hasattr(model, "embedding") and hasattr(model.embedding, "word_embeddings"):
                 self.embed_layer = model.embedding.word_embeddings
-                log.debug(f"Successfully stored Megatron embedding layer: {type(self.embed_layer)}")
+                log.info(f"✓ Successfully stored Megatron embedding layer: {type(self.embed_layer)}")
+            # Try module wrapper (DistributedDataParallel)
+            elif hasattr(model, "module"):
+                inner_model = model.module
+                log.info(f"NLA MEGATRON ACTOR: Found module wrapper, inner type: {type(inner_model)}")
+
+                # Float16Module might wrap the actual model - unwrap again
+                if hasattr(inner_model, "module"):
+                    actual_model = inner_model.module
+                    log.info(f"NLA MEGATRON ACTOR: Found nested module, actual type: {type(actual_model)}")
+                else:
+                    actual_model = inner_model
+
+                # Now try to find embeddings
+                if hasattr(actual_model, "embedding") and hasattr(actual_model.embedding, "word_embeddings"):
+                    self.embed_layer = actual_model.embedding.word_embeddings
+                    log.info(f"✓ Successfully stored embedding via module.module.embedding.word_embeddings")
+                elif hasattr(actual_model, "model") and hasattr(actual_model.model, "embed_tokens"):
+                    self.embed_layer = actual_model.model.embed_tokens
+                    log.info(f"✓ Successfully stored embedding via module.module.model.embed_tokens")
+                elif hasattr(inner_model, "embedding") and hasattr(inner_model.embedding, "word_embeddings"):
+                    self.embed_layer = inner_model.embedding.word_embeddings
+                    log.info(f"✓ Successfully stored embedding via module.embedding.word_embeddings")
+                elif hasattr(inner_model, "model") and hasattr(inner_model.model, "embed_tokens"):
+                    self.embed_layer = inner_model.model.embed_tokens
+                    log.info(f"✓ Successfully stored embedding via module.model.embed_tokens")
             # Fallback to HF patterns
-            elif hasattr(model, 'get_input_embeddings'):
+            elif hasattr(model, "get_input_embeddings"):
                 self.embed_layer = model.get_input_embeddings()
-                log.debug(f"Successfully stored embedding layer via get_input_embeddings")
-            elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                log.info("✓ Successfully stored embedding layer via get_input_embeddings")
+            elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
                 self.embed_layer = model.model.embed_tokens
-                log.debug(f"Successfully stored embedding layer via model.embed_tokens")
+                log.info("✓ Successfully stored embedding layer via model.embed_tokens")
             else:
-                log.debug("WARNING: Could not find embedding layer in Megatron actor model")
+                log.error("ERROR: Could not find embedding layer in Megatron actor model!")
+                log.error(f"Model type: {type(model)}, Has module: {hasattr(model, 'module')}")
         else:
-            log.debug("WARNING: actor_module not found or empty")
+            log.error("ERROR: actor_module not found or empty")
 
     def _embedding_injection_hook(self, module, input, output):
         """Forward hook that injects activation vectors into embeddings (first pipeline stage only).
@@ -241,20 +272,22 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
         if not mpu.is_pipeline_first_stage():
             return output
 
-        if hasattr(self, '_injection_telemetry'):
-            self._injection_telemetry['hook_calls'] += 1
+        if hasattr(self, "_injection_telemetry"):
+            self._injection_telemetry["hook_calls"] += 1
 
-        if not hasattr(self, '_current_activation_vectors') or self._current_activation_vectors is None:
+        if not hasattr(self, "_current_activation_vectors") or self._current_activation_vectors is None:
             return output
 
         activation_vectors = self._current_activation_vectors
         injection_positions = self._current_injection_positions
 
         # Get current micro-batch offset to index into the global activation vectors
-        micro_batch_offset = getattr(self, '_current_micro_batch_offset', 0)
+        micro_batch_offset = getattr(self, "_current_micro_batch_offset", 0)
         micro_batch_size = output.shape[0]
 
-        log.debug(f"🔥 NLA MEGATRON HOOK FIRING: micro_batch_offset={micro_batch_offset}, micro_batch_size={micro_batch_size}, total_activations={activation_vectors.shape[0]}")
+        log.debug(
+            f"🔥 NLA MEGATRON HOOK FIRING: micro_batch_offset={micro_batch_offset}, micro_batch_size={micro_batch_size}, total_activations={activation_vectors.shape[0]}"
+        )
 
         # Clone output to avoid in-place modification issues
         output = output.clone()
@@ -266,7 +299,9 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
             global_idx = micro_batch_offset + local_idx
 
             if global_idx >= len(injection_positions):
-                log.debug(f"WARNING: global_idx {global_idx} exceeds injection_positions length {len(injection_positions)}")
+                log.debug(
+                    f"WARNING: global_idx {global_idx} exceeds injection_positions length {len(injection_positions)}"
+                )
                 continue
 
             pos = injection_positions[global_idx]
@@ -287,7 +322,7 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
                 # Apply projection if needed
                 if activation.shape[-1] != output.shape[-1]:
-                    if hasattr(self, '_activation_projection') and self._activation_projection is not None:
+                    if hasattr(self, "_activation_projection") and self._activation_projection is not None:
                         activation = self._activation_projection(activation)
                     else:
                         raise RuntimeError(
@@ -298,10 +333,12 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
                 output[local_idx, pos] = activation.to(device=output.device, dtype=output.dtype)
                 injections_performed += 1
 
-        log.debug(f"✓ NLA MEGATRON HOOK: Performed {injections_performed}/{micro_batch_size} injections for global indices [{micro_batch_offset}:{micro_batch_offset+micro_batch_size}]")
+        log.debug(
+            f"✓ NLA MEGATRON HOOK: Performed {injections_performed}/{micro_batch_size} injections for global indices [{micro_batch_offset}:{micro_batch_offset + micro_batch_size}]"
+        )
 
-        if hasattr(self, '_injection_telemetry'):
-            self._injection_telemetry['actual_injections'] += injections_performed
+        if hasattr(self, "_injection_telemetry"):
+            self._injection_telemetry["actual_injections"] += injections_performed
 
         # Increment offset for next micro-batch
         self._current_micro_batch_offset = micro_batch_offset + micro_batch_size
@@ -338,14 +375,12 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
     def _wrap_actor_methods(self):
         """Wrap actor's methods to manage injection state around forward passes."""
         # Wrap compute_log_prob
-        if hasattr(self.actor, 'compute_log_prob'):
+        if hasattr(self.actor, "compute_log_prob"):
             log.debug("NLA MEGATRON ACTOR: Wrapping compute_log_prob")
-            self._wrap_method('compute_log_prob')
+            self._wrap_method("compute_log_prob")
 
-        # Wrap update_policy
-        if hasattr(self.actor, 'update_policy'):
-            log.debug("NLA MEGATRON ACTOR: Wrapping update_policy")
-            self._wrap_method('update_policy')
+        # Note: We don't wrap update_policy because it takes a dataloader, not a single DataProto
+        # The injection state is managed at the worker level via the update_actor() override
 
     def _wrap_method(self, method_name: str):
         """Generic wrapper to manage injection state around an actor method."""
@@ -353,24 +388,26 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
         def wrapped_method(data: DataProto, *args, **kwargs):
             # Track calls
-            if hasattr(self, '_injection_telemetry'):
-                self._injection_telemetry['method_calls'] += 1
+            if hasattr(self, "_injection_telemetry"):
+                self._injection_telemetry["method_calls"] += 1
 
             # Only manage injection state on first pipeline stage
-            has_activations = 'activation_vectors' in data.batch
+            has_activations = "activation_vectors" in data.batch
             should_inject = has_activations and mpu.is_pipeline_first_stage()
 
             if should_inject:
-                if hasattr(self, '_injection_telemetry'):
-                    self._injection_telemetry['calls_with_activations'] += 1
+                if hasattr(self, "_injection_telemetry"):
+                    self._injection_telemetry["calls_with_activations"] += 1
 
-                activation_vectors = data.batch['activation_vectors']
-                input_ids = data.batch['input_ids']
+                activation_vectors = data.batch["activation_vectors"]
+                input_ids = data.batch["input_ids"]
                 injection_positions = self._find_injection_positions_from_ids(input_ids)
 
                 log.debug(f"🎯 NLA MEGATRON: Setting injection state for {method_name}")
                 log.debug(f"   Activations shape: {activation_vectors.shape}")
-                log.debug(f"   Injection positions: {[(p.item() if isinstance(p, torch.Tensor) and p.numel() > 0 else p) for p in injection_positions]}")
+                log.debug(
+                    f"   Injection positions: {[(p.item() if isinstance(p, torch.Tensor) and p.numel() > 0 else p) for p in injection_positions]}"
+                )
 
                 self._set_injection_state(activation_vectors, injection_positions)
 
@@ -387,12 +424,14 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
         """Extract activation vectors from DataProto."""
         activation_vectors = None
         if data.batch is not None:
-            batch_keys = getattr(data.batch, 'keys', lambda: [])()
-            if 'activation_vectors' in batch_keys:
-                activation_vectors = data.batch['activation_vectors']
+            batch_keys = getattr(data.batch, "keys", lambda: [])()
+            if "activation_vectors" in batch_keys:
+                activation_vectors = data.batch["activation_vectors"]
         return activation_vectors
 
-    def _prepare_input_embeddings(self, data: DataProto, input_ids: torch.Tensor, activation_vectors: torch.Tensor) -> torch.Tensor:
+    def _prepare_input_embeddings(
+        self, data: DataProto, input_ids: torch.Tensor, activation_vectors: torch.Tensor
+    ) -> torch.Tensor:
         """
         Prepare input embeddings with activation injection for SGLang rollout.
 
@@ -415,13 +454,12 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
             # Check if this is FSDP DTensor (sharded)
             try:
                 from torch.distributed._tensor import DTensor
+
                 if isinstance(self.embed_layer.weight, DTensor):
                     # FSDP: All-gather the sharded embedding weights
                     full_weight = self.embed_layer.weight.full_tensor()
                     input_embeds = torch.nn.functional.embedding(
-                        input_ids,
-                        full_weight,
-                        padding_idx=getattr(self.embed_layer, 'padding_idx', None)
+                        input_ids, full_weight, padding_idx=getattr(self.embed_layer, "padding_idx", None)
                     )
                 else:
                     # Megatron (or non-sharded): Call embedding layer directly
@@ -438,11 +476,11 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
         # Find injection token positions
         injection_token_id = None
-        if hasattr(self, 'injection_cfg') and self.injection_cfg.injection_token_id is not None:
+        if hasattr(self, "injection_cfg") and self.injection_cfg.injection_token_id is not None:
             injection_token_id = self.injection_cfg.injection_token_id
 
         if injection_token_id is not None:
-            injection_mask = (input_ids == injection_token_id)
+            injection_mask = input_ids == injection_token_id
             if injection_mask.any():
                 injection_positions = injection_mask.float().argmax(dim=1)
                 log.debug(f"NLA Megatron Actor: Found injection tokens at positions: {injection_positions}")
@@ -459,6 +497,7 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
         # Inject activations at specified positions
         from collections import defaultdict
+
         pos_token_counts = defaultdict(list)
 
         for i in range(batch_size):
@@ -473,7 +512,7 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
                 log.debug(f"NLA Megatron Actor: Injected activation at position {pos} for {len(idxs)} sequence(s)")
 
         # Remove padding using attention mask
-        attention_mask = data.batch['attention_mask']
+        attention_mask = data.batch["attention_mask"]
         if attention_mask is None:
             raise ValueError("Attention mask is required to remove padding vectors.")
 
@@ -499,7 +538,9 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
 
         # Extract activation vectors
         activation_vectors = self._extract_activation_vectors(data)
-        log.debug(f"NLA MEGATRON ACTOR: Extracted activation_vectors: {activation_vectors.shape if activation_vectors is not None else None}")
+        log.debug(
+            f"NLA MEGATRON ACTOR: Extracted activation_vectors: {activation_vectors.shape if activation_vectors is not None else None}"
+        )
 
         # FAIL FAST: Ensure activation vectors are present
         if activation_vectors is None:
@@ -522,7 +563,7 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
             )
 
         # Prepare input embeddings with activation injection for SGLang
-        input_ids = data.batch['input_ids']
+        input_ids = data.batch["input_ids"]
         input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
         data.non_tensor_batch.update({"input_embeds": input_embeds})
         log.debug(f"NLA Megatron Actor: Prepared input_embeds for SGLang, first item shape: {input_embeds[0].shape}")
@@ -544,7 +585,7 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
             log.debug("WARNING: embed_layer not available, skipping embedding preparation")
             return data
 
-        input_ids = data.batch['input_ids']
+        input_ids = data.batch["input_ids"]
         input_embeds = self._prepare_input_embeddings(data, input_ids, activation_vectors)
         data.non_tensor_batch.update({"input_embeds": input_embeds})
         return data
@@ -552,13 +593,13 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE)
     def compute_log_prob(self, data: DataProto):
         """Compute log probabilities with activation injection."""
-        log.debug(f"🎯 NLA MEGATRON ACTOR WORKER: compute_log_prob() CALLED")
+        log.debug("🎯 NLA MEGATRON ACTOR WORKER: compute_log_prob() CALLED")
 
         # Ensure activation vectors are in batch
         activation_vectors = self._extract_activation_vectors(data)
         if activation_vectors is not None:
-            if 'activation_vectors' not in data.batch.keys():
-                data.batch['activation_vectors'] = activation_vectors
+            if "activation_vectors" not in data.batch.keys():
+                data.batch["activation_vectors"] = activation_vectors
             log.debug(f"✓ compute_log_prob with activation vectors: {activation_vectors.shape}")
 
         # Call parent - wrapped actor method will handle injection state
@@ -566,19 +607,34 @@ class NLAMegatronActorRolloutRefWorker(MegatronActorRolloutRefWorker):
         return result
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE)
-    def update_policy(self, data: DataProto):
-        """Update policy with activation injection."""
-        log.debug(f"🎯 NLA MEGATRON ACTOR WORKER: update_policy() CALLED")
+    def update_actor(self, data: DataProto):
+        """Update actor with activation injection."""
+        log.debug("🎯 NLA MEGATRON ACTOR WORKER: update_actor() CALLED")
 
         # Ensure activation vectors are in batch
         activation_vectors = self._extract_activation_vectors(data)
         if activation_vectors is not None:
-            if 'activation_vectors' not in data.batch.keys():
-                data.batch['activation_vectors'] = activation_vectors
-            log.debug(f"✓ update_policy with activation vectors: {activation_vectors.shape}")
+            if "activation_vectors" not in data.batch.keys():
+                data.batch["activation_vectors"] = activation_vectors
+            log.debug(f"✓ update_actor with activation vectors: {activation_vectors.shape}")
 
-        # Call parent - wrapped actor method will handle injection state
-        result = super().update_policy(data)
+        # Set injection state for the entire training batch
+        # The forward hooks will fire for each micro-batch during training
+        if activation_vectors is not None and mpu.is_pipeline_first_stage():
+            input_ids = data.batch["input_ids"]
+            injection_positions = self._find_injection_positions_from_ids(input_ids)
+            log.debug("Setting injection state for update_actor")
+            self._set_injection_state(activation_vectors, injection_positions)
+
+        try:
+            # Call parent's update_actor which will process the dataloader
+            result = super().update_actor(data)
+        finally:
+            # Clear injection state after training
+            if activation_vectors is not None and mpu.is_pipeline_first_stage():
+                log.debug("Clearing injection state after update_actor")
+                self._clear_injection_state()
+
         return result
 
 
@@ -592,21 +648,41 @@ class NLAMegatronCriticWorker(MegatronCriticWorker):
 
         # Import NLA Megatron critic wrapper
         from verl.nla.workers.nla_megatron_critic import NLAMegatronCritic
+        import logging
+        log = logging.getLogger(__name__)
+
+        # Extract critic_optimizer_config from the parent's critic before we replace it
+        critic_optimizer_config = self.critic.critic_optimizer_config
+
+        # Debug logging
+        log.info(f"NLA Megatron Critic Worker init_model:")
+        log.info(f"  hf_config: {self.hf_config is not None}")
+        log.info(f"  tf_config: {self.tf_config is not None}")
+        log.info(f"  critic_optimizer_config: {critic_optimizer_config is not None}")
 
         # Wrap the Megatron critic with NLA logic
+        # Pass hf_config, tf_config, and critic_optimizer_config as kwargs
         self.critic = NLAMegatronCritic(
             config=self.config,
             critic_module=self.critic_module,
             critic_optimizer=self.critic_optimizer,
             tokenizer=self.tokenizer,
+            hf_config=self.hf_config,
+            tf_config=self.tf_config,
+            critic_optimizer_config=critic_optimizer_config,
         )
 
     def compute_activation_predictions(self, response_ids, attention_mask):
-        """Predict activation vectors for the final response token using Megatron critic."""
+        """Predict activation vectors for the final response token using Megatron critic.
+
+        Delegates to the critic's forward logic to ensure consistency with training,
+        including critic prompt prepending if configured and respecting output_layer_index.
+        """
         device = get_device_id()
         response_ids = response_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        if attention_mask is None:
+            raise ValueError("Attention mask is required for NLA Megatron critic worker")
+        attention_mask = attention_mask.to(device)
 
         # Handle model offloading if enabled
         if self._is_offload_param:
@@ -619,27 +695,20 @@ class NLAMegatronCriticWorker(MegatronCriticWorker):
         try:
             critic_model.eval()
             with torch.no_grad():
-                outputs = critic_model(
-                    input_ids=response_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    output_hidden_states=True,
+                # Build minimal micro-batch for the critic's forward path
+                micro_batch = {
+                    "responses": response_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": torch.zeros_like(attention_mask, dtype=torch.long),
+                }
+
+                # Use critic's forward logic (handles prompt prepending, layer selection, etc.)
+                full_activations = self.critic._forward_micro_batch(micro_batch)
+
+                # Extract last token using critic's pooling logic
+                activations = self.critic.extract_predicted_activations(
+                    full_activations, attention_mask, pooling="last"
                 )
-
-                # Extract hidden states
-                if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                    hidden_states = outputs.hidden_states[-1]
-                else:
-                    raise ValueError("Megatron critic model output does not contain hidden_states")
-
-                # Extract last token activations
-                if attention_mask is not None:
-                    seq_lengths = attention_mask.sum(dim=1) - 1
-                    seq_lengths = seq_lengths.clamp(min=0)
-                    indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-                    activations = hidden_states[indices, seq_lengths]
-                else:
-                    activations = hidden_states[:, -1, :]
         finally:
             if was_training:
                 critic_model.train(True)

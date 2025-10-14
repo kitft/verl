@@ -1,0 +1,92 @@
+# NLA SFT configuration - 30B Qwen MoE model on 8 GPUs
+# Inherits from nla_sft_7b_8gpu and overrides for larger model
+
+defaults:
+  - nla_sft_7b_8gpu
+  - _self_
+
+# Data configuration - 8 GPU setup with reduced batch size for 30B
+data:
+  train_batch_size: 256  # Same total throughput
+  micro_batch_size_per_gpu: 16  # Reduced from 32 for larger model
+  train_files: data/q30b/sft/train_nla_sft_dataset_fineweb_layer32_summarized_internal.parquet
+  val_files: data/q30b/sft/val_nla_sft_dataset_fineweb_layer32_summarized_internal.parquet
+
+  max_length: 512  # Same as 7B
+
+# Model configuration - 30B Qwen MoE model
+model:
+  partial_pretrain: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  enable_gradient_checkpointing: true  # Critical for 30B
+  use_liger: false
+  strategy: fsdp2
+
+  fsdp_config:
+    model_dtype: bf16
+    wrap_policy:
+      min_num_params: 0
+    cpu_offload: false  # Can enable if OOM
+    offload_params: false  # Can enable if OOM
+
+# Optimizer configuration - slightly lower LR for stability
+optim:
+  lr: 3e-5  # Reduced from 5e-5 for larger model
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.05
+  clip_grad: 1.0
+  lr_scheduler: cosine
+
+# Trainer configuration - 8 GPU setup
+trainer:
+  default_local_dir: checkpoints/nla_sft_qwen_30b_8gpu
+  project_name: null  # Auto-filled from model name + train_mode when unset
+  experiment_name: null
+  total_epochs: 1
+  total_training_steps: null
+  logger: ["console", "wandb"]
+  seed: 42
+  save_freq: -1
+  disable_checkpointing: false
+  test_freq: 10
+  nnodes: 1
+  n_gpus_per_node: 8
+  device: cuda
+  resume_mode: disable
+
+  checkpoint:
+    save_contents: ["model", "optimizer", "extra", "hf_model"]  # Include HF model for RL training
+    load_contents: ["model", "optimizer", "extra"]
+
+# Engine configuration
+engine:
+  strategy: fsdp2
+
+# NLA-specific configuration
+nla:
+  train_mode: actor  # "actor" or "critic"
+
+  # Activation vector transformations
+  scale: null
+  norm: null
+
+  # Injection configuration for actor
+  injection:
+    mode: replace
+    layer_indices: [0]
+    projection_dim: null
+    injection_token: null
+
+  # Critic model configuration
+  critic:
+    model_path: Qwen/Qwen3-30B-A3B
+    pooling: last
+    dropout: 0.1
+    projection_layers: null
+    truncate_layers: null  # Set to 15-20 for faster critic training
+    output_layer_index: 32  # Adjust if needed for MoE architecture
+
+  # Training settings
+  critic_lr: 2e-5
+  critic_epochs: 3

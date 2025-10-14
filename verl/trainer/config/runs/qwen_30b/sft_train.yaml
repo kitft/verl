@@ -1,0 +1,64 @@
+# @package _global_
+
+defaults:
+  - /nla_activation_dataset
+  - _self_
+
+mode: sft
+
+model:
+  name: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  layer_index: 32  # Adjust if needed for MoE architecture
+  model_dtype: bf16
+
+seed: 42
+
+dataset:
+  name: HuggingFaceFW/fineweb
+  config_name: sample-10BT
+  split: train
+  input_parquet: null
+  max_samples: null
+  chat_column: null
+  text_column: text
+  user_role: user
+  system_prompt: null
+  add_generation_prompt: false
+  expect_chat: false
+  slice_start: 0
+  slice_length: 50000
+
+sampling:
+  total_activations: 50000
+  activations_per_sample: 1
+  max_length: 512
+  # Single H100 80GB: 60GB model + activations
+  # max_length 512 allows larger batch than 1024
+  parallel_batch_size: 32
+
+output:
+  path_prefix: data/generated/q30b/sft/train_nla_sft_dataset_fineweb
+  overwrite: true
+  include_layer_suffix: true
+  injection_token: null
+  random_variant:
+    enabled: true
+    path: null
+    suffix: _random
+    seed: null
+    columns: null
+    source_field: sample_uuid
+    source_column: activation_vector_source_uuid
+
+prompt:
+  default_role: user
+  add_generation_prompt: false
+  chat_template: null
+  messages:
+    - role: user
+      template: |
+        Explain the following: <concept>{injection_token}</concept>
+
+response:
+  template: "{processed_response}"

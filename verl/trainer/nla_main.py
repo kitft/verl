@@ -5,13 +5,13 @@ Based on main_ppo.py but adapted for NLA with autoencoder critic.
 """
 
 import os
-import sys
-import shlex
 import re
+import shlex
 import socket
+import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import hydra
 import ray
@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 from verl.nla.data.nla_rl_dataset import create_nla_rl_dataset
 
 # Import NLA components
-from verl.nla.trainer.nla_grpo_trainer import GRPOTrainerConfig, NLAGRPOTrainer
+from verl.nla.trainer.nla_grpo_trainer import NLAGRPOTrainer
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
@@ -43,8 +43,6 @@ def _slugify(value: Optional[str], fallback: Optional[str] = None) -> Optional[s
         return fallback_slug or None
 
     return None
-
-
 
 
 def _detect_model_init_type(model_path: str) -> Optional[str]:
@@ -90,7 +88,6 @@ def _detect_dataset_variant(train_files) -> Optional[str]:
 
 def _extract_base_model_name(model_path: str) -> Optional[str]:
     """Extract the base model name from checkpoint or model path."""
-    from pathlib import Path
     import json
 
     # If it's a checkpoint path, try to read config.json
@@ -140,7 +137,7 @@ def _build_experiment_name(config, user_label: Optional[str]) -> str:
     now = datetime.now()
     timestamp = now.strftime("%m-%d_%H%M%S")
 
-    components: List[str] = []
+    components: list[str] = []
     seen = set()
 
     def add_component(value: Optional[str], *, fallback: Optional[str] = None) -> None:
@@ -192,6 +189,7 @@ def run_nla_grpo(config) -> None:
 
     # Record launch command and CWD for tracking
     from omegaconf import open_dict
+
     launch_cmd = " ".join([shlex.quote(sys.executable)] + [shlex.quote(a) for a in sys.argv])
     with open_dict(config.trainer):
         config.trainer.launch_command = launch_cmd
@@ -235,10 +233,12 @@ class NLATaskRunner:
         if strategy in {"fsdp", "fsdp2"}:
             # Use NLA FSDP actor worker for activation injection
             from verl.nla.workers.nla_actor_worker import NLAActorRolloutRefWorker
+
             actor_rollout_cls = NLAActorRolloutRefWorker
         elif strategy == "megatron":
             # Use NLA Megatron actor worker for activation injection
             from verl.nla.workers.nla_megatron_worker import NLAMegatronActorRolloutRefWorker
+
             actor_rollout_cls = NLAMegatronActorRolloutRefWorker
         else:
             raise NotImplementedError(f"NLA does not support strategy '{strategy}'. Supported: fsdp, fsdp2, megatron")
@@ -251,12 +251,16 @@ class NLATaskRunner:
         # NLA GRPO uses our custom critic worker with vector value head
         if config.critic.strategy in {"fsdp", "fsdp2"}:
             from verl.nla.workers.nla_critic_worker import NLACriticWorker
+
             critic_cls = NLACriticWorker
         elif config.critic.strategy == "megatron":
             from verl.nla.workers.nla_megatron_worker import NLAMegatronCriticWorker
+
             critic_cls = NLAMegatronCriticWorker
         else:
-            raise NotImplementedError(f"NLA does not support strategy '{config.critic.strategy}'. Supported: fsdp, fsdp2, megatron")
+            raise NotImplementedError(
+                f"NLA does not support strategy '{config.critic.strategy}'. Supported: fsdp, fsdp2, megatron"
+            )
 
         self.role_worker_mapping[Role.Critic] = ray.remote(critic_cls)
 
@@ -274,9 +278,11 @@ class NLATaskRunner:
         # Check if split resource pools are configured in YAML
         # Note: resource_pool must exist, be non-empty, and have pools with GPUs
         resource_pool_config = None
-        if (hasattr(config, 'ray_kwargs') and
-            hasattr(config.ray_kwargs, 'resource_pool') and
-            config.ray_kwargs.resource_pool):
+        if (
+            hasattr(config, "ray_kwargs")
+            and hasattr(config.ray_kwargs, "resource_pool")
+            and config.ray_kwargs.resource_pool
+        ):
             resource_pool_config = config.ray_kwargs.resource_pool
 
         # Try to build resource_pool_spec from YAML config
@@ -288,7 +294,7 @@ class NLATaskRunner:
                 # Defensive: skip if pool_config is not a dict
                 if not isinstance(pool_config, dict):
                     continue
-                gpus_per_node = pool_config.get('num_gpus', 0)
+                gpus_per_node = pool_config.get("num_gpus", 0)
                 if gpus_per_node > 0:
                     # Format: [gpus_per_node] * nnodes
                     resource_pool_spec[pool_name] = [gpus_per_node] * config.trainer.nnodes
@@ -299,12 +305,12 @@ class NLATaskRunner:
             # Convention: pool names should contain role identifiers
             for pool_name in resource_pool_spec.keys():
                 pool_name_lower = pool_name.lower()
-                if 'actor' in pool_name_lower or 'rollout' in pool_name_lower:
+                if "actor" in pool_name_lower or "rollout" in pool_name_lower:
                     self.mapping[Role.ActorRollout] = pool_name
-                if 'critic' in pool_name_lower:
+                if "critic" in pool_name_lower:
                     self.mapping[Role.Critic] = pool_name
 
-            print(f"[NLA] Split placement enabled")
+            print("[NLA] Split placement enabled")
             print(f"[NLA] resource_pool_spec: {resource_pool_spec}")
             print(f"[NLA] Role mapping: {self.mapping}")
 
@@ -412,6 +418,7 @@ class NLATaskRunner:
 
         # Add simple chat template for tiny model if needed
         if tokenizer.chat_template is None:
+            raise ValueError("Tokenizer chat template is None")
             tokenizer.chat_template = "{{ messages[-1]['content'] }}"
             print("Set simple chat template for tokenizer")
 

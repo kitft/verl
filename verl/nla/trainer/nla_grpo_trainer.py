@@ -7,13 +7,19 @@ This trainer implements Group Relative Policy Optimization (GRPO) where:
 4. Both actor and critic are trained simultaneously
 """
 
-from typing import Optional
+import logging
 from dataclasses import dataclass
+from typing import Optional
+
 from omegaconf import DictConfig
 
+# Import NLA evaluation module
+from verl.nla.trainer.nla_eval import create_evaluator
 from verl.protocol import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+logger = logging.getLogger(__name__)
 
 
 class _ValuesAsRewardsShim:
@@ -26,14 +32,15 @@ class _ValuesAsRewardsShim:
     This is called BEFORE the base fit() calls compute_values, so we need to
     compute them ourselves and cache in the batch.
     """
+
     def __init__(self, trainer: "NLAGRPOTrainer"):
         self.trainer = trainer
 
     def __call__(self, data: DataProto, return_dict: bool = False):
-        print(f"=== _ValuesAsRewardsShim called ===")
+        print("=== _ValuesAsRewardsShim called ===")
         print(f"Batch size: {data.batch['input_ids'].shape[0] if 'input_ids' in data.batch else 'N/A'}")
         print(f"Has activation_vectors: {'activation_vectors' in data.batch}")
-        if 'activation_vectors' in data.batch:
+        if "activation_vectors" in data.batch:
             print(f"activation_vectors shape: {data.batch['activation_vectors'].shape}")
 
         if "values" not in data.batch:
@@ -51,6 +58,7 @@ class _ValuesAsRewardsShim:
         if return_dict:
             return {"reward_tensor": token_level_scores, "reward_extra_info": reward_extra_info}
         return token_level_scores
+
 
 @dataclass
 class GRPOTrainerConfig:
@@ -139,11 +147,38 @@ class NLAGRPOTrainer(RayPPOTrainer):
         self.final_reward_std = None
         self.training_start_time = None
 
+        # Initialize NLA string-match evaluator (if enabled in config)
+        self.nla_evaluator = None
+        try:
+            # # Get injection token ID from config
+            # injection_token_id = self.config.get("nla", {}).get("injection", {}).get("injection_token_id", None)
+            # if injection_token_id is None:
+            #     # Try to get from tokenizer if not in config
+            #     injection_token = self.config.get("nla", {}).get("injection", {}).get("injection_token", "㊗")
+            #     result = tokenizer.convert_tokens_to_ids(injection_token)
+            #     # Handle both single token (int) and potential list return
+            #     injection_token_id = result[0] if isinstance(result, list) else result
+
+            #     # Validate token ID is not unknown token
+            #     if injection_token_id == tokenizer.unk_token_id:
+            #         logger.warning(
+            #             f"Injection token '{injection_token}' not found in vocabulary. "
+            #             f"Evaluator may not work correctly. Consider adding token to tokenizer."
+            #         )
+
+            self.nla_evaluator = create_evaluator(
+                config=config,
+                tokenizer=tokenizer,
+            )
+        except FileNotFoundError as e:
+            logger.warning(f"NLA evaluator disabled: eval file not found: {e}")
+        except KeyError as e:
+            logger.warning(f"NLA evaluator disabled: missing config key: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error initializing NLA evaluator: {e}", exc_info=True)
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         """Override to include activation_vectors in generation batch."""
-        from collections import defaultdict
-        import numpy as np
-        import torch
 
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
@@ -181,6 +216,44 @@ class NLAGRPOTrainer(RayPPOTrainer):
     # The base RayPPOTrainer.fit() doesn't call training_step, it implements
     # the training loop inline. Our strategy is to make compute_values return
     # MSE-based values that work with the normal GRPO flow.
+
+    def _run_nla_string_match_eval(self) -> dict:
+        """
+        Run NLA string-match evaluation.
+
+        Generates completions with activation injection and checks if expected
+        strings appear in the output.
+
+        Returns:
+            Dictionary of evaluation metrics, or empty dict if evaluator not available
+        """
+        if self.nla_evaluator is None:
+            return {}
+
+        try:
+            # Get evaluation config parameters
+            eval_config = self.config.get("nla_eval", {})
+            max_new_tokens = eval_config.get("max_new_tokens", 50)
+            temperature = eval_config.get("temperature", 0.7)
+            do_sample = eval_config.get("do_sample", True)
+            num_generations = eval_config.get("num_generations_per_prompt", 1)
+
+            # Run evaluation
+            eval_metrics = self.nla_evaluator.evaluate(
+                actor_rollout_wg=self.actor_rollout_wg,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                num_generations_per_prompt=num_generations,
+                global_steps=self.global_steps,
+                experiment_name=self.config.trainer.experiment_name,
+            )
+
+            return eval_metrics
+
+        except Exception as e:
+            logger.error(f"NLA evaluation failed: {e}", exc_info=True)
+            return {}
 
     # def training_step(
     #     self,
@@ -251,9 +324,10 @@ class NLAGRPOTrainer(RayPPOTrainer):
 
     def fit(self):
         """Override fit to track training time and metrics."""
-        import time
         import signal
         import sys
+        import time
+
         import verl.utils.tracking
 
         self.training_start_time = time.time()
@@ -295,6 +369,31 @@ class NLAGRPOTrainer(RayPPOTrainer):
                 reward_range = data["critic/rewards/max"] - data["critic/rewards/min"]
                 self.final_reward_std = reward_range / 4.0  # Rough approximation
 
+            # Run NLA string-match evaluation if enabled and at right frequency
+            if self.nla_evaluator is not None:
+                eval_config = self.config.get("nla_eval", {})
+                eval_freq = eval_config.get("freq", 100)  # Default: every 100 steps
+
+                # Check if it's time to evaluate or if it's the final step
+                is_final_step = step >= self.total_training_steps
+                should_eval = (step % eval_freq == 0) or is_final_step or step == 1
+
+                if should_eval:
+                    start_time = time.time()
+                    logger.info(f"Running NLA string-match evaluation at step {step}...")
+                    eval_metrics = self._run_nla_string_match_eval()
+                    end_time = time.time()
+                    time_taken = end_time - start_time
+                    logger.info(f"NLA string-match evaluation completed in {time_taken:.2f} seconds")
+                    eval_metrics["nla_eval/evaluation_time"] = end_time - start_time
+                    if eval_metrics:
+                        data.update(eval_metrics)
+                        accuracy = eval_metrics.get("nla_eval/string_match_accuracy")
+                        if accuracy is not None:
+                            logger.info(f"NLA eval completed: {accuracy:.2%} accuracy")
+                        else:
+                            logger.warning("NLA eval completed but no accuracy metric returned")
+
             # Call original
             return original_log_method(logger_self, data, step)
 
@@ -310,16 +409,16 @@ class NLAGRPOTrainer(RayPPOTrainer):
 
     def _save_checkpoint(self):
         """Override to save NLA metadata with RL checkpoint."""
-        import time
         import os
+        import time
+
         import torch
-        from pathlib import Path
-        from verl.utils.fs import local_mkdir_safe
+
         from verl.utils.checkpoint.nla_metadata import (
             create_rl_metadata_from_config,
             save_metadata,
-            extract_lineage_from_checkpoint,
         )
+        from verl.utils.fs import local_mkdir_safe
 
         # Prepare metadata before calling parent
         training_time_hours = None
@@ -331,6 +430,7 @@ class NLAGRPOTrainer(RayPPOTrainer):
         wandb_run_url = None
         try:
             import wandb
+
             if wandb.run is not None:
                 wandb_run_id = wandb.run.id
                 wandb_run_url = wandb.run.get_url()

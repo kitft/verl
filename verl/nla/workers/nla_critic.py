@@ -1,19 +1,18 @@
 """NLA Critic that outputs activation vectors instead of scalars."""
 
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch import optim
-from typing import Optional
 
 from verl import DataProto
-from verl.workers.critic.dp_critic import DataParallelPPOCritic
-from verl.utils.device import get_device_id, is_cuda_available, is_npu_available
-from verl.utils.torch_functional import masked_mean
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.trainer.ppo.ray_trainer import compute_response_mask
+from verl.utils.device import get_device_id, is_cuda_available, is_npu_available
+from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
+from verl.workers.critic.dp_critic import DataParallelPPOCritic
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -39,14 +38,15 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         super().__init__(config, critic_module, critic_optimizer)
         self.logger = logging.getLogger(__name__)
         # Get hidden size from the critic model
-        self.hidden_size = critic_module.config.hidden_size if hasattr(critic_module, 'config') else None
+        self.hidden_size = critic_module.config.hidden_size if hasattr(critic_module, "config") else None
         # Initialize NLA adapter for extracting activation vectors
         from verl.nla.integration.dataproto_adapter import NLADataProtoAdapter
+
         self.adapter = NLADataProtoAdapter()
 
         # Handle critic prompt configuration
         self.tokenizer = tokenizer
-        self.critic_prompt_text = getattr(config, 'critic_prompt', None)
+        self.critic_prompt_text = getattr(config, "critic_prompt", None)
         self.critic_prompt_tokens = None
         self.critic_prompt_length = 0
         self._MAX_CRITIC_PROMPT_LENGTH = 128  # Maximum allowed prompt length in tokens
@@ -66,9 +66,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 prompt_encoding = tokenizer(
                     self.critic_prompt_text,
                     add_special_tokens=False,  # Don't add BOS/EOS mid-sequence
-                    return_tensors='pt'
+                    return_tensors="pt",
                 )
-                self.critic_prompt_tokens = prompt_encoding['input_ids'][0]  # (prompt_len,)
+                self.critic_prompt_tokens = prompt_encoding["input_ids"][0]  # (prompt_len,)
                 self.critic_prompt_length = len(self.critic_prompt_tokens)
 
                 # Validate prompt length
@@ -108,6 +108,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         if hasattr(model_outputs, "hidden_states") and model_outputs.hidden_states is not None:
             return model_outputs.hidden_states[self.config.output_layer_index]
         if isinstance(model_outputs, (tuple, list)) and len(model_outputs) > 2:
+            raise ValueError(
+                "Critic model output is a tuple or list, but does not contain activation tensor. Alson ot sure this code path should be used."
+            )
             candidate = model_outputs[2]
             if isinstance(candidate, torch.Tensor) and candidate.dim() >= 3:
                 return candidate
@@ -151,9 +154,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             if self.critic_prompt_tokens is not None and self.critic_prompt_length > 0:
                 # Create attention mask for prompt (all ones)
                 prompt_mask = torch.ones(
-                    (batch, self.critic_prompt_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
+                    (batch, self.critic_prompt_length), dtype=attention_mask.dtype, device=attention_mask.device
                 )
                 # Concatenate prompt mask + response mask
                 attention_mask = torch.cat([prompt_mask, attention_mask], dim=1)
@@ -169,9 +170,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 num_ropes = position_ids_full_transposed.shape[0]
                 # Use seqlen which now includes prompt if present
                 position_ids = torch.zeros(
-                    (num_ropes, batch, seqlen),
-                    dtype=position_ids_full.dtype,
-                    device=position_ids_full.device
+                    (num_ropes, batch, seqlen), dtype=position_ids_full.dtype, device=position_ids_full.device
                 )
                 for rope_idx in range(num_ropes):
                     for b_idx in range(batch):
@@ -191,9 +190,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                     )
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, cu_seqlens, max_seqlen = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )
+                input_ids_rmpad, indices, cu_seqlens, max_seqlen = unpad_input(input_ids.unsqueeze(-1), attention_mask)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
 
                 if position_ids.dim() == 3:
@@ -253,7 +250,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             if self.critic_prompt_length > 0:
                 # Simply remove the prompt prefix; response_mask will handle padding
                 # This is simpler and more robust than slicing with response_length
-                values = values[:, self.critic_prompt_length:, :]
+                values = values[:, self.critic_prompt_length :, :]
                 # Ensure shape matches expected response_length (truncate if needed)
                 if values.shape[1] > response_length:
                     values = values[:, :response_length, :]
@@ -294,18 +291,14 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         )
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
-        data_selected = data.select(
-            batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys
-        )
+        data_selected = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         micro_batch_size = meta["micro_batch_size"]
         use_dynamic_bsz = meta["use_dynamic_bsz"]
 
         if use_dynamic_bsz:
             max_token_len = meta["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(
-                data_selected, max_token_len=max_token_len
-            )
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data_selected, max_token_len=max_token_len)
         else:
             micro_batches = data_selected.split(micro_batch_size)
 
@@ -364,23 +357,18 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         target_activations = self.adapter.extract_activation_vectors_from_dataproto(data, raise_on_missing=True)
         if not isinstance(target_activations, torch.Tensor):
             target_activations = torch.as_tensor(
-                target_activations,
-                device=full_activations.device,
-                dtype=full_activations.dtype
+                target_activations, device=full_activations.device, dtype=full_activations.dtype
             )
         else:
-            target_activations = target_activations.to(
-                device=full_activations.device,
-                dtype=full_activations.dtype
-            )
+            target_activations = target_activations.to(device=full_activations.device, dtype=full_activations.dtype)
 
         # Pool last non-padded token for each response
         response_mask = data.batch.get("response_mask", None)  # (b, L)
-        pooled = self.extract_predicted_activations(
-            full_activations, response_mask, pooling="last"
-        )  # (b, H)
+        pooled = self.extract_predicted_activations(full_activations, response_mask, pooling="last")  # (b, H)
         if response_mask.shape != full_activations.shape[:2]:
-            raise ValueError(f"Response mask shape {response_mask.shape} does not match full activations shape {full_activations.shape[:2]}")
+            raise ValueError(
+                f"Response mask shape {response_mask.shape} does not match full activations shape {full_activations.shape[:2]}"
+            )
         # print(f"Number of nonzero elements of response mask of 0th sequence: {response_mask[0].sum().item()}")
         # print(f"first response: {data.batch['responses'][0]}")
 
@@ -414,7 +402,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         return values
 
-    def extract_predicted_activations(self, full_activations: torch.Tensor, response_mask: Optional[torch.Tensor] = None, pooling: str = "last") -> torch.Tensor:
+    def extract_predicted_activations(
+        self, full_activations: torch.Tensor, response_mask: Optional[torch.Tensor] = None, pooling: str = "last"
+    ) -> torch.Tensor:
         """
         Args:
             full_activations: (batch, seq_len, hidden_size)
@@ -436,9 +426,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
                 last_indices = last_indices.clamp(min=0).long()  # Ensure long type for indexing
 
                 # Gather predictions at last positions
-                pooled_predictions = full_activations[
-                    torch.arange(batch_size), last_indices
-                ]  # (batch, activation_dim)
+                pooled_predictions = full_activations[torch.arange(batch_size), last_indices]  # (batch, activation_dim)
                 # print(f"last indices (count of each): {last_indices.unique(return_counts=True)}, for shape of full_activations: {full_activations.shape}")
                 # print(f"avg norms of extraction vector by position")
                 # #for i in range(len(last_indices)):
@@ -506,7 +494,16 @@ class NLADataParallelCritic(DataParallelPPOCritic):
         metrics = {}
 
         # NLA-specific: include activation_vectors in select_keys
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns", "activation_vectors"]
+        select_keys = [
+            "input_ids",
+            "responses",
+            "response_mask",
+            "attention_mask",
+            "position_ids",
+            "values",
+            "returns",
+            "activation_vectors",
+        ]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -517,7 +514,9 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         # Compute predictions using parent's forward logic
         full_activations = self._compute_values_internal(data, enable_grads=True)
-        predicted_activations = self.extract_predicted_activations(full_activations, data.batch["response_mask"], pooling=self.config.get("pooling_strategy", "last"))
+        predicted_activations = self.extract_predicted_activations(
+            full_activations, data.batch["response_mask"], pooling=self.config.get("pooling_strategy", "last")
+        )
 
         # Get response mask if available
         response_mask = data.batch.get("response_mask", None)
@@ -537,7 +536,7 @@ class NLADataParallelCritic(DataParallelPPOCritic):
 
         # Log metrics
         metrics["critic_loss"] = loss.item()
-        metrics["grad_norm"] = grad_norm.item() if torch.isfinite(grad_norm) else float('inf')
+        metrics["grad_norm"] = grad_norm.item() if torch.isfinite(grad_norm) else float("inf")
         metrics["hidden_size"] = self.hidden_size if self.hidden_size else predicted_activations.shape[-1]
 
         # Log some statistics about predictions
@@ -551,10 +550,14 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             target_norms = torch.norm(target_activations, dim=1)  # (batch,)
             avg_target_norm = target_norms.mean().item()
             pred_norms = torch.norm(predicted_activations, dim=1)  # (batch,)
-            avg_pred_norm = pred_norms.mean().item()    
+            avg_pred_norm = pred_norms.mean().item()
             max_target_norm = target_norms.max().item()
-            mse_with_zero_pred = nn.functional.mse_loss(torch.zeros_like(predicted_activations).to(target_activations.device), target_activations).item()
-            mse_with_mean_pred_over_batch = nn.functional.mse_loss(target_activations.mean(dim=0).unsqueeze(0).expand_as(predicted_activations), target_activations).item()
+            mse_with_zero_pred = nn.functional.mse_loss(
+                torch.zeros_like(predicted_activations).to(target_activations.device), target_activations
+            ).item()
+            mse_with_mean_pred_over_batch = nn.functional.mse_loss(
+                target_activations.mean(dim=0).unsqueeze(0).expand_as(predicted_activations), target_activations
+            ).item()
 
             metrics["pred_activation_mean"] = pred_mean
             metrics["pred_activation_std"] = pred_std
@@ -571,21 +574,21 @@ class NLADataParallelCritic(DataParallelPPOCritic):
             # Value of 1.0 means RMSE equals the average norm (poor reconstruction)
             # Value of 0.1 means RMSE is 10% of average norm (good reconstruction)
             if avg_target_norm > 0:
-                normalized_mse = loss.item() / (avg_target_norm ** 2)
+                normalized_mse = loss.item() / (avg_target_norm**2)
                 metrics["normalized_mse"] = normalized_mse
             else:
-                metrics["normalized_mse"] = float('inf')
-            
+                metrics["normalized_mse"] = float("inf")
+
             if mse_with_zero_pred > 0:
                 normalized_mse_with_zero_pred = loss.item() / mse_with_zero_pred
                 metrics["normalized_mse_by_zero"] = normalized_mse_with_zero_pred
             else:
-                metrics["normalized_mse_by_zero"] = float('inf')
+                metrics["normalized_mse_by_zero"] = float("inf")
 
             if mse_with_mean_pred_over_batch > 0:
                 normalized_mse_with_mean_pred_over_batch = loss.item() / mse_with_mean_pred_over_batch
                 metrics["normalized_mse_by_mean_pred_over_batch"] = normalized_mse_with_mean_pred_over_batch
             else:
-                metrics["normalized_mse_by_mean_pred_over_batch"] = float('inf')
+                metrics["normalized_mse_by_mean_pred_over_batch"] = float("inf")
 
         return metrics

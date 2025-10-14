@@ -696,7 +696,9 @@ class SGLangRollout(BaseRollout):
         else:
             self._engine = None
 
-        print(f"[INIT] TP_RANK={self._tp_rank} engine initialization complete, _engine={'None' if self._engine is None else 'Created'}")
+        print(
+            f"[INIT] TP_RANK={self._tp_rank} engine initialization complete, _engine={'None' if self._engine is None else 'Created'}"
+        )
         self.sharding_manager = None
         self.is_sleep = True
 
@@ -781,7 +783,7 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: generate_sequences ENTRY")
+        # print(f"[TP_RANK={self._tp_rank}] DEBUG: generate_sequences ENTRY")
         """Generate sequences for a batch of prompts.
 
         Args:
@@ -809,7 +811,7 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: _batch_level_generate_sequences ENTRY")
+        # print(f"[TP_RANK={self._tp_rank}] DEBUG: _batch_level_generate_sequences ENTRY")
         """Generates single-turn sequences for a batch of prompts.
         For single-turn generation, all prompts are processed in one request.
         `_batch_level_generate_sequences` involves:
@@ -862,21 +864,17 @@ class SGLangRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: batch_size = {batch_size}")
 
         # Extract non-tensor data
         non_tensor_batch = prompts.non_tensor_batch
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to check/create raw_prompt_ids")
+        # print(f"[TP_RANK={self._tp_rank}] DEBUG: About to check/create raw_prompt_ids")
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]).tolist() for i in range(batch_size)],
                 dtype=object,
             )
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: raw_prompt_ids ready")
 
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to extract input_embeds")
         input_embeds_per_sample = _extract_batch_input_embeds(prompts, batch_size, pop_from_non_tensor=True)
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: input_embeds extracted, length={len(input_embeds_per_sample)}")
 
         raw_prompt_ids_array = non_tensor_batch.pop("raw_prompt_ids")
         raw_prompt_ids_list = (
@@ -899,11 +897,10 @@ class SGLangRollout(BaseRollout):
         if len(multi_modal_list) != batch_size:
             raise ValueError(f"multi_modal_data length mismatch: expected {batch_size}, got {len(multi_modal_list)}")
 
-        print(f"[TP_RANK={self._tp_rank}] DEBUG: About to build sglang_inputs from {batch_size} samples")
         sglang_inputs = []
-        for i, (raw_prompt_ids, multi_modal_data, prompt_embeds) in enumerate(zip(
-            raw_prompt_ids_list, multi_modal_list, input_embeds_per_sample, strict=True
-        )):
+        for i, (raw_prompt_ids, multi_modal_data, prompt_embeds) in enumerate(
+            zip(raw_prompt_ids_list, multi_modal_list, input_embeds_per_sample, strict=True)
+        ):
             if i == 0:
                 print(f"[TP_RANK={self._tp_rank}] DEBUG: Processing sample 0...")
             prompt_token_ids = (
@@ -987,14 +984,21 @@ class SGLangRollout(BaseRollout):
             print(f"  prompt: {None}")
             print(f"  input_ids: {type(engine_input_ids)}, len={len(engine_input_ids) if engine_input_ids else 0}")
             if engine_input_ids:
-                print(f"    first sample: {type(engine_input_ids[0])}, len={len(engine_input_ids[0]) if engine_input_ids[0] else 0}")
+                print(
+                    f"    first sample: {type(engine_input_ids[0])}, len={len(engine_input_ids[0]) if engine_input_ids[0] else 0}"
+                )
             print(f"  input_embeds: {type(engine_input_embeds)}")
             if engine_input_embeds:
                 print(f"    len={len(engine_input_embeds)}, first sample type={type(engine_input_embeds[0])}")
                 if engine_input_embeds[0] is not None:
                     import torch
+
                     if isinstance(engine_input_embeds[0], (list, torch.Tensor)):
-                        shape = len(engine_input_embeds[0]) if isinstance(engine_input_embeds[0], list) else engine_input_embeds[0].shape
+                        shape = (
+                            len(engine_input_embeds[0])
+                            if isinstance(engine_input_embeds[0], list)
+                            else engine_input_embeds[0].shape
+                        )
                         print(f"    first sample shape/len={shape}")
             print("=" * 80)
 

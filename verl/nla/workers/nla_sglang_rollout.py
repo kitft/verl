@@ -1,7 +1,6 @@
 """NLA-specific SGLang rollout wrapper that supports embedding input."""
 
 import torch
-from typing import Generator, Optional, Any
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
@@ -50,35 +49,35 @@ class NLASGLangRollout(SGLangRollout):
         @wraps(original_async_generate)
         async def nla_async_generate(*args, **gen_kwargs):
             """Patched version that nullifies input_ids when input_embeds is provided."""
-            print("=" * 80)
-            print("NLA PATCH: nla_async_generate called!")
-            print(f"  args: {len(args)}")
-            print(f"  gen_kwargs keys: {list(gen_kwargs.keys())}")
-            print(f"  has input_embeds: {'input_embeds' in gen_kwargs}")
-            if 'input_embeds' in gen_kwargs:
-                print(f"  input_embeds is not None: {gen_kwargs['input_embeds'] is not None}")
-            print(f"  has input_ids: {'input_ids' in gen_kwargs}")
-            if 'input_ids' in gen_kwargs:
-                print(f"  input_ids type before: {type(gen_kwargs['input_ids'])}")
+            # print("=" * 80)
+            # print("NLA PATCH: nla_async_generate called!")
+            # print(f"  args: {len(args)}")
+            # print(f"  gen_kwargs keys: {list(gen_kwargs.keys())}")
+            # print(f"  has input_embeds: {'input_embeds' in gen_kwargs}")
+            # if 'input_embeds' in gen_kwargs:
+            #     print(f"  input_embeds is not None: {gen_kwargs['input_embeds'] is not None}")
+            # print(f"  has input_ids: {'input_ids' in gen_kwargs}")
+            # if 'input_ids' in gen_kwargs:
+            #     print(f"  input_ids type before: {type(gen_kwargs['input_ids'])}")
 
-            if 'input_embeds' in gen_kwargs and gen_kwargs['input_embeds'] is not None:
-                print(f"NLA PATCH: Nullifying input_ids! (was {type(gen_kwargs.get('input_ids'))})")
-                gen_kwargs['input_ids'] = None
-                print(f"NLA PATCH: After nullification, input_ids = {gen_kwargs['input_ids']}")
-            else:
-                print("NLA PATCH: NOT nullifying input_ids (no input_embeds or embeds is None)")
+            if "input_embeds" in gen_kwargs and gen_kwargs["input_embeds"] is not None:
+                # print(f"NLA PATCH: Nullifying input_ids! (was {type(gen_kwargs.get('input_ids'))})")
+                gen_kwargs["input_ids"] = None
+                # print(f"NLA PATCH: After nullification, input_ids = {gen_kwargs['input_ids']}")
+            # else:
+            #     print("NLA PATCH: NOT nullifying input_ids (no input_embeds or embeds is None)")
 
             # Final verification before calling original
-            print(f"NLA PATCH: Calling original async_generate with:")
-            print(f"  prompt = {gen_kwargs.get('prompt')} (is None: {gen_kwargs.get('prompt') is None})")
-            print(f"  input_ids = {type(gen_kwargs.get('input_ids'))} (is None: {gen_kwargs.get('input_ids') is None})")
-            print(f"  input_embeds = {type(gen_kwargs.get('input_embeds'))}")
-            if gen_kwargs.get('input_embeds'):
-                print(f"    input_embeds length: {len(gen_kwargs['input_embeds'])}")
-            print("=" * 80)
+            # print(f"NLA PATCH: Calling original async_generate with:")
+            # print(f"  prompt = {gen_kwargs.get('prompt')} (is None: {gen_kwargs.get('prompt') is None})")
+            # print(f"  input_ids = {type(gen_kwargs.get('input_ids'))} (is None: {gen_kwargs.get('input_ids') is None})")
+            # print(f"  input_embeds = {type(gen_kwargs.get('input_embeds'))}")
+            # if gen_kwargs.get('input_embeds'):
+            #     print(f"    input_embeds length: {len(gen_kwargs['input_embeds'])}")
+            # print("=" * 80)
 
             result = await original_async_generate(*args, **gen_kwargs)
-            print("NLA PATCH: original async_generate returned successfully")
+            # print("NLA PATCH: original async_generate returned successfully")
             return result
 
         self._engine.async_generate = nla_async_generate
@@ -92,15 +91,11 @@ class NLASGLangRollout(SGLangRollout):
         activations and passes them in the batch. We just need to ensure
         they're on CPU for network transmission.
         """
-        print("=" * 80)
         print(f"NLA SGLang: generate_sequences() ENTRY POINT (tp_rank={self._tp_rank})")
-        print(f"NLA SGLang: Batch keys: {list(prompts.batch.keys())}")
-        print("=" * 80)
 
         # Check if input_embeds are already prepared by the actor worker
-        if 'input_embeds' in prompts.non_tensor_batch:
-            input_embeds = prompts.non_tensor_batch['input_embeds']
-            print(f"NLA SGLang: Received pre-computed input_embeds with first item shape: {input_embeds[0].shape}", f"second item shape: {input_embeds[1].shape if len(input_embeds) > 1 else 'None'}")
+        if "input_embeds" in prompts.non_tensor_batch:
+            input_embeds = prompts.non_tensor_batch["input_embeds"]
 
             # # Ensure embeddings are on CPU for network transmission
             # if hasattr(input_embeds, 'is_cuda') and input_embeds.is_cuda:
@@ -117,30 +112,30 @@ class NLASGLangRollout(SGLangRollout):
             # 2. Creating raw_prompt_ids at lines 854-858
             #
             # Solution: Pre-create raw_prompt_ids, then nullify input_ids
-            if 'input_ids' in prompts.batch and prompts.batch['input_ids'] is not None:
+            if "input_ids" in prompts.batch and prompts.batch["input_ids"] is not None:
                 # Pre-create raw_prompt_ids before nullifying input_ids
                 # (Replicates logic from sglang_rollout.py:854-858)
-                input_ids = prompts.batch['input_ids']
+                input_ids = prompts.batch["input_ids"]
                 batch_size = input_ids.size(0)
 
                 # Import _pre_process_inputs from parent module
-                from verl.workers.rollout.sglang_rollout.sglang_rollout import _pre_process_inputs
                 import numpy as np
 
+                from verl.workers.rollout.sglang_rollout.sglang_rollout import _pre_process_inputs
+
                 # Get pad_token_id from parent's config
-                pad_token_id = self.pad_token_id if hasattr(self, 'pad_token_id') else 0
+                pad_token_id = self.pad_token_id if hasattr(self, "pad_token_id") else 0
 
                 prompts.non_tensor_batch["raw_prompt_ids"] = np.array(
                     [_pre_process_inputs(pad_token_id, input_ids[i]).tolist() for i in range(batch_size)],
                     dtype=object,
                 )
-                print(f"NLA SGLang: Pre-created raw_prompt_ids from input_ids (batch_size={batch_size})")
 
                 # DON'T nullify input_ids - keep it so parent can use it for batch_size
                 # SGLang will use input_embeds anyway because we pass it explicitly
-                #print("NLA SGLang: Kept input_ids for batch_size calculation")
+                # print("NLA SGLang: Kept input_ids for batch_size calculation")
 
-            #print("NLA SGLang: input_embeds will be used by SGLang")
+            # print("NLA SGLang: input_embeds will be used by SGLang")
 
         # # Prepare embeddings from activation vectors attached to the batch
         # elif 'activation_vectors' in prompts.batch:
@@ -189,10 +184,12 @@ class NLASGLangRollout(SGLangRollout):
         #     # SGLang will use input_embeds anyway because we pass it explicitly
         #     print("NLA SGLang: Kept input_ids for batch_size calculation")
 
-        elif hasattr(prompts, 'meta_info') and prompts.meta_info and prompts.meta_info.get('activation_vectors') is not None:
-            raise ValueError(
-                "Activation vectors present in meta_info; expected them under batch['activation_vectors']"
-            )
+        elif (
+            hasattr(prompts, "meta_info")
+            and prompts.meta_info
+            and prompts.meta_info.get("activation_vectors") is not None
+        ):
+            raise ValueError("Activation vectors present in meta_info; expected them under batch['activation_vectors']")
 
         else:
             # FAIL FAST: Neither input_embeds nor activation_vectors present
@@ -208,20 +205,15 @@ class NLASGLangRollout(SGLangRollout):
 
         # Note: We no longer nullify input_ids, so no dummy creation needed
         # input_embeds will be used by SGLang because we provide raw_prompt_ids and input_embeds
-        #print(f"NLA SGLang: input_ids kept in batch, input_embeds will take priority in SGLang")
+        # print(f"NLA SGLang: input_ids kept in batch, input_embeds will take priority in SGLang")
 
         # Call parent's generate_sequences
         # SGLang will now use input_embeds if present in the batch
-        print("NLA SGLang: Calling parent generate_sequences...")
         result = super().generate_sequences(prompts)
-        print("NLA SGLang: Parent generate_sequences returned!")
         return result
 
     def _prepare_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        activation_vectors: torch.Tensor,
-        injection_positions: torch.Tensor
+        self, input_ids: torch.Tensor, activation_vectors: torch.Tensor, injection_positions: torch.Tensor
     ) -> torch.Tensor:
         """
         Prepare input embeddings with activation vector injection.
@@ -240,13 +232,13 @@ class NLASGLangRollout(SGLangRollout):
         # Note: This assumes SGLang exposes the model's embedding layer
         try:
             # Try to get embedding layer from the engine's model
-            if hasattr(self._engine, 'model'):
+            if hasattr(self._engine, "model"):
                 model = self._engine.model
-                if hasattr(model, 'get_input_embeddings'):
+                if hasattr(model, "get_input_embeddings"):
                     embed_layer = model.get_input_embeddings()
-                elif hasattr(model, 'embed_tokens'):
+                elif hasattr(model, "embed_tokens"):
                     embed_layer = model.embed_tokens
-                elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
                     embed_layer = model.model.embed_tokens
                 else:
                     # Fallback: create a simple embedding layer
@@ -261,7 +253,7 @@ class NLASGLangRollout(SGLangRollout):
             print(f"WARNING: Could not access SGLang embedding layer: {e}")
             print("Using a fallback embedding layer - results may be suboptimal")
             print(f"Could not access SGLang embedding layer: {e}")
-            print(f"FIX THIS LATER")
+            print("FIX THIS LATER")
             vocab_size = self.model_config.hf_config.vocab_size
             embed_layer = torch.nn.Embedding(vocab_size, self.hidden_dim)
             raise e
@@ -272,7 +264,9 @@ class NLASGLangRollout(SGLangRollout):
 
         # Project activation vectors if needed
         if activation_vectors.shape[-1] != self.hidden_dim:
-            raise ValueError(f"Activation vectors dimension {activation_vectors.shape[-1]} does not match hidden dimension {self.hidden_dim}")
+            raise ValueError(
+                f"Activation vectors dimension {activation_vectors.shape[-1]} does not match hidden dimension {self.hidden_dim}"
+            )
             print(f"Projecting activation vectors from {activation_vectors.shape[-1]} to {self.hidden_dim}")
             # Simple linear projection - could be improved with a learned projection
             projection = torch.nn.Linear(activation_vectors.shape[-1], self.hidden_dim, bias=False)

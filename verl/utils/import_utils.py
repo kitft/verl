@@ -98,15 +98,23 @@ def load_extern_type(file_path: Optional[str], type_name: Optional[str]) -> type
         if file_path.startswith("file://"):
             file_path = file_path[7:]
 
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Custom type file '{file_path}' not found.")
-
-        spec = importlib.util.spec_from_file_location("custom_module", file_path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-        except Exception as e:
-            raise RuntimeError(f"Error loading module from '{file_path}'") from e
+        # Try as file path first
+        if os.path.exists(file_path):
+            spec = importlib.util.spec_from_file_location("custom_module", file_path)
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+            except Exception as e:
+                raise RuntimeError(f"Error loading module from '{file_path}'") from e
+        else:
+            # If not a file path, try as module path (e.g., "verl.nla.data.nla_sft_dataset")
+            try:
+                module = importlib.import_module(file_path)
+            except (ModuleNotFoundError, ImportError) as e:
+                raise FileNotFoundError(
+                    f"Custom type file or module '{file_path}' not found. "
+                    f"Use 'pkg://' prefix for module paths or provide a valid file path."
+                ) from e
 
     if not hasattr(module, type_name):
         raise AttributeError(f"Custom type '{type_name}' not found in '{file_path}'.")

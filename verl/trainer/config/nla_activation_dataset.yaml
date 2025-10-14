@@ -53,8 +53,11 @@ prompt:
       template: |
         Explain the following: <concept>{injection_token}</concept>
 
-
+### n.b. is ther ea newline in the concep tactivaiton token?
 response:
   template: "{source}"
 
 seed: 42
+
+# Optional: Use indices from an existing dataset (for exact reproduction)
+source_indices_file: null  # Path to parquet file to extract indices from

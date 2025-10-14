@@ -45,10 +45,12 @@ class NLASFTDataset(SFTDataset):
             mode: Training mode - "actor", "critic", or "both"
         """
         self.mode = mode
-        # Get activation_dim from config - will be determined dynamically from model config
-        self.activation_dim = config.get("activation_dim")
-        if self.activation_dim is None:
-            raise ValueError("activation_dim must be provided in config or determined from model config")
+        # Get activation_dim from config - will be inferred from dataset if not provided
+        self.activation_dim = config.get("activation_dim", None)
+
+        # Get scale and norm transformations from config
+        self.scale = config.get("scale", None)
+        self.norm = config.get("norm", None)
 
         # Initialize base dataset first to get tokenizer
         super().__init__(parquet_files, tokenizer, config)
@@ -59,6 +61,11 @@ class NLASFTDataset(SFTDataset):
         self.injection_token = self.injection_manager.character
         self.injection_token_id = self.injection_manager.token_id
 
+        # Print transformation settings
+        print(f"NLASFTDataset: Loading activation vectors with transformations:")
+        print(f"  - Normalization: {self.norm if self.norm else 'None'}")
+        print(f"  - Scale: {self.scale if self.scale else 'None'}")
+
         # Load activation vectors
         self._load_activation_vectors()
 
@@ -67,6 +74,19 @@ class NLASFTDataset(SFTDataset):
         # Activation vectors should be in the dataframe
         if "activation_vector" not in self.dataframe.columns:
             raise ValueError("Dataset must contain 'activation_vector' column")
+
+        # Infer activation_dim from first vector if not provided
+        if self.activation_dim is None:
+            first_vec = self.dataframe.iloc[0]["activation_vector"]
+            if isinstance(first_vec, (list, tuple)):
+                self.activation_dim = len(first_vec)
+            elif hasattr(first_vec, "shape"):
+                self.activation_dim = first_vec.shape[-1]
+            elif hasattr(first_vec, "__len__"):
+                self.activation_dim = len(first_vec)
+            else:
+                raise ValueError("Cannot infer activation_dim from dataset - please provide it in config")
+            print(f"NLASFTDataset: Inferred activation_dim={self.activation_dim} from dataset")
 
         # Convert activation vectors to tensors
         self.activation_vectors = []
@@ -88,6 +108,16 @@ class NLASFTDataset(SFTDataset):
                 raise ValueError(
                     f"Activation vector dimension mismatch: expected {self.activation_dim}, got {vec.shape[-1]}"
                 )
+
+            # Apply normalization if specified
+            if self.norm == "unit":
+                vec_norm = torch.norm(vec)
+                if vec_norm > 0:
+                    vec = vec / vec_norm
+
+            # Apply scaling if specified
+            if self.scale is not None:
+                vec = vec * self.scale
 
             self.activation_vectors.append(vec)
 
@@ -174,6 +204,21 @@ class NLASFTDataset(SFTDataset):
                 "Ensure the dataset prompt_text includes the injection marker."
             )
 
+        # For Megatron backend: extract response tokens from input_ids using loss_mask
+        # loss_mask is 0 for prompt tokens and 1 for response tokens (except last token)
+        loss_mask = sample["loss_mask"]
+        # Find where response starts (first non-zero in loss_mask)
+        response_start_idx = (loss_mask != 0).nonzero(as_tuple=False)
+        if len(response_start_idx) > 0:
+            response_start = response_start_idx[0].item()
+            # Find where response ends (last non-zero in loss_mask + 1 for the masked last token)
+            response_end_idx = (loss_mask != 0).nonzero(as_tuple=False)[-1].item() + 1
+            # Extract response tokens (excluding padding)
+            sample["responses"] = sample["input_ids"][response_start:response_end_idx + 1]
+        else:
+            # If no response tokens (edge case), create empty tensor
+            sample["responses"] = torch.tensor([], dtype=sample["input_ids"].dtype)
+
         # Skip metadata attachment for now to avoid TensorDict batch issues
         # sample = self._attach_metadata(idx, sample)
 
@@ -249,7 +294,61 @@ class NLASFTCollator:
 
     def __call__(self, features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         """
-        Collate batch of samples, handling activation vectors properly.
+        Collate batch of samples, handling activation vectors and variable-length responses.
+
+        Simple collator for FSDP SFT training.
+        """
+        batch = {}
+
+        # Stack standard tensor fields - these are already padded to same length by dataset
+        tensor_keys = ["input_ids", "attention_mask", "loss_mask", "position_ids"]
+        for key in tensor_keys:
+            if key in features[0]:
+                batch[key] = torch.stack([f[key] for f in features])
+
+        # Stack activation vectors - these should all be same size
+        if "activation_vectors" in features[0]:
+            batch["activation_vectors"] = torch.stack([f["activation_vectors"] for f in features])
+
+        # Handle responses field (for Megatron backend) with padding if present
+        # Note: FSDP doesn't use this field, but we pad it anyway for compatibility
+        if "responses" in features[0]:
+            # Find max response length in batch
+            max_resp_len = max(f["responses"].size(0) for f in features)
+            # Pad all responses to max length
+            padded_responses = []
+            for f in features:
+                resp = f["responses"]
+                pad_len = max_resp_len - resp.size(0)
+                if pad_len > 0:
+                    # Pad with pad_token_id
+                    padded_resp = torch.cat([resp, torch.full((pad_len,), self.pad_token_id, dtype=resp.dtype)])
+                else:
+                    padded_resp = resp
+                padded_responses.append(padded_resp)
+            batch["responses"] = torch.stack(padded_responses)
+
+        return batch
+
+
+class NLASFTCollatorWithRLFields:
+    """
+    Data collator for NLA SFT that adds RL-compatible fields for update_policy training.
+
+    This collator adds dummy RL fields to enable SFT training via the RL update_policy path:
+    - old_log_probs = 0: Makes the policy ratio exp(new_log_prob - 0) = exp(new_log_prob)
+    - advantages = 1: Makes the weight 1 * exp(new_log_prob) = exp(new_log_prob)
+    - response_mask: Copy of loss_mask to indicate which tokens are part of the response
+
+    With no clipping, this becomes standard maximum likelihood estimation (SFT).
+    """
+
+    def __init__(self, pad_token_id: int = 0):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """
+        Collate batch of samples with RL-compatible fields for update_policy.
         """
         batch = {}
 
@@ -264,6 +363,46 @@ class NLASFTCollator:
         for key in response_keys:
             if key in features[0]:
                 batch[key] = torch.stack([f[key] for f in features])
+
+        # Handle responses field (for Megatron backend) with padding
+        # IMPORTANT: Do this BEFORE creating old_log_probs/advantages which depend on responses shape
+        if "responses" in features[0]:
+            # Find max response length in batch
+            max_resp_len = max(f["responses"].size(0) for f in features)
+            # Pad all responses to max length
+            padded_responses = []
+            for f in features:
+                resp = f["responses"]
+                pad_len = max_resp_len - resp.size(0)
+                if pad_len > 0:
+                    # Pad with pad_token_id
+                    padded_resp = torch.cat([resp, torch.full((pad_len,), self.pad_token_id, dtype=resp.dtype)])
+                else:
+                    padded_resp = resp
+                padded_responses.append(padded_resp)
+            batch["responses"] = torch.stack(padded_responses)
+
+        # For SFT via update_policy: add dummy fields to make it equivalent to supervised learning
+        # - response_mask: Extract from loss_mask (response portion only, masks padding)
+        # - old_log_probs = 0: ratio becomes exp(new_log_prob - 0) = exp(new_log_prob)
+        # - advantages = 1: weight becomes 1 * exp(new_log_prob) = exp(new_log_prob)
+        # - With no clipping, this is standard maximum likelihood (SFT)
+        #
+        # IMPORTANT: Shape these based on responses (response tokens only), not full input_ids,
+        # because the actor only computes log_probs for response tokens.
+        if "responses" in batch and "loss_mask" in batch:
+            batch_size, response_len = batch["responses"].shape
+            full_seq_len = batch["loss_mask"].shape[1]
+
+            # Extract response_mask from loss_mask
+            # Prompts are left-padded, responses are on the right
+            # loss_mask is 1 for response tokens, 0 for prompt/padding
+            # Truncate loss_mask from the left to get response portion only
+            prompt_len = full_seq_len - response_len
+            batch["response_mask"] = batch["loss_mask"][:, prompt_len:]
+
+            batch["old_log_probs"] = torch.zeros((batch_size, response_len), dtype=torch.float32)
+            batch["advantages"] = torch.ones((batch_size, response_len), dtype=torch.float32)
 
         # Stack activation vectors
         if "activation_vectors" in features[0]:
